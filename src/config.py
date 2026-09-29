@@ -30,14 +30,21 @@ DEFAULT_ALLOWED_TOOLS = [
 ]
 
 
+try:
+  import dotenv
+  dotenv.load_dotenv()
+except ImportError:
+  pass
+
+
 class TenantConfig(BaseModel):
   """Dynamic tenant configuration with environment variable fallbacks."""
 
   project_id: str = Field(
-      default_factory=lambda: os.environ.get("CHRONICLE_PROJECT_ID", "")
+      default_factory=lambda: os.environ.get("CHRONICLE_PROJECT_ID", "gus-sdl")
   )
   customer_id: str = Field(
-      default_factory=lambda: os.environ.get("CHRONICLE_CUSTOMER_ID", "")
+      default_factory=lambda: os.environ.get("CHRONICLE_CUSTOMER_ID", "8cbac5ae-8267-4da7-b405-cdbc6fa3f1d5")
   )
   region: str = Field(
       default_factory=lambda: os.environ.get("CHRONICLE_REGION", "us")
