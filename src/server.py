@@ -8,6 +8,7 @@ Exposes the autonomous JIT Threat Hunting Engine over two concurrent protocols:
 2. Model Context Protocol (/mcp via SSE / Streamable HTTP) for Agent-to-Agent invocations.
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -302,18 +303,21 @@ async def watchdog_reset_endpoint(request: Request) -> JSONResponse:
 app = mcp.streamable_http_app()
 
 
-@app.on_event("startup")
-async def on_startup():
-  if tenant_config.watchdog_enabled:
-    logger.info("Auto-starting Watchdog daemon on server startup.")
-    watchdog.start()
+@contextlib.asynccontextmanager
+async def combined_lifespan(application):
+  async with mcp.session_manager.run():
+    if tenant_config.watchdog_enabled:
+      logger.info("Auto-starting Watchdog daemon on server startup.")
+      watchdog.start()
+    try:
+      yield
+    finally:
+      if watchdog.is_running:
+        logger.info("Stopping Watchdog daemon on server shutdown.")
+        watchdog.stop()
 
 
-@app.on_event("shutdown")
-async def on_shutdown():
-  if watchdog.is_running:
-    logger.info("Stopping Watchdog daemon on server shutdown.")
-    watchdog.stop()
+app.router.lifespan_context = combined_lifespan
 
 
 if __name__ == "__main__":
