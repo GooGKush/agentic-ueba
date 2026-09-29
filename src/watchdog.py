@@ -46,6 +46,96 @@ def _unwrap_exception(e: BaseException) -> str:
   return f"{type(e).__name__}: {e}"
 
 
+def _extract_entity_from_connector_events(events: List[Dict[str, Any]]) -> Optional[Tuple[str, str]]:
+  """Extracts target entity and type (USER, ASSET, IP) from raw connector events / UDM data."""
+  for ev in events:
+    # 1. Inspect eventJsonData -> rawEvent
+    raw_data = ev.get("eventJsonData", {}).get("rawEvent") or "{}"
+    try:
+      parsed_raw = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
+    except Exception:
+      parsed_raw = {}
+
+    fields = parsed_raw.get("_rawDataFields", {}) if isinstance(parsed_raw, dict) else {}
+
+    # Check principal user
+    user = (fields.get("event_principal_user_userid") or 
+            fields.get("event_principal_user_email_addresses_1") or
+            fields.get("event_target_user_userid"))
+    if user:
+      return str(user).lower(), "USER"
+
+    # Check principal hostname
+    host = (fields.get("event_principal_hostname") or 
+            fields.get("event_principal_asset_hostname"))
+    if host:
+      return str(host).lower(), "ASSET"
+
+    # Check principal asset IP
+    ip = (fields.get("event_principal_asset_ip_1") or 
+          fields.get("event_principal_ip_1") or 
+          fields.get("event_principal_ip"))
+    if ip:
+      return str(ip), "IP"
+
+    # Check target hostname / IP
+    target_host = fields.get("event_target_hostname") or fields.get("event_target_asset_hostname")
+    if target_host:
+      return str(target_host).lower(), "ASSET"
+    target_ip = (fields.get("event_target_asset_ip_1") or 
+                 fields.get("event_target_ip_1") or 
+                 fields.get("event_target_ip"))
+    if target_ip:
+      return str(target_ip), "IP"
+
+    # Direct nested UDM structure in parsed_raw
+    if isinstance(parsed_raw, dict):
+      udm_event = parsed_raw.get("event", {})
+      if isinstance(udm_event, dict):
+        princ = udm_event.get("principal", {})
+        if isinstance(princ, dict):
+          p_user = princ.get("user", {}).get("userid")
+          if p_user:
+            return str(p_user).lower(), "USER"
+          p_host = princ.get("hostname") or (princ.get("asset", {}).get("hostname") if isinstance(princ.get("asset"), dict) else None)
+          if p_host:
+            return str(p_host).lower(), "ASSET"
+          p_ip = (princ.get("asset", {}).get("ip") if isinstance(princ.get("asset"), dict) else None) or princ.get("ip")
+          if p_ip:
+            val = p_ip[0] if isinstance(p_ip, list) and p_ip else p_ip
+            return str(val), "IP"
+        targ = udm_event.get("target", {})
+        if isinstance(targ, dict):
+          t_host = targ.get("hostname") or (targ.get("asset", {}).get("hostname") if isinstance(targ.get("asset"), dict) else None)
+          if t_host:
+            return str(t_host).lower(), "ASSET"
+          t_ip = (targ.get("asset", {}).get("ip") if isinstance(targ.get("asset"), dict) else None) or targ.get("ip")
+          if t_ip:
+            val = t_ip[0] if isinstance(t_ip, list) and t_ip else t_ip
+            return str(val), "IP"
+
+    # 2. Inspect mappedEventJson
+    mapped_raw = ev.get("mappedEventJson") or "{}"
+    try:
+      parsed_mapped = json.loads(mapped_raw) if isinstance(mapped_raw, str) else mapped_raw
+    except Exception:
+      parsed_mapped = {}
+
+    if isinstance(parsed_mapped, dict):
+      m_fields = parsed_mapped.get("_fields", {})
+      m_ip = m_fields.get("SourceAddress") or m_fields.get("DestinationAddress")
+      if m_ip:
+        return str(m_ip), "IP"
+      m_host = m_fields.get("SourceHostName") or m_fields.get("DestinationHostName")
+      if m_host:
+        return str(m_host).lower(), "ASSET"
+      m_user = m_fields.get("SourceUserName") or m_fields.get("DestinationUserName")
+      if m_user:
+        return str(m_user).lower(), "USER"
+
+  return None
+
+
 class WatchdogState:
   """Persistent state tracking for processed cases with sliding-window FIFO eviction."""
 
@@ -489,15 +579,15 @@ class WatchdogDaemon:
                   ident = ent.get("identifier") or ent.get("OriginalIdentifier")
                   if not ident:
                     continue
-                  if e_type in ("USER", "USER_ID", "EMAIL"):
+                  if e_type in ("USER", "USER_ID", "EMAIL", "USERNAME", "ACCOUNT"):
                     target_entity = ident.lower()
                     entity_type = "USER"
                     break
-                  elif e_type in ("HOSTNAME", "ASSET"):
+                  elif e_type in ("HOSTNAME", "ASSET", "HOST", "COMPUTER"):
                     target_entity = ident.lower()
                     entity_type = "ASSET"
                     break
-                  elif e_type in ("IP", "IP_ADDRESS"):
+                  elif e_type in ("IP", "IP_ADDRESS", "INTERNAL_IP", "EXTERNAL_IP", "SOURCE_IP", "DESTINATION_IP", "INTERNAL IP", "EXTERNAL IP", "ADDRESS"):
                     target_entity = ident
                     entity_type = "IP"
                     break
@@ -507,8 +597,43 @@ class WatchdogDaemon:
             # Fallback to case entities
             if not target_entity:
               for ent in case.get("entities", []):
-                target_entity = ent.get("identifier")
-                break
+                ident = ent.get("identifier")
+                if ident:
+                  target_entity = ident
+                  break
+
+            # Deep Fallback: inspect connector events for underlying UDM principal / target asset & user
+            if not target_entity and alerts:
+              for alert in alerts:
+                alert_name_str = str(alert.get("name", ""))
+                alert_numeric_id = alert_name_str.split("/")[-1] if "/" in alert_name_str else str(alert.get("id", ""))
+                if not alert_numeric_id:
+                  continue
+                try:
+                  events_res = await session.call_tool(
+                      "list_connector_events",
+                      {
+                          "projectId": self.tenant.project_id,
+                          "customerId": self.tenant.customer_id,
+                          "region": self.tenant.region,
+                          "caseId": case_id,
+                          "caseAlertId": alert_numeric_id,
+                          "expandEventJsonData": True,
+                          "pageSize": 5,
+                      },
+                  )
+                  if events_res.content:
+                    events_data = json.loads(events_res.content[0].text)
+                    conn_events = events_data.get("connectorEvents", [])
+                    extracted = _extract_entity_from_connector_events(conn_events)
+                    if extracted:
+                      target_entity, entity_type = extracted
+                      logger.info(
+                          f"Extracted entity '{target_entity}' ({entity_type}) from connector events for Case {case_id}."
+                      )
+                      break
+                except Exception as ev_err:
+                  logger.debug(f"Could not inspect connector events for alert {alert_numeric_id}: {ev_err}")
 
             if not target_entity:
               logger.info(f"Case {case_id} had no extractable entities; marking as processed.")
