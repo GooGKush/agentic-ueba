@@ -11,6 +11,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Install python dependencies
@@ -20,8 +21,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application source
 COPY src/ ./src/
 
-# Copy staged skills from build process
-COPY .build/skills/ /app/skills/
+# Install canonical skills directly into /app/skills
+RUN mkdir -p /app/skills && \
+    git clone --depth 1 https://github.com/GooGKush/secops-risk-metrics-multistage.git /app/skills/secops-risk-metrics-multistage && \
+    git clone --depth 1 https://github.com/GooGKush/secops-statistical-hunter.git /app/skills/secops-statistical-hunter && \
+    rm -rf /app/skills/*/.git
 
 EXPOSE 8080
 
