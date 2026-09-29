@@ -128,11 +128,17 @@ class StatsHunterEngine:
         "entity": entity,
         "model": "POISSON_BURST_CLUSTERING",
         "fano_factor": round(fano, 2),
+        "top_fano": round(fano, 2),
+        "top_z_score": round(fano, 2),
         "is_burst": is_burst,
         "calibrated_risk_index": cri,
         "is_outlier": is_burst,
+        "stats_rows": len(rows),
         "executed_query": rendered,
     }
+
+  # Alias for backward compatibility
+  run_poisson_burst_spray = run_poisson_burst_clustering
 
   async def run_poisson_rare_surge(
       self,
@@ -165,7 +171,214 @@ class StatsHunterEngine:
         "entity": entity,
         "model": "POISSON_RARE_SURGE",
         "poisson_z": round(z_score, 2),
+        "top_z_score": round(z_score, 2),
         "calibrated_risk_index": cri,
         "is_outlier": cri >= 46,
+        "stats_rows": len(rows),
+        "executed_query": rendered,
+    }
+
+  async def run_markov_transition_rarity(
+      self,
+      session: ClientSession,
+      host: str,
+      event_type: str = "PROCESS_LAUNCH",
+      entity_field: str = "principal.hostname",
+      bucket_size: str = "1d",
+      min_parent_count: int = 5,
+      surprisal_threshold: float = 3.5,
+      lookback_days: int = 7,
+  ) -> Dict[str, Any]:
+    """Detects rare, unobserved process parent-child execution transitions via Markov 2-Gram Transition Rarity."""
+    start_iso, end_iso = self._iso_window(lookback_days)
+    tpl_path = self.runner.find_template(self.SKILL_NAME, "markov_2gram_transition_rarity_2stage.yl2")
+
+    params = {
+        "event_type": event_type,
+        "entity_field": entity_field,
+        "bucket_size": bucket_size,
+        "min_parent_count": str(min_parent_count),
+        "surprisal_threshold": str(surprisal_threshold),
+        "tier": "STANDARD",
+    }
+
+    rendered = self.runner.render_template(tpl_path, params)
+    resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
+    rows = self.runner.parse_stats_response(resp)
+
+    threat_score = 0.0
+    surprisal = 0.0
+    parent_proc = None
+    child_proc = None
+    if rows:
+      top_row = rows[0]
+      threat_score = float(top_row.get("markov_threat_score", top_row.get("$markov_threat_score", 0.0)) or 0.0)
+      surprisal = float(top_row.get("surprisal_score", top_row.get("$surprisal_score", 0.0)) or 0.0)
+      parent_proc = top_row.get("parent", top_row.get("$parent", None))
+      child_proc = top_row.get("child", top_row.get("$child", None))
+
+    cri = self.runner.calculate_cri(threat_score)
+    is_outlier = cri >= 60 or threat_score >= surprisal_threshold
+    return {
+        "entity": host,
+        "model": "MARKOV_TRANSITION_RARITY",
+        "markov_threat_score": round(threat_score, 2),
+        "surprisal_score": round(surprisal, 2),
+        "parent_process": parent_proc,
+        "child_process": child_proc,
+        "top_z_score": round(threat_score, 2),
+        "calibrated_risk_index": cri,
+        "is_outlier": is_outlier,
+        "stats_rows": len(rows),
+        "executed_query": rendered,
+    }
+
+  async def run_shannon_character_entropy(
+      self,
+      session: ClientSession,
+      entity: str,
+      event_type: str = "PROCESS_LAUNCH",
+      entity_field: str = "principal.hostname",
+      bucket_size: str = "1d",
+      min_length: int = 20,
+      entropy_threshold: float = 6.0,
+      lookback_days: int = 7,
+  ) -> Dict[str, Any]:
+    """Detects obfuscated command lines and high-entropy arguments via Shannon Character-Class Entropy."""
+    start_iso, end_iso = self._iso_window(lookback_days)
+    tpl_path = self.runner.find_template(self.SKILL_NAME, "shannon_entropy_character_2stage.yl2")
+
+    params = {
+        "event_type": event_type,
+        "entity_field": entity_field,
+        "bucket_size": bucket_size,
+        "min_length": str(min_length),
+        "entropy_threshold": str(entropy_threshold),
+        "tier": "STANDARD",
+    }
+
+    rendered = self.runner.render_template(tpl_path, params)
+    resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
+    rows = self.runner.parse_stats_response(resp)
+
+    entropy_score = 0.0
+    token_cmd = None
+    if rows:
+      top_row = rows[0]
+      entropy_score = float(top_row.get("shannon_entropy_score", top_row.get("$shannon_entropy_score", 0.0)) or 0.0)
+      token_cmd = top_row.get("token", top_row.get("$token", None))
+
+    cri = self.runner.calculate_cri(entropy_score)
+    is_outlier = cri >= 60 or entropy_score >= entropy_threshold
+    return {
+        "entity": entity,
+        "model": "SHANNON_CHARACTER_ENTROPY",
+        "shannon_entropy_score": round(entropy_score, 2),
+        "sample_token": token_cmd,
+        "top_z_score": round(entropy_score, 2),
+        "calibrated_risk_index": cri,
+        "is_outlier": is_outlier,
+        "stats_rows": len(rows),
+        "executed_query": rendered,
+    }
+
+  async def run_zipfian_process_rarity(
+      self,
+      session: ClientSession,
+      host: str,
+      event_type: str = "PROCESS_LAUNCH",
+      entity_field: str = "principal.hostname",
+      bucket_size: str = "1d",
+      max_adopters: int = 2,
+      min_count: int = 1,
+      zipf_threshold: float = 3.5,
+      lookback_days: int = 7,
+  ) -> Dict[str, Any]:
+    """Detects rare administrative tools in the enterprise Zipfian long tail."""
+    start_iso, end_iso = self._iso_window(lookback_days)
+    tpl_path = self.runner.find_template(self.SKILL_NAME, "zipfian_process_rarity_2stage.yl2")
+
+    params = {
+        "event_type": event_type,
+        "entity_field": entity_field,
+        "bucket_size": bucket_size,
+        "max_adopters": str(max_adopters),
+        "min_count": str(min_count),
+        "zipf_threshold": str(zipf_threshold),
+        "tier": "STANDARD",
+    }
+
+    rendered = self.runner.render_template(tpl_path, params)
+    resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
+    rows = self.runner.parse_stats_response(resp)
+
+    zipf_score = 0.0
+    rare_binary = None
+    if rows:
+      top_row = rows[0]
+      zipf_score = float(top_row.get("zipf_rarity_score", top_row.get("$zipf_rarity_score", 0.0)) or 0.0)
+      rare_binary = top_row.get("binary", top_row.get("$binary", None))
+
+    cri = self.runner.calculate_cri(zipf_score)
+    is_outlier = cri >= 60 or zipf_score >= zipf_threshold
+    return {
+        "entity": host,
+        "model": "ZIPFIAN_PROCESS_RARITY",
+        "zipf_rarity_score": round(zipf_score, 2),
+        "rare_binary": rare_binary,
+        "top_z_score": round(zipf_score, 2),
+        "calibrated_risk_index": cri,
+        "is_outlier": is_outlier,
+        "stats_rows": len(rows),
+        "executed_query": rendered,
+    }
+
+  async def run_ewma_burst_velocity(
+      self,
+      session: ClientSession,
+      entity: str,
+      event_type: str = "NETWORK_CONNECTION",
+      entity_field: str = "principal.ip",
+      bucket_size: str = "1h",
+      min_active_samples: int = 3,
+      min_sd: float = 1.0,
+      min_count: int = 5,
+      velocity_threshold: float = 3.0,
+      lookback_days: int = 7,
+  ) -> Dict[str, Any]:
+    """Detects acute intraday rate acceleration using Exponentially Weighted Moving Average (EWMA)."""
+    start_iso, end_iso = self._iso_window(lookback_days)
+    tpl_path = self.runner.find_template(self.SKILL_NAME, "ewma_burst_velocity_2stage.yl2")
+
+    params = {
+        "event_type": event_type,
+        "entity_field": entity_field,
+        "bucket_size": bucket_size,
+        "min_active_samples": str(min_active_samples),
+        "min_sd": str(min_sd),
+        "min_count": str(min_count),
+        "velocity_threshold": str(velocity_threshold),
+        "tier": "STANDARD",
+    }
+
+    rendered = self.runner.render_template(tpl_path, params)
+    resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
+    rows = self.runner.parse_stats_response(resp)
+
+    velocity_score = 0.0
+    if rows:
+      top_row = rows[0]
+      velocity_score = float(top_row.get("ewma_velocity_score", top_row.get("$ewma_velocity_score", 0.0)) or 0.0)
+
+    cri = self.runner.calculate_cri(velocity_score)
+    is_outlier = cri >= 60 or velocity_score >= velocity_threshold
+    return {
+        "entity": entity,
+        "model": "EWMA_BURST_VELOCITY",
+        "ewma_velocity_score": round(velocity_score, 2),
+        "top_z_score": round(velocity_score, 2),
+        "calibrated_risk_index": cri,
+        "is_outlier": is_outlier,
+        "stats_rows": len(rows),
         "executed_query": rendered,
     }

@@ -251,30 +251,110 @@ order:
         "verdict": "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE"),
     }
 
-  async def run_cloud_crud_surge(
+  async def run_circadian_von_mises(
       self,
       session: ClientSession,
-      username: str,
+      entity: str,
+      metric_name: str = "auth_attempts_total",
+      event_type: str = "USER_LOGIN",
+      dimension_key: str = "target.user.userid",
       lookback_days: int = 14,
   ) -> Dict[str, Any]:
-    """Evaluates cloud resource write surges with mandatory companion dimensions."""
+    """Evaluates hourly telemetry against 24-hour circular clock to penalize off-hours deviations."""
     start_iso, end_iso = self._iso_window(lookback_days)
-    tpl_path = self.runner.find_template(self.SKILL_NAME, "cloud_repository_scope_dual_branch.yl2")
-    rendered = self.runner.render_template(tpl_path, {"sa": username, "target_user": username})
+    tpl_path = self.runner.find_template(self.SKILL_NAME, "circadian_von_mises_2stage.yl2")
 
+    metric_type_val = "value_sum" if "bytes" in metric_name else "event_count_sum"
+    obs_agg = "sum(network.sent_bytes)" if "bytes" in metric_name else "count(metadata.id)"
+
+    params = {
+        "event_type": event_type,
+        "entity_field": dimension_key,
+        "value_filter": "",
+        "observed_aggregation": obs_agg,
+        "target_metric_name": metric_name,
+        "metric_type_val": metric_type_val,
+        "dimension_key": dimension_key,
+        "extra_dimensions": "",
+    }
+
+    rendered = self.runner.render_template(tpl_path, params)
     resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
     rows = self.runner.parse_stats_response(resp)
-    top_z = 0.0
-    if rows:
-      top_z = float(rows[0].get("z_score", rows[0].get("z", 0.0)) or 0.0)
 
-    cri = self.runner.calculate_cri(top_z)
+    circadian_score = 0.0
+    hourly_z = 0.0
+    event_hour = 0
+    if rows:
+      top_row = rows[0]
+      circadian_score = float(top_row.get("circadian_threat_score", top_row.get("$circadian_threat_score", 0.0)) or 0.0)
+      hourly_z = float(top_row.get("hourly_z", top_row.get("$hourly_z", 0.0)) or 0.0)
+      event_hour = int(top_row.get("event_hour", top_row.get("$event_hour", 0)) or 0)
+
+    cri = self.runner.calculate_cri(circadian_score)
     return {
-        "entity": username,
-        "metric": "cloud_crud_resource_written",
-        "top_z_score": round(top_z, 2),
+        "entity": entity,
+        "model": "CIRCADIAN_VON_MISES",
+        "circadian_threat_score": round(circadian_score, 2),
+        "hourly_z": round(hourly_z, 2),
+        "event_hour": event_hour,
+        "top_z_score": round(circadian_score, 2),
         "calibrated_risk_index": cri,
-        "is_outlier": cri >= 46,
+        "is_outlier": cri >= 60 or circadian_score >= 3.0,
+        "stats_rows": len(rows),
+        "executed_query": rendered,
+    }
+
+  async def run_macd_momentum_velocity(
+      self,
+      session: ClientSession,
+      entity: str,
+      metric_name: str = "network_bytes_outbound",
+      event_type: str = "NETWORK_CONNECTION",
+      dimension_key: str = "principal.user.userid",
+      lookback_days: int = 14,
+  ) -> Dict[str, Any]:
+    """Detects sudden momentum acceleration where short-term surge diverges from slow baseline anchor."""
+    start_iso, end_iso = self._iso_window(lookback_days)
+    tpl_path = self.runner.find_template(self.SKILL_NAME, "macd_momentum_velocity_2stage.yl2")
+
+    metric_type_val = "value_sum" if "bytes" in metric_name else "event_count_sum"
+    obs_agg = "sum(network.sent_bytes)" if "bytes" in metric_name else "count(metadata.id)"
+
+    params = {
+        "event_type": event_type,
+        "entity_field": dimension_key,
+        "value_filter": "",
+        "observed_aggregation": obs_agg,
+        "target_metric_name": metric_name,
+        "metric_type_val": metric_type_val,
+        "dimension_key": dimension_key,
+        "extra_dimensions": "",
+    }
+
+    rendered = self.runner.render_template(tpl_path, params)
+    resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
+    rows = self.runner.parse_stats_response(resp)
+
+    macd_score = 0.0
+    fast_z = 0.0
+    slow_z = 0.0
+    if rows:
+      top_row = rows[0]
+      macd_score = float(top_row.get("macd_momentum_score", top_row.get("$macd_momentum_score", 0.0)) or 0.0)
+      fast_z = float(top_row.get("fast_z", top_row.get("$fast_z", 0.0)) or 0.0)
+      slow_z = float(top_row.get("slow_z", top_row.get("$slow_z", 0.0)) or 0.0)
+
+    cri = self.runner.calculate_cri(macd_score)
+    return {
+        "entity": entity,
+        "model": "MACD_MOMENTUM_VELOCITY",
+        "macd_momentum_score": round(macd_score, 2),
+        "fast_z": round(fast_z, 2),
+        "slow_z": round(slow_z, 2),
+        "top_z_score": round(macd_score, 2),
+        "calibrated_risk_index": cri,
+        "is_outlier": cri >= 60 or macd_score >= 3.0,
         "stats_rows": len(rows),
         "executed_query": rendered,
     }
@@ -328,6 +408,7 @@ order:
         "distinct_micro_signatures": distinct_sigs,
         "calibrated_risk_index": cri,
         "is_outlier": cri >= 46,
+        "stats_rows": len(rows),
         "executed_query": rendered,
     }
 
@@ -392,5 +473,6 @@ order:
         "observed_events": observed,
         "calibrated_risk_index": cri,
         "is_outlier": cri >= 60 or top_z >= 3.0,
+        "stats_rows": len(rows),
         "executed_query": query,
     }

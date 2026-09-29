@@ -400,114 +400,518 @@ class AutonomousHunterEngine:
 
         # --- 3. Deterministic Fast-Path: Poisson Burst Spray ---
         elif "poisson_burst" in query_str or "spray" in query_str:
-          spray_result = await StatsHunterEngine(tenant).run_poisson_burst_spray(
-              session=session,
-              entity=req.target_entity,
-              lookback_days=req.lookback_days,
-          )
-          cri = spray_result["calibrated_risk_index"]
-          verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
-          markdown_report = f"# Poisson Burst Spray Analysis: {req.target_entity}\n\n**CRI**: {cri}/100\n**Is Outlier**: {spray_result['is_outlier']}\n**Rows**: {spray_result['stats_rows']}"
-          case_wall_updated = False
-          if req.case_id and req.post_to_case_wall:
-            await session.call_tool(
-                "create_case_comment",
-                {
-                    "projectId": tenant.project_id,
-                    "customerId": tenant.customer_id,
-                    "region": tenant.region,
-                    "caseId": str(req.case_id),
-                    "comment": markdown_report,
-                },
+          try:
+            spray_result = await StatsHunterEngine(tenant).run_poisson_burst_spray(
+                session=session,
+                entity=req.target_entity,
+                lookback_days=req.lookback_days,
             )
-            case_wall_updated = True
-          return JITHuntResponse(
-              status="SUCCESS",
-              triage=TriageSummary(
-                  calibrated_risk_index=float(cri),
-                  verdict=verdict,
-                  is_outlier=spray_result["is_outlier"],
-                  primary_vector="poisson_burst_clustering",
-                  top_z_score=float(spray_result.get("top_fano", 0.0)),
-                  recommended_action="LOCK_ACCOUNT" if cri >= 80 else "MONITOR",
-                  entities_to_quarantine=[req.target_entity] if spray_result["is_outlier"] else [],
-                  mitre_tactics=["TA0006"] if spray_result["is_outlier"] else [],
-              ),
-              clean_hand_off=CleanHandOffPayload(
-                  target_entity=req.target_entity,
-                  entity_type=req.entity_type,
-                  evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                  primary_model="secops-statistical-hunter",
-                  outlier_topology="POISSON_BURST",
-                  mitre_tactics_mapped=["TA0006"] if spray_result["is_outlier"] else [],
-                  recommended_swarm_playbook="CREDENTIAL_SPRAY_REMEDIATION",
-                  escalation_action="LOCK_ACCOUNT" if cri >= 80 else "MONITOR",
-              ),
-              forensics=ForensicsSummary(
-                  executed_query=spray_result["executed_query"],
-                  markdown_report=markdown_report,
-              ),
-              case_wall_updated=case_wall_updated,
-          )
+            cri = spray_result["calibrated_risk_index"]
+            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            markdown_report = f"# Poisson Burst Spray Analysis: {req.target_entity}\n\n**CRI**: {cri}/100\n**Is Outlier**: {spray_result['is_outlier']}\n**Rows**: {spray_result['stats_rows']}"
+            case_wall_updated = False
+            if req.case_id and req.post_to_case_wall:
+              await session.call_tool(
+                  "create_case_comment",
+                  {
+                      "projectId": tenant.project_id,
+                      "customerId": tenant.customer_id,
+                      "region": tenant.region,
+                      "caseId": str(req.case_id),
+                      "comment": markdown_report,
+                  },
+              )
+              case_wall_updated = True
+            return JITHuntResponse(
+                status="SUCCESS",
+                triage=TriageSummary(
+                    calibrated_risk_index=float(cri),
+                    verdict=verdict,
+                    is_outlier=spray_result["is_outlier"],
+                    primary_vector="poisson_burst_clustering",
+                    top_z_score=float(spray_result.get("top_fano", 0.0)),
+                    recommended_action="LOCK_ACCOUNT" if cri >= 80 else "MONITOR",
+                    entities_to_quarantine=[req.target_entity] if spray_result["is_outlier"] else [],
+                    mitre_tactics=["TA0006"] if spray_result["is_outlier"] else [],
+                ),
+                clean_hand_off=CleanHandOffPayload(
+                    target_entity=req.target_entity,
+                    entity_type=req.entity_type,
+                    evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    primary_model="secops-statistical-hunter",
+                    outlier_topology="POISSON_BURST",
+                    mitre_tactics_mapped=["TA0006"] if spray_result["is_outlier"] else [],
+                    recommended_swarm_playbook="CREDENTIAL_SPRAY_REMEDIATION",
+                    escalation_action="LOCK_ACCOUNT" if cri >= 80 else "MONITOR",
+                ),
+                forensics=ForensicsSummary(
+                    executed_query=spray_result["executed_query"],
+                    markdown_report=markdown_report,
+                ),
+                case_wall_updated=case_wall_updated,
+            )
+          except Exception as fast_path_err:
+            logger.warning(
+                f"Deterministic Poisson burst fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
+            )
 
         # --- 4. Deterministic Fast-Path: Cloud Infrastructure CRUD Surge ---
         elif "cloud_crud" in query_str or "cloud_surge" in query_str:
-          cloud_result = await RiskMetricsEngine(tenant).run_cloud_crud_surge(
-              session=session,
-              username=req.target_entity,
-              lookback_days=req.lookback_days,
-          )
-          cri = cloud_result["calibrated_risk_index"]
-          verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
-          markdown_report = (
-              f"# Cloud Infrastructure CRUD Analysis: {req.target_entity}\n\n"
-              f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
-              f"**Top Z-Score**: {cloud_result['top_z_score']}σ\n"
-              f"**Observed Cloud Modifications**: {cloud_result['observed_events']}\n\n"
-              f"## Forensic Details\n"
-              f"- Evaluated resource creation, deletion, modification, and permissions changes over a {req.lookback_days}-day horizon against the 30-day precomputed behavioral baseline.\n"
-          )
-          case_wall_updated = False
-          if req.case_id and req.post_to_case_wall:
-            await session.call_tool(
-                "create_case_comment",
-                {
-                    "projectId": tenant.project_id,
-                    "customerId": tenant.customer_id,
-                    "region": tenant.region,
-                    "caseId": str(req.case_id),
-                    "comment": markdown_report,
-                },
+          try:
+            cloud_result = await RiskMetricsEngine(tenant).run_cloud_crud_surge(
+                session=session,
+                username=req.target_entity,
+                lookback_days=req.lookback_days,
             )
-            case_wall_updated = True
-          return JITHuntResponse(
-              status="SUCCESS",
-              triage=TriageSummary(
-                  calibrated_risk_index=float(cri),
-                  verdict=verdict,
-                  is_outlier=cloud_result["is_outlier"],
-                  primary_vector="cloud_crud_surge",
-                  top_z_score=float(cloud_result.get("top_z_score", 0.0)),
-                  recommended_action="REVOKE_IAM_ROLES" if cri >= 80 else "MONITOR",
-                  entities_to_quarantine=[req.target_entity] if cloud_result["is_outlier"] else [],
-                  mitre_tactics=["TA0003", "TA0004"] if cloud_result["is_outlier"] else [],
-              ),
-              clean_hand_off=CleanHandOffPayload(
-                  target_entity=req.target_entity,
-                  entity_type=req.entity_type,
-                  evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                  primary_model="secops-risk-metrics-multistage",
-                  outlier_topology="CLOUD_CRUD_SURGE",
-                  mitre_tactics_mapped=["TA0003", "TA0004"] if cloud_result["is_outlier"] else [],
-                  recommended_swarm_playbook="IAM_ABUSE_INVESTIGATION",
-                  escalation_action="REVOKE_IAM_ROLES" if cri >= 80 else "MONITOR",
-              ),
-              forensics=ForensicsSummary(
-                  executed_query=cloud_result["executed_query"],
-                  markdown_report=markdown_report,
-              ),
-              case_wall_updated=case_wall_updated,
-          )
+            cri = cloud_result["calibrated_risk_index"]
+            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            markdown_report = (
+                f"# Cloud Infrastructure CRUD Analysis: {req.target_entity}\n\n"
+                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
+                f"**Top Z-Score**: {cloud_result['top_z_score']}σ\n"
+                f"**Observed Cloud Modifications**: {cloud_result['observed_events']}\n\n"
+                f"## Forensic Details\n"
+                f"- Evaluated resource creation, deletion, modification, and permissions changes over a {req.lookback_days}-day horizon against the 30-day precomputed behavioral baseline.\n"
+            )
+            case_wall_updated = False
+            if req.case_id and req.post_to_case_wall:
+              await session.call_tool(
+                  "create_case_comment",
+                  {
+                      "projectId": tenant.project_id,
+                      "customerId": tenant.customer_id,
+                      "region": tenant.region,
+                      "caseId": str(req.case_id),
+                      "comment": markdown_report,
+                  },
+              )
+              case_wall_updated = True
+            return JITHuntResponse(
+                status="SUCCESS",
+                triage=TriageSummary(
+                    calibrated_risk_index=float(cri),
+                    verdict=verdict,
+                    is_outlier=cloud_result["is_outlier"],
+                    primary_vector="cloud_crud_surge",
+                    top_z_score=float(cloud_result.get("top_z_score", 0.0)),
+                    recommended_action="REVOKE_IAM_ROLES" if cri >= 80 else "MONITOR",
+                    entities_to_quarantine=[req.target_entity] if cloud_result["is_outlier"] else [],
+                    mitre_tactics=["TA0003", "TA0004"] if cloud_result["is_outlier"] else [],
+                ),
+                clean_hand_off=CleanHandOffPayload(
+                    target_entity=req.target_entity,
+                    entity_type=req.entity_type,
+                    evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    primary_model="secops-risk-metrics-multistage",
+                    outlier_topology="CLOUD_CRUD_SURGE",
+                    mitre_tactics_mapped=["TA0003", "TA0004"] if cloud_result["is_outlier"] else [],
+                    recommended_swarm_playbook="IAM_ABUSE_INVESTIGATION",
+                    escalation_action="REVOKE_IAM_ROLES" if cri >= 80 else "MONITOR",
+                ),
+                forensics=ForensicsSummary(
+                    executed_query=cloud_result["executed_query"],
+                    markdown_report=markdown_report,
+                ),
+                case_wall_updated=case_wall_updated,
+            )
+          except Exception as fast_path_err:
+            logger.warning(
+                f"Deterministic Cloud CRUD fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
+            )
+
+        # --- 5. Deterministic Fast-Path: Circadian von Mises Temporal Anomaly ---
+        elif "circadian" in query_str or "von_mises" in query_str:
+          try:
+            circ_result = await RiskMetricsEngine(tenant).run_circadian_von_mises(
+                session=session,
+                entity=req.target_entity,
+                lookback_days=req.lookback_days,
+            )
+            cri = circ_result["calibrated_risk_index"]
+            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            markdown_report = (
+                f"# Circadian von Mises Temporal Analysis: {req.target_entity}\n\n"
+                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
+                f"**Circadian Threat Score**: {circ_result['circadian_threat_score']}\n"
+                f"**Hourly Z-Score**: {circ_result['hourly_z']}σ (Hour UTC: {circ_result['event_hour']})\n"
+                f"**Is Outlier**: {circ_result['is_outlier']}\n\n"
+                f"## Forensic Details\n"
+                f"- Evaluated circular clock distance departure against 30-day precomputed hourly baseline.\n"
+            )
+            case_wall_updated = False
+            if req.case_id and req.post_to_case_wall:
+              await session.call_tool(
+                  "create_case_comment",
+                  {
+                      "projectId": tenant.project_id,
+                      "customerId": tenant.customer_id,
+                      "region": tenant.region,
+                      "caseId": str(req.case_id),
+                      "comment": markdown_report,
+                  },
+              )
+              case_wall_updated = True
+            return JITHuntResponse(
+                status="SUCCESS",
+                triage=TriageSummary(
+                    calibrated_risk_index=float(cri),
+                    verdict=verdict,
+                    is_outlier=circ_result["is_outlier"],
+                    primary_vector="circadian_temporal_anomaly",
+                    top_z_score=float(circ_result.get("top_z_score", 0.0)),
+                    recommended_action="FORCE_MFA_CHALLENGE" if cri >= 80 else "MONITOR",
+                    entities_to_quarantine=[req.target_entity] if circ_result["is_outlier"] else [],
+                    mitre_tactics=["TA0001"] if circ_result["is_outlier"] else [],
+                ),
+                clean_hand_off=CleanHandOffPayload(
+                    target_entity=req.target_entity,
+                    entity_type=req.entity_type,
+                    evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    primary_model="secops-risk-metrics-multistage",
+                    outlier_topology="CIRCADIAN_TEMPORAL_DEPARTURE",
+                    mitre_tactics_mapped=["TA0001"] if circ_result["is_outlier"] else [],
+                    recommended_swarm_playbook="OFF_HOURS_ACCESS_CONTAINMENT",
+                    escalation_action="FORCE_MFA_CHALLENGE" if cri >= 80 else "MONITOR",
+                ),
+                forensics=ForensicsSummary(
+                    executed_query=circ_result["executed_query"],
+                    markdown_report=markdown_report,
+                ),
+                case_wall_updated=case_wall_updated,
+            )
+          except Exception as fast_path_err:
+            logger.warning(
+                f"Deterministic Circadian fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
+            )
+
+        # --- 6. Deterministic Fast-Path: MACD Momentum Velocity ---
+        elif "macd" in query_str or "momentum" in query_str:
+          try:
+            macd_result = await RiskMetricsEngine(tenant).run_macd_momentum_velocity(
+                session=session,
+                entity=req.target_entity,
+                lookback_days=req.lookback_days,
+            )
+            cri = macd_result["calibrated_risk_index"]
+            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            markdown_report = (
+                f"# MACD Momentum Velocity Analysis: {req.target_entity}\n\n"
+                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
+                f"**MACD Momentum Score**: {macd_result['macd_momentum_score']}\n"
+                f"**Fast Z**: {macd_result['fast_z']}σ | **Slow Z**: {macd_result['slow_z']}σ\n"
+                f"**Is Outlier**: {macd_result['is_outlier']}\n\n"
+                f"## Forensic Details\n"
+                f"- Evaluated dual-spine momentum acceleration against 30-day precomputed anchor.\n"
+            )
+            case_wall_updated = False
+            if req.case_id and req.post_to_case_wall:
+              await session.call_tool(
+                  "create_case_comment",
+                  {
+                      "projectId": tenant.project_id,
+                      "customerId": tenant.customer_id,
+                      "region": tenant.region,
+                      "caseId": str(req.case_id),
+                      "comment": markdown_report,
+                  },
+              )
+              case_wall_updated = True
+            return JITHuntResponse(
+                status="SUCCESS",
+                triage=TriageSummary(
+                    calibrated_risk_index=float(cri),
+                    verdict=verdict,
+                    is_outlier=macd_result["is_outlier"],
+                    primary_vector="macd_momentum_acceleration",
+                    top_z_score=float(macd_result.get("top_z_score", 0.0)),
+                    recommended_action="THROTTLE_EGRESS" if cri >= 80 else "MONITOR",
+                    entities_to_quarantine=[req.target_entity] if macd_result["is_outlier"] else [],
+                    mitre_tactics=["TA0010"] if macd_result["is_outlier"] else [],
+                ),
+                clean_hand_off=CleanHandOffPayload(
+                    target_entity=req.target_entity,
+                    entity_type=req.entity_type,
+                    evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    primary_model="secops-risk-metrics-multistage",
+                    outlier_topology="MACD_MOMENTUM_DIVERGENCE",
+                    mitre_tactics_mapped=["TA0010"] if macd_result["is_outlier"] else [],
+                    recommended_swarm_playbook="EXFILTRATION_MOMENTUM_CONTAINMENT",
+                    escalation_action="THROTTLE_EGRESS" if cri >= 80 else "MONITOR",
+                ),
+                forensics=ForensicsSummary(
+                    executed_query=macd_result["executed_query"],
+                    markdown_report=markdown_report,
+                ),
+                case_wall_updated=case_wall_updated,
+            )
+          except Exception as fast_path_err:
+            logger.warning(
+                f"Deterministic MACD fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
+            )
+
+        # --- 7. Deterministic Fast-Path: Shannon Character Entropy ---
+        elif "shannon" in query_str or "entropy" in query_str:
+          try:
+            shannon_result = await StatsHunterEngine(tenant).run_shannon_character_entropy(
+                session=session,
+                entity=req.target_entity,
+                lookback_days=req.lookback_days,
+            )
+            cri = shannon_result["calibrated_risk_index"]
+            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            sample_tok = shannon_result.get("sample_token") or "N/A"
+            markdown_report = (
+                f"# Shannon Character Entropy Analysis: {req.target_entity}\n\n"
+                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
+                f"**Entropy Score**: {shannon_result['shannon_entropy_score']}\n"
+                f"**Sample Token/Command**: `{sample_tok}`\n"
+                f"**Is Outlier**: {shannon_result['is_outlier']}\n\n"
+                f"## Forensic Details\n"
+                f"- Evaluated token length and character-class randomness for command obfuscation and DGA payloads.\n"
+            )
+            case_wall_updated = False
+            if req.case_id and req.post_to_case_wall:
+              await session.call_tool(
+                  "create_case_comment",
+                  {
+                      "projectId": tenant.project_id,
+                      "customerId": tenant.customer_id,
+                      "region": tenant.region,
+                      "caseId": str(req.case_id),
+                      "comment": markdown_report,
+                  },
+              )
+              case_wall_updated = True
+            return JITHuntResponse(
+                status="SUCCESS",
+                triage=TriageSummary(
+                    calibrated_risk_index=float(cri),
+                    verdict=verdict,
+                    is_outlier=shannon_result["is_outlier"],
+                    primary_vector="command_line_obfuscation_entropy",
+                    top_z_score=float(shannon_result.get("top_z_score", 0.0)),
+                    recommended_action="TERMINATE_PROCESS" if cri >= 80 else "MONITOR",
+                    entities_to_quarantine=[req.target_entity] if shannon_result["is_outlier"] else [],
+                    mitre_tactics=["TA0005"] if shannon_result["is_outlier"] else [],
+                ),
+                clean_hand_off=CleanHandOffPayload(
+                    target_entity=req.target_entity,
+                    entity_type=req.entity_type,
+                    evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    primary_model="secops-statistical-hunter",
+                    outlier_topology="SHANNON_CHARACTER_ENTROPY",
+                    mitre_tactics_mapped=["TA0005"] if shannon_result["is_outlier"] else [],
+                    recommended_swarm_playbook="OBFUSCATED_COMMAND_REMEDIATION",
+                    escalation_action="TERMINATE_PROCESS" if cri >= 80 else "MONITOR",
+                ),
+                forensics=ForensicsSummary(
+                    executed_query=shannon_result["executed_query"],
+                    markdown_report=markdown_report,
+                ),
+                case_wall_updated=case_wall_updated,
+            )
+          except Exception as fast_path_err:
+            logger.warning(
+                f"Deterministic Shannon entropy fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
+            )
+
+        # --- 8. Deterministic Fast-Path: Markov 2-Gram Transition Rarity ---
+        elif "markov" in query_str or "transition" in query_str:
+          try:
+            markov_result = await StatsHunterEngine(tenant).run_markov_transition_rarity(
+                session=session,
+                host=req.target_entity,
+                lookback_days=req.lookback_days,
+            )
+            cri = markov_result["calibrated_risk_index"]
+            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            p_proc = markov_result.get("parent_process") or "UNKNOWN"
+            c_proc = markov_result.get("child_process") or "UNKNOWN"
+            markdown_report = (
+                f"# Markov Process Transition Analysis: {req.target_entity}\n\n"
+                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
+                f"**Markov Threat Score**: {markov_result['markov_threat_score']}\n"
+                f"**Information Surprisal**: {markov_result['surprisal_score']}\n"
+                f"**Transition**: `{p_proc}` ➔ `{c_proc}`\n"
+                f"**Is Outlier**: {markov_result['is_outlier']}\n\n"
+                f"## Forensic Details\n"
+                f"- Evaluated conditional transition probability P(Child | Parent) to detect rare Living-off-the-Land execution chains.\n"
+            )
+            case_wall_updated = False
+            if req.case_id and req.post_to_case_wall:
+              await session.call_tool(
+                  "create_case_comment",
+                  {
+                      "projectId": tenant.project_id,
+                      "customerId": tenant.customer_id,
+                      "region": tenant.region,
+                      "caseId": str(req.case_id),
+                      "comment": markdown_report,
+                  },
+              )
+              case_wall_updated = True
+            return JITHuntResponse(
+                status="SUCCESS",
+                triage=TriageSummary(
+                    calibrated_risk_index=float(cri),
+                    verdict=verdict,
+                    is_outlier=markov_result["is_outlier"],
+                    primary_vector="markov_process_transition_rarity",
+                    top_z_score=float(markov_result.get("top_z_score", 0.0)),
+                    recommended_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
+                    entities_to_quarantine=[req.target_entity] if markov_result["is_outlier"] else [],
+                    mitre_tactics=["TA0002", "TA0005"] if markov_result["is_outlier"] else [],
+                ),
+                clean_hand_off=CleanHandOffPayload(
+                    target_entity=req.target_entity,
+                    entity_type=req.entity_type,
+                    evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    primary_model="secops-statistical-hunter",
+                    outlier_topology="MARKOV_TRANSITION_RARITY",
+                    mitre_tactics_mapped=["TA0002", "TA0005"] if markov_result["is_outlier"] else [],
+                    recommended_swarm_playbook="LIVING_OFF_THE_LAND_CONTAINMENT",
+                    escalation_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
+                ),
+                forensics=ForensicsSummary(
+                    executed_query=markov_result["executed_query"],
+                    markdown_report=markdown_report,
+                ),
+                case_wall_updated=case_wall_updated,
+            )
+          except Exception as fast_path_err:
+            logger.warning(
+                f"Deterministic Markov transition fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
+            )
+
+        # --- 9. Deterministic Fast-Path: Zipfian Process Rarity ---
+        elif "zipf" in query_str or "zipfian" in query_str:
+          try:
+            zipf_result = await StatsHunterEngine(tenant).run_zipfian_process_rarity(
+                session=session,
+                host=req.target_entity,
+                lookback_days=req.lookback_days,
+            )
+            cri = zipf_result["calibrated_risk_index"]
+            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            rare_bin = zipf_result.get("rare_binary") or "UNKNOWN"
+            markdown_report = (
+                f"# Zipfian Process Rarity Analysis: {req.target_entity}\n\n"
+                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
+                f"**Zipf Rarity Score**: {zipf_result['zipf_rarity_score']}\n"
+                f"**Rare Binary**: `{rare_bin}`\n"
+                f"**Is Outlier**: {zipf_result['is_outlier']}\n\n"
+                f"## Forensic Details\n"
+                f"- Evaluated power-law asymptotic long tail departure across fleetwide binary adoption.\n"
+            )
+            case_wall_updated = False
+            if req.case_id and req.post_to_case_wall:
+              await session.call_tool(
+                  "create_case_comment",
+                  {
+                      "projectId": tenant.project_id,
+                      "customerId": tenant.customer_id,
+                      "region": tenant.region,
+                      "caseId": str(req.case_id),
+                      "comment": markdown_report,
+                  },
+              )
+              case_wall_updated = True
+            return JITHuntResponse(
+                status="SUCCESS",
+                triage=TriageSummary(
+                    calibrated_risk_index=float(cri),
+                    verdict=verdict,
+                    is_outlier=zipf_result["is_outlier"],
+                    primary_vector="zipfian_rare_tool_execution",
+                    top_z_score=float(zipf_result.get("top_z_score", 0.0)),
+                    recommended_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
+                    entities_to_quarantine=[req.target_entity] if zipf_result["is_outlier"] else [],
+                    mitre_tactics=["TA0002"] if zipf_result["is_outlier"] else [],
+                ),
+                clean_hand_off=CleanHandOffPayload(
+                    target_entity=req.target_entity,
+                    entity_type=req.entity_type,
+                    evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    primary_model="secops-statistical-hunter",
+                    outlier_topology="ZIPFIAN_PROCESS_RARITY",
+                    mitre_tactics_mapped=["TA0002"] if zipf_result["is_outlier"] else [],
+                    recommended_swarm_playbook="RARE_ADMIN_TOOL_REMEDIATION",
+                    escalation_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
+                ),
+                forensics=ForensicsSummary(
+                    executed_query=zipf_result["executed_query"],
+                    markdown_report=markdown_report,
+                ),
+                case_wall_updated=case_wall_updated,
+            )
+          except Exception as fast_path_err:
+            logger.warning(
+                f"Deterministic Zipfian fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
+            )
+
+        # --- 10. Deterministic Fast-Path: EWMA Burst Velocity ---
+        elif "ewma" in query_str or "burst_velocity" in query_str:
+          try:
+            ewma_result = await StatsHunterEngine(tenant).run_ewma_burst_velocity(
+                session=session,
+                entity=req.target_entity,
+                lookback_days=req.lookback_days,
+            )
+            cri = ewma_result["calibrated_risk_index"]
+            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            markdown_report = (
+                f"# EWMA Burst Velocity Analysis: {req.target_entity}\n\n"
+                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
+                f"**EWMA Velocity Score**: {ewma_result['ewma_velocity_score']}σ\n"
+                f"**Is Outlier**: {ewma_result['is_outlier']}\n\n"
+                f"## Forensic Details\n"
+                f"- Evaluated intraday exponential smoothing divergence to capture acute kinetic rate surges.\n"
+            )
+            case_wall_updated = False
+            if req.case_id and req.post_to_case_wall:
+              await session.call_tool(
+                  "create_case_comment",
+                  {
+                      "projectId": tenant.project_id,
+                      "customerId": tenant.customer_id,
+                      "region": tenant.region,
+                      "caseId": str(req.case_id),
+                      "comment": markdown_report,
+                  },
+              )
+              case_wall_updated = True
+            return JITHuntResponse(
+                status="SUCCESS",
+                triage=TriageSummary(
+                    calibrated_risk_index=float(cri),
+                    verdict=verdict,
+                    is_outlier=ewma_result["is_outlier"],
+                    primary_vector="ewma_kinetic_burst_velocity",
+                    top_z_score=float(ewma_result.get("top_z_score", 0.0)),
+                    recommended_action="RATE_LIMIT_ENTITY" if cri >= 80 else "MONITOR",
+                    entities_to_quarantine=[req.target_entity] if ewma_result["is_outlier"] else [],
+                    mitre_tactics=["TA0010"] if ewma_result["is_outlier"] else [],
+                ),
+                clean_hand_off=CleanHandOffPayload(
+                    target_entity=req.target_entity,
+                    entity_type=req.entity_type,
+                    evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    primary_model="secops-statistical-hunter",
+                    outlier_topology="EWMA_BURST_VELOCITY",
+                    mitre_tactics_mapped=["TA0010"] if ewma_result["is_outlier"] else [],
+                    recommended_swarm_playbook="KINETIC_BURST_CONTAINMENT",
+                    escalation_action="RATE_LIMIT_ENTITY" if cri >= 80 else "MONITOR",
+                ),
+                forensics=ForensicsSummary(
+                    executed_query=ewma_result["executed_query"],
+                    markdown_report=markdown_report,
+                ),
+                case_wall_updated=case_wall_updated,
+            )
+          except Exception as fast_path_err:
+            logger.warning(
+                f"Deterministic EWMA fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
+            )
 
         mcp_tools = await session.list_tools()
 
