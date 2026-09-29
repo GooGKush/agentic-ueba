@@ -506,3 +506,110 @@ def test_watchdog_state_activity_report(tmp_path):
   assert rep_all["total_cases_triaged"] == 3
 
 
+@pytest.mark.anyio
+async def test_watchdog_connector_events_extraction_fallback(tmp_path, monkeypatch):
+  mock_engine = MagicMock()
+  state_file = tmp_path / "fallback_state.json"
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  daemon = WatchdogDaemon(engine=mock_engine, tenant_config=tenant, state_file=state_file)
+
+  # Mock JIT hunt response
+  mock_resp = JITHuntResponse(
+      status="SUCCESS",
+      triage=TriageSummary(
+          calibrated_risk_index=75.0,
+          verdict="HIGH_OUTLIER",
+          is_outlier=True,
+          primary_vector="c2_jitter",
+          top_z_score=3.8,
+          recommended_action="QUARANTINE",
+      ),
+      clean_hand_off=CleanHandOffPayload(
+          target_entity="10.10.20.60",
+          entity_type="IP",
+          evaluated_window="2026-09-29",
+          primary_model="secops-statistical-hunter",
+          outlier_topology="C2_BEACONING",
+          mitre_tactics_mapped=[],
+          recommended_swarm_playbook="ISOLATE_HOST",
+          escalation_action="QUARANTINE",
+      ),
+      forensics=ForensicsSummary(
+          executed_query="// test query",
+          markdown_report="# Triage Report",
+      ),
+      case_wall_updated=True,
+  )
+  mock_engine.execute_jit_hunt = AsyncMock(return_value=mock_resp)
+
+  mock_session = AsyncMock()
+  mock_session.initialize = AsyncMock()
+  mock_session.__aenter__.return_value = mock_session
+
+  cases_data = {
+      "cases": [
+          {"id": "case-filehash-only", "title": "ATI Rule Match for File IoC", "description": "IOC Alert"},
+      ]
+  }
+  # Alert only has a FILEHASH entity
+  alerts_data = {
+      "alerts": [
+          {
+              "name": "projects/.../caseAlerts/123",
+              "displayName": "ATI File IOC Match",
+              "entities": [{"identifier": "2fda6e766e1b5263d7d957f2fcc998c438bd92c7b7e566e6d31872c254fa88bb", "type": "FILEHASH"}],
+          }
+      ]
+  }
+  # Connector events has underlying principal asset IP
+  connector_events_data = {
+      "connectorEvents": [
+          {
+              "eventJsonData": {
+                  "rawEvent": json.dumps({
+                      "_rawDataFields": {
+                          "event_principal_asset_ip_1": "10.10.20.60",
+                          "event_target_file_sha256": "2fda6e766e1b5263d7d957f2fcc998c438bd92c7b7e566e6d31872c254fa88bb",
+                      }
+                  })
+              }
+          }
+      ]
+  }
+
+  async def mock_call_tool(tool_name, args):
+    mock_res = MagicMock()
+    if tool_name == "list_cases":
+      mock_res.content = [MagicMock(text=json.dumps(cases_data))]
+    elif tool_name == "list_case_alerts":
+      mock_res.content = [MagicMock(text=json.dumps(alerts_data))]
+    elif tool_name == "list_connector_events":
+      mock_res.content = [MagicMock(text=json.dumps(connector_events_data))]
+    elif tool_name == "list_case_comments":
+      mock_res.content = [MagicMock(text=json.dumps({"caseComments": []}))]
+    else:
+      mock_res.content = [MagicMock(text="{}")]
+    return mock_res
+
+  mock_session.call_tool = mock_call_tool
+
+  class MockContext:
+    async def __aenter__(self):
+      return (AsyncMock(), AsyncMock())
+    async def __aexit__(self, *args):
+      pass
+
+  monkeypatch.setattr("src.watchdog.streamable_http_client", lambda *args, **kwargs: MockContext())
+  monkeypatch.setattr("src.watchdog.ClientSession", lambda *args, **kwargs: mock_session)
+  monkeypatch.setattr("src.config.TenantConfig.get_auth_headers", lambda self: {"Authorization": "Bearer test"})
+
+  results = await daemon.scan_once()
+  assert len(results) == 1
+  assert daemon.state.is_seen("case-filehash-only")
+  assert mock_engine.execute_jit_hunt.call_count == 1
+  call_args = mock_engine.execute_jit_hunt.call_args[0][0]
+  assert call_args.target_entity == "10.10.20.60"
+  assert call_args.entity_type == "IP"
+
+
+
