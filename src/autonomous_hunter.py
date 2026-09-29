@@ -342,55 +342,61 @@ class AutonomousHunterEngine:
 
         # --- 2. Deterministic Fast-Path: C2 Beaconing Jitter ---
         elif "c2_jitter" in query_str or "beaconing" in query_str:
-          jitter_result = await StatsHunterEngine(tenant).run_c2_beaconing_jitter(
-              session=session,
-              src_ip=req.target_entity,
-              lookback_days=req.lookback_days,
-          )
-          cri = jitter_result["calibrated_risk_index"]
-          verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
-          markdown_report = f"# C2 Beaconing Jitter Analysis: {req.target_entity}\n\n**CRI**: {cri}/100\n**Is Outlier**: {jitter_result['is_outlier']}\n**Rows**: {jitter_result['stats_rows']}"
-          case_wall_updated = False
-          if req.case_id and req.post_to_case_wall:
-            await session.call_tool(
-                "create_case_comment",
-                {
-                    "projectId": tenant.project_id,
-                    "customerId": tenant.customer_id,
-                    "region": tenant.region,
-                    "caseId": str(req.case_id),
-                    "comment": markdown_report,
-                },
+          try:
+            jitter_result = await StatsHunterEngine(tenant).run_c2_beaconing_jitter(
+                session=session,
+                src_ip=req.target_entity,
+                lookback_days=req.lookback_days,
             )
-            case_wall_updated = True
-          return JITHuntResponse(
-              status="SUCCESS",
-              triage=TriageSummary(
-                  calibrated_risk_index=float(cri),
-                  verdict=verdict,
-                  is_outlier=jitter_result["is_outlier"],
-                  primary_vector="c2_timing_regularity",
-                  top_z_score=float(jitter_result.get("top_z_score", 0.0)),
-                  recommended_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
-                  entities_to_quarantine=[req.target_entity] if jitter_result["is_outlier"] else [],
-                  mitre_tactics=["TA0011"] if jitter_result["is_outlier"] else [],
-              ),
-              clean_hand_off=CleanHandOffPayload(
-                  target_entity=req.target_entity,
-                  entity_type=req.entity_type,
-                  evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                  primary_model="secops-statistical-hunter",
-                  outlier_topology="C2_REGULARITY",
-                  mitre_tactics_mapped=["TA0011"] if jitter_result["is_outlier"] else [],
-                  recommended_swarm_playbook="C2_CONTAINMENT",
-                  escalation_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
-              ),
-              forensics=ForensicsSummary(
-                  executed_query=jitter_result["executed_query"],
-                  markdown_report=markdown_report,
-              ),
-              case_wall_updated=case_wall_updated,
-          )
+            cri = jitter_result["calibrated_risk_index"]
+            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            rows_count = jitter_result.get("stats_rows", 0)
+            markdown_report = f"# C2 Beaconing Jitter Analysis: {req.target_entity}\n\n**CRI**: {cri}/100\n**Is Outlier**: {jitter_result['is_outlier']}\n**Rows**: {rows_count}"
+            case_wall_updated = False
+            if req.case_id and req.post_to_case_wall:
+              await session.call_tool(
+                  "create_case_comment",
+                  {
+                      "projectId": tenant.project_id,
+                      "customerId": tenant.customer_id,
+                      "region": tenant.region,
+                      "caseId": str(req.case_id),
+                      "comment": markdown_report,
+                  },
+              )
+              case_wall_updated = True
+            return JITHuntResponse(
+                status="SUCCESS",
+                triage=TriageSummary(
+                    calibrated_risk_index=float(cri),
+                    verdict=verdict,
+                    is_outlier=jitter_result["is_outlier"],
+                    primary_vector="c2_timing_regularity",
+                    top_z_score=float(jitter_result.get("top_z_score", 0.0)),
+                    recommended_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
+                    entities_to_quarantine=[req.target_entity] if jitter_result["is_outlier"] else [],
+                    mitre_tactics=["TA0011"] if jitter_result["is_outlier"] else [],
+                ),
+                clean_hand_off=CleanHandOffPayload(
+                    target_entity=req.target_entity,
+                    entity_type=req.entity_type,
+                    evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    primary_model="secops-statistical-hunter",
+                    outlier_topology="C2_REGULARITY",
+                    mitre_tactics_mapped=["TA0011"] if jitter_result["is_outlier"] else [],
+                    recommended_swarm_playbook="C2_CONTAINMENT",
+                    escalation_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
+                ),
+                forensics=ForensicsSummary(
+                    executed_query=jitter_result["executed_query"],
+                    markdown_report=markdown_report,
+                ),
+                case_wall_updated=case_wall_updated,
+            )
+          except Exception as fast_path_err:
+            logger.warning(
+                f"Deterministic C2 jitter fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
+            )
 
         # --- 3. Deterministic Fast-Path: Poisson Burst Spray ---
         elif "poisson_burst" in query_str or "spray" in query_str:

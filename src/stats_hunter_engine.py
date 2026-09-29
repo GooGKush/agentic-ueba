@@ -85,6 +85,7 @@ class StatsHunterEngine:
         "target_destination": detected_dst,
         "calibrated_risk_index": risk_score,
         "is_outlier": is_beaconing,
+        "stats_rows": len(rows),
         "executed_query": rendered,
     }
 
