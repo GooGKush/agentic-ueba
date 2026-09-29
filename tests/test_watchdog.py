@@ -438,3 +438,69 @@ async def test_watchdog_wall_comment_idempotency(tmp_path, monkeypatch):
   assert mock_engine.execute_jit_hunt.call_count == 0
 
 
+def test_watchdog_state_activity_report(tmp_path):
+  from datetime import datetime, timedelta, timezone
+
+  state_file = tmp_path / "activity_state.json"
+  state = WatchdogState(state_file=state_file)
+
+  now = datetime.now(timezone.utc)
+  # 1. Recent case (30 mins ago)
+  ts_recent = (now - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+  state.record_case("case-1", {
+      "case_id": "case-1",
+      "case_title": "Recent Phish",
+      "entity": "user1",
+      "strategy": "CIRCADIAN_VON_MISES",
+      "cri": 75.0,
+      "verdict": "HIGH_OUTLIER",
+      "source": "WATCHDOG",
+      "timestamp": ts_recent,
+  })
+
+  # 2. Older case (5 hours ago)
+  ts_older = (now - timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+  state.record_case("case-2", {
+      "case_id": "case-2",
+      "case_title": "Older Spray",
+      "entity": "user2",
+      "strategy": "POISSON_BURST_CLUSTERING",
+      "cri": 45.0,
+      "verdict": "NOMINAL_BASELINE",
+      "source": "JIT_PLAYBOOK",
+      "timestamp": ts_older,
+  })
+
+  # 3. Very old case (2 days ago)
+  ts_oldest = (now - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+  state.record_case("case-3", {
+      "case_id": "case-3",
+      "case_title": "Old Beacon",
+      "entity": "10.0.0.5",
+      "strategy": "C2_BEACONING_JITTER",
+      "cri": 90.0,
+      "verdict": "CRITICAL_OUTLIER",
+      "source": "WATCHDOG",
+      "timestamp": ts_oldest,
+  })
+
+  # Test 1h lookback: should only return case-1
+  rep_1h = state.get_activity_report(timeframe="1h")
+  assert rep_1h["status"] == "SUCCESS"
+  assert rep_1h["total_cases_triaged"] == 1
+  assert rep_1h["cases"][0]["case_id"] == "case-1"
+  assert rep_1h["summary_by_verdict"] == {"HIGH_OUTLIER": 1}
+
+  # Test 24h lookback: should return case-1 and case-2
+  rep_24h = state.get_activity_report(timeframe="24h")
+  assert rep_24h["total_cases_triaged"] == 2
+  case_ids_24h = [c["case_id"] for c in rep_24h["cases"]]
+  assert "case-1" in case_ids_24h
+  assert "case-2" in case_ids_24h
+  assert "case-3" not in case_ids_24h
+
+  # Test all lookback: should return all 3 cases
+  rep_all = state.get_activity_report(timeframe="all")
+  assert rep_all["total_cases_triaged"] == 3
+
+

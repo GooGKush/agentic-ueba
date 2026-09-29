@@ -9,6 +9,7 @@ Exposes the autonomous JIT Threat Hunting Engine over two concurrent protocols:
 """
 
 import contextlib
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -336,7 +337,23 @@ async def hunt_ewma_burst(
   return resp.model_dump()
 
 
+@mcp.tool()
+async def get_case_activity(timeframe: str = "1h") -> Dict[str, Any]:
+  """Returns an activity summary report of cases touched by the agent (e.g. '1h', '24h', '7d', 'all')."""
+  return watchdog.state.get_activity_report(timeframe=timeframe)
+
+
 # --- 2. REST Endpoints (Playbook-to-Agent Gateway) ---
+
+@mcp.custom_route("/api/v1/cases/activity", methods=["GET"])
+async def cases_activity_endpoint(request: Request) -> JSONResponse:
+  """Returns an activity summary report of cases touched by the agent (e.g. ?timeframe=1h or ?timeframe=24h or ?hours=1)."""
+  timeframe = request.query_params.get("timeframe", "1h")
+  hours_param = request.query_params.get("hours")
+  hours = float(hours_param) if hours_param else None
+  report = watchdog.state.get_activity_report(timeframe=timeframe, hours=hours)
+  return JSONResponse(report, status_code=200)
+
 
 @mcp.custom_route("/api/v1/cases/scan", methods=["POST"])
 async def scan_cases_endpoint(request: Request) -> JSONResponse:
@@ -364,6 +381,26 @@ async def jit_playbook_endpoint(request: Request) -> JSONResponse:
     logger.info(f"Incoming JIT Playbook Request for entity: {req.target_entity} (Case: {req.case_id})")
     
     resp: JITHuntResponse = await engine.execute_jit_hunt(req)
+    if req.case_id:
+      try:
+        watchdog.state.record_case(
+            str(req.case_id),
+            {
+                "case_id": str(req.case_id),
+                "case_title": req.alert_name or "JIT Playbook Investigation",
+                "entity": req.target_entity,
+                "entity_type": req.entity_type,
+                "strategy": resp.clean_hand_off.outlier_topology or req.query or "JIT_HUNT",
+                "cri": resp.triage.calibrated_risk_index,
+                "verdict": resp.triage.verdict,
+                "primary_vector": resp.triage.primary_vector,
+                "source": "JIT_PLAYBOOK",
+                "case_wall_updated": resp.case_wall_updated,
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+        )
+      except Exception as rec_err:
+        logger.warning(f"Failed recording JIT case {req.case_id} to watchdog state: {rec_err}")
     return JSONResponse(resp.model_dump(), status_code=200)
 
   except Exception as e:
