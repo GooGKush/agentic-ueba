@@ -385,3 +385,56 @@ async def test_watchdog_queue_backpressure(tmp_path):
   assert status["queue_depth"] == 2
   assert status["queue_max_size"] == 2
 
+
+@pytest.mark.anyio
+async def test_watchdog_wall_comment_idempotency(tmp_path, monkeypatch):
+  mock_engine = MagicMock()
+  state_file = tmp_path / "idempotent_state.json"
+  daemon = WatchdogDaemon(engine=mock_engine, state_file=state_file)
+
+  # Mock MCP ClientSession
+  mock_session = AsyncMock()
+  mock_session.initialize = AsyncMock()
+  mock_session.__aenter__.return_value = mock_session
+
+  cases_data = {
+      "cases": [
+          {"id": "case-already-commented", "title": "Phishing Incident"},
+      ]
+  }
+  # Existing comment contains previous triage report signature
+  comments_data = {
+      "caseComments": [
+          {"comment": "#### 1. Statistical Outlier Report: Parametric Historical Z-Score\n* Calibrated Risk Index: 0/100"}
+      ]
+  }
+
+  async def mock_call_tool(tool_name, args):
+    mock_res = MagicMock()
+    if tool_name == "list_cases":
+      mock_res.content = [MagicMock(text=json.dumps(cases_data))]
+    elif tool_name == "list_case_comments":
+      mock_res.content = [MagicMock(text=json.dumps(comments_data))]
+    else:
+      mock_res.content = [MagicMock(text="{}")]
+    return mock_res
+
+  mock_session.call_tool = mock_call_tool
+
+  class MockContext:
+    async def __aenter__(self):
+      return (AsyncMock(), AsyncMock())
+    async def __aexit__(self, *args):
+      pass
+
+  monkeypatch.setattr("src.watchdog.streamable_http_client", lambda *args, **kwargs: MockContext())
+  monkeypatch.setattr("src.watchdog.ClientSession", lambda *args, **kwargs: mock_session)
+  monkeypatch.setattr("src.config.TenantConfig.get_auth_headers", lambda self: {"Authorization": "Bearer test"})
+
+  results = await daemon.scan_once()
+  # Must be skipped without calling execute_jit_hunt
+  assert len(results) == 0
+  assert daemon.state.is_seen("case-already-commented")
+  assert mock_engine.execute_jit_hunt.call_count == 0
+
+
