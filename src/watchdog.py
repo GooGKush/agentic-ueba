@@ -41,9 +41,10 @@ logger = logging.getLogger("WatchdogDaemon")
 class WatchdogState:
   """Persistent state tracking for processed cases with sliding-window FIFO eviction."""
 
-  def __init__(self, state_file: Optional[Path] = None, max_state_size: int = 2000):
+  def __init__(self, state_file: Optional[Path] = None, max_state_size: int = 2000, max_results: int = 1000):
     self.state_file = state_file or Path("data/watchdog_state.json")
     self.max_state_size = max_state_size
+    self.max_results = max_results
     self.seen_case_ids: OrderedDict[str, None] = OrderedDict()
     self.last_scan_time: Optional[str] = None
     self.triaged_count: int = 0
@@ -72,7 +73,7 @@ class WatchdogState:
           "seen_case_ids": list(self.seen_case_ids.keys()),
           "last_scan_time": self.last_scan_time,
           "triaged_count": self.triaged_count,
-          "recent_results": self.recent_results[-50:],  # keep last 50
+          "recent_results": self.recent_results[-self.max_results:],
       }
       # Atomic file replacement prevents corrupted state writes during process interruption
       tmp_file = self.state_file.with_suffix(".tmp")
@@ -94,8 +95,8 @@ class WatchdogState:
 
     if summary is not None:
       self.recent_results.append(summary)
-      if len(self.recent_results) > 50:
-        self.recent_results = self.recent_results[-50:]
+      if len(self.recent_results) > self.max_results:
+        self.recent_results = self.recent_results[-self.max_results:]
     self.save()
 
   def is_seen(self, case_id: str) -> bool:
@@ -103,9 +104,65 @@ class WatchdogState:
 
   def reset(self) -> None:
     self.seen_case_ids.clear()
-    self.triaged_count = 0
     self.recent_results.clear()
+    self.triaged_count = 0
     self.save()
+
+  def get_activity_report(self, timeframe: str = "1h", hours: Optional[float] = None) -> Dict[str, Any]:
+    """Generates an activity summary for cases triaged within a lookback window."""
+    now = datetime.now(timezone.utc)
+    lookback_delta: Optional[timedelta] = None
+
+    if hours is not None and hours > 0:
+      lookback_delta = timedelta(hours=hours)
+      timeframe_label = f"{hours}h"
+    else:
+      tf = (timeframe or "1h").lower().strip()
+      timeframe_label = tf
+      if tf in ("1h", "hour", "last_hour"):
+        lookback_delta = timedelta(hours=1)
+      elif tf in ("24h", "1d", "day", "today"):
+        lookback_delta = timedelta(days=1)
+      elif tf in ("7d", "week"):
+        lookback_delta = timedelta(days=7)
+      elif tf in ("all", "everything"):
+        lookback_delta = None
+      else:
+        lookback_delta = timedelta(hours=1)
+
+    cutoff = (now - lookback_delta) if lookback_delta else None
+
+    filtered_cases = []
+    verdicts: Dict[str, int] = {}
+    strategies: Dict[str, int] = {}
+
+    for res in reversed(self.recent_results):
+      ts_str = res.get("timestamp")
+      if ts_str and cutoff:
+        try:
+          clean_ts = ts_str.replace("Z", "+00:00")
+          dt = datetime.fromisoformat(clean_ts)
+          if dt < cutoff:
+            continue
+        except Exception:
+          pass
+
+      filtered_cases.append(res)
+      v = res.get("verdict", "UNKNOWN")
+      verdicts[v] = verdicts.get(v, 0) + 1
+      s = res.get("strategy", "UNKNOWN")
+      strategies[s] = strategies.get(s, 0) + 1
+
+    return {
+        "status": "SUCCESS",
+        "timeframe": timeframe_label,
+        "window_start": cutoff.strftime("%Y-%m-%dT%H:%M:%SZ") if cutoff else "ALL_TIME",
+        "window_end": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "total_cases_triaged": len(filtered_cases),
+        "summary_by_verdict": verdicts,
+        "summary_by_strategy": strategies,
+        "cases": filtered_cases,
+    }
 
 
 class WatchdogDaemon:
