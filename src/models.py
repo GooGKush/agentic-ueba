@@ -33,6 +33,20 @@ class CleanHandOffPayload(BaseModel):
   escalation_action: str = "MONITOR"
 
 
+class StrategyDirective(BaseModel):
+  """Formulated threat hunt hypothesis and model execution directive."""
+  selected_skill: str = "secops-statistical-hunter"
+  model_name: str = "GEMINI_REACT_AUTONOMOUS"
+  directive_query: str = ""
+  target_entity: str = ""
+  entity_type: str = "USER"
+  threat_summary: str = ""
+  hypothesis_h0: str = ""
+  hypothesis_h1: str = ""
+  selection_rationale: str = ""
+  flight_card_title: str = ""
+
+
 class JITHuntRequest(BaseModel):
   """Incoming JIT request payload from SecOps Playbook or caller."""
   target_entity: str = Field(..., description="Target username, hostname, or IP to investigate")
@@ -50,6 +64,9 @@ class JITHuntRequest(BaseModel):
   alert_name: Optional[str] = Field(default=None, description="Title of the triggering alert")
   alert_description: Optional[str] = Field(default=None, description="Description/TTP of triggering alert")
   
+  # Pre-formulated strategy directive (optional, populated by Agentic Strategy Reasoner)
+  directive: Optional[StrategyDirective] = None
+
   # Analytical parameters
   skill: str = Field(default="auto", description="'auto', 'risk-metrics', or 'stats-hunter'")
   lookback_days: int = Field(default=14, ge=1, le=30)
