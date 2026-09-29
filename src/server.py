@@ -204,6 +204,138 @@ async def hunt_hybrid_enrichment(
   return resp.model_dump()
 
 
+@mcp.tool()
+async def hunt_circadian_von_mises(
+    username: str,
+    case_id: Optional[str] = None,
+    lookback_days: int = 14,
+    post_to_case_wall: bool = True,
+) -> Dict[str, Any]:
+  """Risk Metrics: Evaluates off-hours temporal departures using 24-hour circular von Mises clock."""
+  req = JITHuntRequest(
+      target_entity=username,
+      entity_type="USER",
+      alert_name="Circadian von Mises Temporal Anomaly",
+      query="circadian_von_mises",
+      skill="risk-metrics",
+      lookback_days=lookback_days,
+      case_id=case_id,
+      post_to_case_wall=post_to_case_wall,
+  )
+  resp = await engine.execute_jit_hunt(req)
+  return resp.model_dump()
+
+
+@mcp.tool()
+async def hunt_macd_momentum(
+    entity: str,
+    case_id: Optional[str] = None,
+    lookback_days: int = 14,
+    post_to_case_wall: bool = True,
+) -> Dict[str, Any]:
+  """Risk Metrics: Detects instantaneous momentum acceleration diverging from 30-day anchor."""
+  req = JITHuntRequest(
+      target_entity=entity,
+      entity_type="USER",
+      alert_name="MACD Momentum Velocity Divergence",
+      query="macd_momentum",
+      skill="risk-metrics",
+      lookback_days=lookback_days,
+      case_id=case_id,
+      post_to_case_wall=post_to_case_wall,
+  )
+  resp = await engine.execute_jit_hunt(req)
+  return resp.model_dump()
+
+
+@mcp.tool()
+async def hunt_shannon_entropy(
+    entity: str,
+    case_id: Optional[str] = None,
+    lookback_days: int = 7,
+    post_to_case_wall: bool = True,
+) -> Dict[str, Any]:
+  """Statistical Hunter: Detects obfuscated command lines or DGA payloads via Shannon Character Entropy."""
+  req = JITHuntRequest(
+      target_entity=entity,
+      entity_type="HOST",
+      alert_name="Shannon Character-Class Entropy Investigation",
+      query="shannon_entropy",
+      skill="stats-hunter",
+      lookback_days=lookback_days,
+      case_id=case_id,
+      post_to_case_wall=post_to_case_wall,
+  )
+  resp = await engine.execute_jit_hunt(req)
+  return resp.model_dump()
+
+
+@mcp.tool()
+async def hunt_markov_transition(
+    host: str,
+    case_id: Optional[str] = None,
+    lookback_days: int = 7,
+    post_to_case_wall: bool = True,
+) -> Dict[str, Any]:
+  """Statistical Hunter: Detects rare Living-off-the-Land process transitions via Markov 2-Gram Surprisal."""
+  req = JITHuntRequest(
+      target_entity=host,
+      entity_type="HOST",
+      alert_name="Markov Process Transition Rarity Investigation",
+      query="markov_transition",
+      skill="stats-hunter",
+      lookback_days=lookback_days,
+      case_id=case_id,
+      post_to_case_wall=post_to_case_wall,
+  )
+  resp = await engine.execute_jit_hunt(req)
+  return resp.model_dump()
+
+
+@mcp.tool()
+async def hunt_zipfian_rarity(
+    host: str,
+    case_id: Optional[str] = None,
+    lookback_days: int = 7,
+    post_to_case_wall: bool = True,
+) -> Dict[str, Any]:
+  """Statistical Hunter: Detects rare administrative tools in the enterprise Zipfian power-law long tail."""
+  req = JITHuntRequest(
+      target_entity=host,
+      entity_type="HOST",
+      alert_name="Zipfian Process Rarity Investigation",
+      query="zipfian_rarity",
+      skill="stats-hunter",
+      lookback_days=lookback_days,
+      case_id=case_id,
+      post_to_case_wall=post_to_case_wall,
+  )
+  resp = await engine.execute_jit_hunt(req)
+  return resp.model_dump()
+
+
+@mcp.tool()
+async def hunt_ewma_burst(
+    entity: str,
+    case_id: Optional[str] = None,
+    lookback_days: int = 7,
+    post_to_case_wall: bool = True,
+) -> Dict[str, Any]:
+  """Statistical Hunter: Detects acute intraday kinetic rate surges via EWMA Velocity Divergence."""
+  req = JITHuntRequest(
+      target_entity=entity,
+      entity_type="IP",
+      alert_name="EWMA Burst Velocity Investigation",
+      query="ewma_burst",
+      skill="stats-hunter",
+      lookback_days=lookback_days,
+      case_id=case_id,
+      post_to_case_wall=post_to_case_wall,
+  )
+  resp = await engine.execute_jit_hunt(req)
+  return resp.model_dump()
+
+
 # --- 2. REST Endpoints (Playbook-to-Agent Gateway) ---
 
 @mcp.custom_route("/api/v1/cases/scan", methods=["POST"])
