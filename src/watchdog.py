@@ -331,6 +331,34 @@ class WatchdogDaemon:
           case_desc = case.get("description", "")
 
           try:
+            # Check if this case was already triaged by the agent (e.g. across container restarts)
+            try:
+              comments_res = await session.call_tool(
+                  "list_case_comments",
+                  {
+                      "projectId": self.tenant.project_id,
+                      "customerId": self.tenant.customer_id,
+                      "region": self.tenant.region,
+                      "caseId": case_id,
+                      "pageSize": 50,
+                  },
+              )
+              raw_comments = json.loads(comments_res.content[0].text) if comments_res.content else {}
+              comments_list = raw_comments.get("caseComments", raw_comments.get("comments", []))
+              has_triage_comment = any(
+                  "Statistical Outlier Report" in str(cm.get("comment", "")) or
+                  "Autonomous Agentic UEBA Triage Report" in str(cm.get("comment", "")) or
+                  "Composite Threat Distance" in str(cm.get("comment", "")) or
+                  "Calibrated Risk Index" in str(cm.get("comment", ""))
+                  for cm in comments_list
+              )
+              if has_triage_comment:
+                logger.info(f"Case {case_id} already contains agent triage report on wall; caching as seen.")
+                self.state.record_case(case_id)
+                continue
+            except Exception as comment_err:
+              logger.debug(f"Could not verify existing comments on Case {case_id}: {comment_err}")
+
             # Query alerts in this case
             alerts_res = await session.call_tool(
                 "list_case_alerts",
