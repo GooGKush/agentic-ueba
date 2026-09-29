@@ -1,0 +1,36 @@
+steps:
+  # 1. Run unit tests
+  - name: 'python:3.13-slim'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        pip install -r requirements.txt
+        python -c "
+        import sys; sys.path.insert(0, '.')
+        from tests.test_protocol_adapter import *
+        test_tenant_config_dynamic_properties()
+        test_jit_hunt_models()
+        "
+
+  # 2. Stage skills into .build/skills (Option A)
+  - name: 'gcr.io/cloud-builders/git'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        bash scripts/build_container.sh
+
+  # 3. Build container image (Option A: skills baked into image at /app/skills)
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/secops-agentic-hunter:$COMMIT_SHA', '-t', 'gcr.io/$PROJECT_ID/secops-agentic-hunter:latest', '.']
+
+  # 4. Push container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/secops-agentic-hunter:$COMMIT_SHA']
+
+images:
+  - 'gcr.io/$PROJECT_ID/secops-agentic-hunter:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/secops-agentic-hunter:latest'
+
+timeout: '900s'
