@@ -8,6 +8,8 @@ and behavioral risk analytics via Gemini 2.5 Pro, and returns structured Clean H
 payloads along with full 6-pillar forensic reports to SecOps Playbooks and cases.
 """
 
+import src._bootstrap
+
 from datetime import datetime, timedelta, timezone
 import json
 import logging

@@ -8,6 +8,8 @@ Exposes the autonomous JIT Threat Hunting Engine over two concurrent protocols:
 2. Model Context Protocol (/mcp via SSE / Streamable HTTP) for Agent-to-Agent invocations.
 """
 
+import src._bootstrap
+
 import contextlib
 from datetime import datetime, timezone
 import json
