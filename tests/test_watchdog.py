@@ -135,7 +135,8 @@ async def test_watchdog_daemon_lifecycle(tmp_path):
 async def test_watchdog_scan_once_deduplication(tmp_path, monkeypatch):
   mock_engine = MagicMock()
   state_file = tmp_path / "scan_state.json"
-  daemon = WatchdogDaemon(engine=mock_engine, state_file=state_file)
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  daemon = WatchdogDaemon(engine=mock_engine, tenant_config=tenant, state_file=state_file)
 
   # Mock JIT hunt response
   mock_resp = JITHuntResponse(
@@ -390,7 +391,8 @@ async def test_watchdog_queue_backpressure(tmp_path):
 async def test_watchdog_wall_comment_idempotency(tmp_path, monkeypatch):
   mock_engine = MagicMock()
   state_file = tmp_path / "idempotent_state.json"
-  daemon = WatchdogDaemon(engine=mock_engine, state_file=state_file)
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  daemon = WatchdogDaemon(engine=mock_engine, tenant_config=tenant, state_file=state_file)
 
   # Mock MCP ClientSession
   mock_session = AsyncMock()

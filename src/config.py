@@ -106,10 +106,10 @@ class TenantConfig(BaseModel):
         ]
     )
     creds.refresh(Request())
-    return {
-        "Authorization": f"Bearer {creds.token}",
-        "x-goog-user-project": self.project_id,
-    }
+    headers = {"Authorization": f"Bearer {creds.token}"}
+    if self.project_id:
+      headers["x-goog-user-project"] = self.project_id
+    return headers
 
 
 def get_skills_root() -> Path:

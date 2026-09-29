@@ -38,6 +38,14 @@ from src.strategy_decider import StrategyDecider
 logger = logging.getLogger("WatchdogDaemon")
 
 
+def _unwrap_exception(e: BaseException) -> str:
+  """Recursively formats ExceptionGroup sub-exceptions for clear diagnostic logging."""
+  if hasattr(e, "exceptions") and e.exceptions:
+    sub_msgs = [_unwrap_exception(sub) for sub in e.exceptions]
+    return f"{type(e).__name__}: {e} [Sub-exceptions: {'; '.join(sub_msgs)}]"
+  return f"{type(e).__name__}: {e}"
+
+
 class WatchdogState:
   """Persistent state tracking for processed cases with sliding-window FIFO eviction."""
 
@@ -321,6 +329,15 @@ class WatchdogDaemon:
 
   async def _do_scan_pass(self) -> List[Dict[str, Any]]:
     self.state.last_scan_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    if not self.tenant.project_id or not self.tenant.customer_id:
+      logger.warning(
+          f"Watchdog scan paused: Missing required Chronicle configuration. "
+          f"Please ensure CHRONICLE_PROJECT_ID and CHRONICLE_CUSTOMER_ID environment variables are set. "
+          f"(Current: project_id='{self.tenant.project_id}', customer_id='{self.tenant.customer_id}')"
+      )
+      return []
+
     headers = self.tenant.get_auth_headers()
     custom_timeout = httpx.Timeout(30.0, read=120.0, write=120.0, pool=120.0)
     pass_results = []
@@ -347,17 +364,24 @@ class WatchdogDaemon:
           cases_filter = "Status='OPENED'"
 
         # 1. Fetch open cases
-        list_cases_res = await session.call_tool(
-            "list_cases",
-            {
-                "projectId": self.tenant.project_id,
-                "customerId": self.tenant.customer_id,
-                "region": self.tenant.region,
-                "filter": cases_filter,
-                "orderBy": "CreateTime desc",
-                "pageSize": self.limit_per_scan * 2,
-            },
-        )
+        try:
+          list_cases_res = await session.call_tool(
+              "list_cases",
+              {
+                  "projectId": self.tenant.project_id,
+                  "customerId": self.tenant.customer_id,
+                  "region": self.tenant.region,
+                  "filter": cases_filter,
+                  "orderBy": "CreateTime desc",
+                  "pageSize": self.limit_per_scan * 2,
+              },
+          )
+        except Exception as list_err:
+          logger.error(
+              f"Failed calling list_cases on OneMCP (project='{self.tenant.project_id}', customer='{self.tenant.customer_id}', filter='{cases_filter}'): {_unwrap_exception(list_err)}"
+          )
+          return []
+
         raw_cases = json.loads(list_cases_res.content[0].text) if list_cases_res.content else {}
         all_cases = raw_cases.get("cases", [])
 
@@ -559,7 +583,7 @@ class WatchdogDaemon:
                 self._in_flight_case_ids.discard(case_id)
 
           except Exception as e:
-            logger.error(f"Failed processing Case {case_id} in watchdog: {e}")
+            logger.error(f"Failed processing Case {case_id} in watchdog: {_unwrap_exception(e)}")
             self.state.record_case(case_id)
 
         return pass_results
@@ -573,7 +597,7 @@ class WatchdogDaemon:
         logger.info("Watchdog scan loop cancelled.")
         break
       except Exception as e:
-        logger.error(f"Error in watchdog scan pass: {e}")
+        logger.error(f"Error in watchdog scan pass: {_unwrap_exception(e)}")
 
       try:
         await asyncio.sleep(self.interval_seconds)
