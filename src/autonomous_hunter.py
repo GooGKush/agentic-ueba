@@ -47,6 +47,8 @@ from src.risk_metrics_engine import RiskMetricsEngine
 from src.stats_hunter_engine import StatsHunterEngine
 from src.strategy_decider import StrategyDecider
 from src.federated_bridge import FederatedBridge
+from src.formatters.case_wall_card import CaseWallCardFormatter
+
 
 logger = logging.getLogger("AutonomousHunter")
 
@@ -278,18 +280,32 @@ class AutonomousHunterEngine:
             verdict = radar_result["verdict"]
             top_sector = radar_result["top_sector"]
 
-            report_lines = [
-                f"# 360° Decoupled Behavioral Risk Radar: {req.target_entity}",
-                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})",
-                f"**Top Risk Sector**: {top_sector} (Composite Distance D: {radar_result['composite_d']})",
-                "",
-                "## Forensic Sector Analysis",
+            sector_rows = [
+                {
+                    "metric": f"**{s_name} Sector**",
+                    "observed": f"Z = {z_val:+.2f} ({radar_result['sector_observed_counts'].get(s_name, 0)} events)",
+                    "threshold": "|Z| <= 2.0σ",
+                    "assessment": "⚠️ Significant Behavioral Drift" if abs(z_val) > 2.0 else "✅ Nominal Baseline",
+                }
+                for s_name, z_val in radar_result["sector_z_scores"].items()
             ]
-            for s_name, z_val in radar_result["sector_z_scores"].items():
-              obs = radar_result["sector_observed_counts"].get(s_name, 0)
-              report_lines.append(f"- **{s_name}**: Z-score = {z_val:+.2f} (Observed: {obs})")
-
-            markdown_report = "\n".join(report_lines)
+            markdown_report = CaseWallCardFormatter.format_card(
+                target_entity=req.target_entity,
+                entity_type=req.entity_type,
+                model_name="360_DECOUPLED_RADAR",
+                calibrated_risk_index=float(cri),
+                is_outlier=radar_result["is_outlier"],
+                case_id=req.case_id,
+                rows_count=sum(radar_result["sector_observed_counts"].values()),
+                directive=req.directive,
+                metrics_table_rows=sector_rows,
+                soc_guidance=(
+                    f"Investigate high-drift sector `{top_sector}` (Composite Euclidean Distance D = {radar_result['composite_d']:.2f}). "
+                    "Stage user containment if unauthorized data exfiltration or credential rotation is confirmed."
+                    if radar_result["is_outlier"] else
+                    "All 5 behavioral sectors (Auth, Cloud, Workspace, Egress, DNS) conform to 30-day baseline. No containment needed."
+                ),
+            )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
               await session.call_tool(
@@ -353,7 +369,43 @@ class AutonomousHunterEngine:
             cri = jitter_result["calibrated_risk_index"]
             verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
             rows_count = jitter_result.get("stats_rows", 0)
-            markdown_report = f"# C2 Beaconing Jitter Analysis: {req.target_entity}\n\n**CRI**: {cri}/100\n**Is Outlier**: {jitter_result['is_outlier']}\n**Rows**: {rows_count}"
+            jitter_rows = [
+                {
+                    "metric": "**Coefficient of Variation ($CV$)**",
+                    "observed": f"`{jitter_result['coefficient_of_variation']:.3f}`",
+                    "threshold": "$\\le 0.300$",
+                    "assessment": "⚠️ Low Jitter / Periodic Beaconing" if jitter_result["is_outlier"] else "✅ High Jitter (Stochastic / Irregular)",
+                },
+                {
+                    "metric": "**Top Target Destination**",
+                    "observed": f"`{jitter_result.get('target_destination', 'UNKNOWN')}`",
+                    "threshold": "External IP",
+                    "assessment": "Primary Egress Communication Endpoint",
+                },
+                {
+                    "metric": "**Sampled Outbound Flows**",
+                    "observed": f"`{rows_count}` connections",
+                    "threshold": "$\\ge 20$ connections",
+                    "assessment": "Sufficient Statistical Power" if rows_count >= 20 else "Limited Sample Size",
+                },
+            ]
+            markdown_report = CaseWallCardFormatter.format_card(
+                target_entity=req.target_entity,
+                entity_type=req.entity_type,
+                model_name="C2_BEACONING_JITTER",
+                calibrated_risk_index=float(cri),
+                is_outlier=jitter_result["is_outlier"],
+                case_id=req.case_id,
+                rows_count=rows_count,
+                directive=req.directive,
+                metrics_table_rows=jitter_rows,
+                soc_guidance=(
+                    f"Outbound network traffic to `{jitter_result.get('target_destination')}` exhibits rigid periodicity ($CV = {jitter_result['coefficient_of_variation']:.3f}$). "
+                    "Host quarantine and perimeter IP block recommended."
+                    if jitter_result["is_outlier"] else
+                    f"Outbound connection intervals exhibit high timing jitter ($CV = {jitter_result['coefficient_of_variation']:.3f}$), typical of normal cloud applications and distributed polling. No beaconing detected."
+                ),
+            )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
               await session.call_tool(
@@ -410,7 +462,37 @@ class AutonomousHunterEngine:
             )
             cri = spray_result["calibrated_risk_index"]
             verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
-            markdown_report = f"# Poisson Burst Spray Analysis: {req.target_entity}\n\n**CRI**: {cri}/100\n**Is Outlier**: {spray_result['is_outlier']}\n**Rows**: {spray_result['stats_rows']}"
+            fano = float(spray_result.get("top_fano", 1.0))
+            spray_rows = [
+                {
+                    "metric": "**Fano Factor ($F = \\sigma^2 / \\mu$)**",
+                    "observed": f"`{fano:.2f}`",
+                    "threshold": "$> 4.00$",
+                    "assessment": "⚠️ Severe Overdispersion (Clustered Spray)" if spray_result["is_outlier"] else "✅ Poisson Dispersion (Nominal Rate)",
+                },
+                {
+                    "metric": "**Evaluated Auth Events**",
+                    "observed": f"`{spray_result.get('stats_rows', 0)}` events",
+                    "threshold": "$\\ge 10$ events",
+                    "assessment": "Observed Sample Window",
+                },
+            ]
+            markdown_report = CaseWallCardFormatter.format_card(
+                target_entity=req.target_entity,
+                entity_type=req.entity_type,
+                model_name="POISSON_BURST_CLUSTERING",
+                calibrated_risk_index=float(cri),
+                is_outlier=spray_result["is_outlier"],
+                case_id=req.case_id,
+                rows_count=spray_result.get("stats_rows", 0),
+                directive=req.directive,
+                metrics_table_rows=spray_rows,
+                soc_guidance=(
+                    f"Detected automated credential spray bursts ($Fano = {fano:.2f}$). Lock account credentials and invalidate active OAuth/SAML tokens."
+                    if spray_result["is_outlier"] else
+                    f"Authentication failures show no statistical clustering ($Fano = {fano:.2f}$), consistent with random user typing mistakes."
+                ),
+            )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
               await session.call_tool(
@@ -467,13 +549,36 @@ class AutonomousHunterEngine:
             )
             cri = cloud_result["calibrated_risk_index"]
             verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
-            markdown_report = (
-                f"# Cloud Infrastructure CRUD Analysis: {req.target_entity}\n\n"
-                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
-                f"**Top Z-Score**: {cloud_result['top_z_score']}σ\n"
-                f"**Observed Cloud Modifications**: {cloud_result['observed_events']}\n\n"
-                f"## Forensic Details\n"
-                f"- Evaluated resource creation, deletion, modification, and permissions changes over a {req.lookback_days}-day horizon against the 30-day precomputed behavioral baseline.\n"
+            top_z = float(cloud_result.get("top_z_score", 0.0))
+            cloud_rows = [
+                {
+                    "metric": "**Cloud Mutation Z-Score**",
+                    "observed": f"`{top_z:+.2f}σ`",
+                    "threshold": "$> 3.00\\sigma$",
+                    "assessment": "⚠️ Significant Administrative Mutation" if cloud_result["is_outlier"] else "✅ Within Baseline Volatility",
+                },
+                {
+                    "metric": "**Observed Cloud Modifications**",
+                    "observed": f"`{cloud_result.get('observed_events', 0)}` mutations",
+                    "threshold": "Historical 30-Day Mean",
+                    "assessment": "Cloud Resource Write Events",
+                },
+            ]
+            markdown_report = CaseWallCardFormatter.format_card(
+                target_entity=req.target_entity,
+                entity_type=req.entity_type,
+                model_name="CLOUD_CRUD_SURGE",
+                calibrated_risk_index=float(cri),
+                is_outlier=cloud_result["is_outlier"],
+                case_id=req.case_id,
+                rows_count=cloud_result.get("observed_events", 0),
+                directive=req.directive,
+                metrics_table_rows=cloud_rows,
+                soc_guidance=(
+                    f"Abnormal cloud infrastructure creation/permission spike ($Z = {top_z:+.2f}\\sigma$). Audit IAM changes and newly deployed cloud workloads."
+                    if cloud_result["is_outlier"] else
+                    f"Cloud resource management operations ($Z = {top_z:+.2f}\\sigma$) match expected deployment baselines."
+                ),
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
@@ -531,14 +636,36 @@ class AutonomousHunterEngine:
             )
             cri = circ_result["calibrated_risk_index"]
             verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
-            markdown_report = (
-                f"# Circadian von Mises Temporal Analysis: {req.target_entity}\n\n"
-                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
-                f"**Circadian Threat Score**: {circ_result['circadian_threat_score']}\n"
-                f"**Hourly Z-Score**: {circ_result['hourly_z']}σ (Hour UTC: {circ_result['event_hour']})\n"
-                f"**Is Outlier**: {circ_result['is_outlier']}\n\n"
-                f"## Forensic Details\n"
-                f"- Evaluated circular clock distance departure against 30-day precomputed hourly baseline.\n"
+            hourly_z = float(circ_result.get("hourly_z", 0.0))
+            circ_rows = [
+                {
+                    "metric": "**Circadian Threat Score**",
+                    "observed": f"`{circ_result.get('circadian_threat_score', 0)}`",
+                    "threshold": "$\\ge 50$",
+                    "assessment": "⚠️ Off-Hours / Temporal Outlier" if circ_result["is_outlier"] else "✅ Active Working Hours",
+                },
+                {
+                    "metric": "**Hourly Z-Score**",
+                    "observed": f"`{hourly_z:+.2f}σ`",
+                    "threshold": "$> 2.50\\sigma$",
+                    "assessment": f"Event Hour: {circ_result.get('event_hour', 'UTC')} UTC",
+                },
+            ]
+            markdown_report = CaseWallCardFormatter.format_card(
+                target_entity=req.target_entity,
+                entity_type=req.entity_type,
+                model_name="CIRCADIAN_VON_MISES",
+                calibrated_risk_index=float(cri),
+                is_outlier=circ_result["is_outlier"],
+                case_id=req.case_id,
+                rows_count=1,
+                directive=req.directive,
+                metrics_table_rows=circ_rows,
+                soc_guidance=(
+                    f"Activity occurred at a statistically rare circadian angle for this identity ($Z = {hourly_z:+.2f}\\sigma$). Verify user physical travel or remote session legitimacy."
+                    if circ_result["is_outlier"] else
+                    f"Activity timing is consistent with user normal diurnal schedule ($Z = {hourly_z:+.2f}\\sigma$)."
+                ),
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:

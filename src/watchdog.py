@@ -602,9 +602,10 @@ class WatchdogDaemon:
                   target_entity = ident
                   break
 
-            # Deep Fallback: inspect connector events for underlying UDM principal / target asset & user
-            if not target_entity and alerts:
-              for alert in alerts:
+            # Inspect connector events for underlying UDM telemetry and fallback entities
+            all_conn_events = []
+            if alerts:
+              for alert in alerts[:3]:
                 alert_name_str = str(alert.get("name", ""))
                 alert_numeric_id = alert_name_str.split("/")[-1] if "/" in alert_name_str else str(alert.get("id", ""))
                 if not alert_numeric_id:
@@ -625,13 +626,14 @@ class WatchdogDaemon:
                   if events_res.content:
                     events_data = json.loads(events_res.content[0].text)
                     conn_events = events_data.get("connectorEvents", [])
-                    extracted = _extract_entity_from_connector_events(conn_events)
-                    if extracted:
-                      target_entity, entity_type = extracted
-                      logger.info(
-                          f"Extracted entity '{target_entity}' ({entity_type}) from connector events for Case {case_id}."
-                      )
-                      break
+                    all_conn_events.extend(conn_events)
+                    if not target_entity:
+                      extracted = _extract_entity_from_connector_events(conn_events)
+                      if extracted:
+                        target_entity, entity_type = extracted
+                        logger.info(
+                            f"Extracted entity '{target_entity}' ({entity_type}) from connector events for Case {case_id}."
+                        )
                 except Exception as ev_err:
                   logger.debug(f"Could not inspect connector events for alert {alert_numeric_id}: {ev_err}")
 
@@ -640,16 +642,26 @@ class WatchdogDaemon:
               self.state.record_case(case_id)
               continue
 
-            # Autonomous Strategy Decision
-            skill, directive_query, model_name = StrategyDecider.decide(
-                case_title=case_title,
-                alert_name=alert_name,
-                alert_desc=alert_desc,
-                entity_type=entity_type,
+            # Agentic Strategy Reasoner: Formulate Hypotheses (H0 vs H1) from UDM Touchpoints
+            directive = await StrategyDecider.decide_agentic(
+                case_info=case,
+                alerts=alerts,
+                connector_events=all_conn_events,
+                default_entity=target_entity,
+                default_entity_type=entity_type,
             )
-            logger.info(f"Watchdog assigning strategy [{model_name}] for Case {case_id} ({target_entity})")
+            target_entity = directive.target_entity or target_entity
+            entity_type = directive.entity_type or entity_type
+            model_name = directive.model_name
+            skill = directive.selected_skill
+            directive_query = directive.directive_query
 
-            # Formulate JIT Hunt Request
+            logger.info(
+                f"Agentic Strategy Reasoner assigned [{model_name}] ({skill}) for Case {case_id} ({target_entity}): "
+                f"H1='{directive.hypothesis_h1}'"
+            )
+
+            # Formulate JIT Hunt Request with full Agentic Directive
             req = JITHuntRequest(
                 target_entity=target_entity,
                 entity_type=entity_type,
@@ -658,6 +670,7 @@ class WatchdogDaemon:
                 alert_description=alert_desc,
                 query=directive_query,
                 skill=skill,
+                directive=directive,
                 post_to_case_wall=True,
             )
 
