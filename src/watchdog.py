@@ -642,13 +642,14 @@ class WatchdogDaemon:
               self.state.record_case(case_id)
               continue
 
-            # Agentic Strategy Reasoner: Formulate Hypotheses (H0 vs H1) from UDM Touchpoints
-            directive = await StrategyDecider.decide_agentic(
-                case_info=case,
+            # Agentic Strategy Reasoner: Formulate Tier 1 360 Baseline Directive
+            directive = StrategyDecider.decide_tier1_360(
+                target_entity=target_entity,
+                entity_type=entity_type,
+                case_id=case_id,
+                case_title=case_title,
+                case_desc=case_desc,
                 alerts=alerts,
-                connector_events=all_conn_events,
-                default_entity=target_entity,
-                default_entity_type=entity_type,
             )
             target_entity = directive.target_entity or target_entity
             entity_type = directive.entity_type or entity_type
@@ -657,8 +658,8 @@ class WatchdogDaemon:
             directive_query = directive.directive_query
 
             logger.info(
-                f"Agentic Strategy Reasoner assigned [{model_name}] ({skill}) for Case {case_id} ({target_entity}): "
-                f"H1='{directive.hypothesis_h1}'"
+                f"Agentic Strategy Reasoner initialized [{model_name}] ({skill}) for Case {case_id} ({target_entity}): "
+                f"H0='{directive.hypothesis_h0}'"
             )
 
             # Formulate JIT Hunt Request with full Agentic Directive

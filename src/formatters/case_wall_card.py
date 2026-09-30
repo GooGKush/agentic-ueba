@@ -57,12 +57,21 @@ class CaseWallCardFormatter:
     h1 = directive.hypothesis_h1 if directive and directive.hypothesis_h1 else "Observed telemetry exhibits anomalous clustering, periodicity, or volume indicative of threat behavior."
     rationale = directive.selection_rationale if directive and directive.selection_rationale else f"Model selected based on {entity_type} topology and triggering alert context."
 
+    tier_label = directive.investigation_tier if directive and directive.investigation_tier else "TIER_1_BASELINE"
+    tier_display = (
+        "Tier 1: 360° Behavioral Radar Baseline"
+        if tier_label == "TIER_1_BASELINE"
+        else f"Tier 2: Targeted Deep Dive ({directive.outlier_vector or 'Outlier Sweep'})"
+        if directive and directive.outlier_vector
+        else "Tier 2: Targeted Deep Dive"
+    )
+
     lines = [
         f"## 🛡️ {card_title}",
         "",
         f"**Calibrated Risk Index**: {risk_bar}  ",
-        f"**Target Entity**: `{target_entity}` ({entity_type}) | **Evaluated Window**: {evaluated_window}  ",
-        f"**Case ID**: {case_id or 'Ad-Hoc'} | **Telemetry Sample**: {rows_count} event records  ",
+        f"**Target Entity**: `{target_entity}` ({entity_type}) | **Investigation Phase**: `{tier_display}`  ",
+        f"**Case ID**: {case_id or 'Ad-Hoc'} | **Window**: {evaluated_window} ({rows_count} telemetry records)  ",
         "",
         "---",
         "",
@@ -112,5 +121,27 @@ class CaseWallCardFormatter:
           f"> **BENIGN / NOMINAL ACTIVITY**: Telemetry for `{target_entity}` supports the null hypothesis ($H_0$) with CRI score {calibrated_risk_index:.0f}/100. "
           f"No containment actions required. Logged as baseline operational activity."
       )
+
+    # 🧭 Recommended Avenues to Pursue
+    avenues = directive.recommended_avenues if directive and directive.recommended_avenues else []
+    if not avenues:
+      if is_outlier:
+        avenues = [
+            f"Cross-correlate `{target_entity}` outbound connections against Google Threat Intelligence (GCTI) and WHOIS NRD feeds.",
+            f"Review process execution lineage for Living-off-the-Land (LotL) binary invocations spawned on or by `{target_entity}`.",
+            f"Check credential and IAM token activity for anomalous concurrent logins from foreign geolocation.",
+        ]
+      else:
+        avenues = [
+            f"Continue passive monitoring of `{target_entity}` across trailing 30-day baseline.",
+            f"If alert recurs, verify upstream log source parser health and rule threshold calibration.",
+        ]
+
+    lines.extend([
+        "",
+        "### 🧭 Recommended Avenues to Pursue",
+    ])
+    for i, avenue in enumerate(avenues, 1):
+      lines.append(f"{i}. {avenue}")
 
     return "\n".join(lines)

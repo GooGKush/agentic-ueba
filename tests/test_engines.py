@@ -494,3 +494,141 @@ async def test_deterministic_jit_hunt_markov_fast_path(monkeypatch):
   assert resp.triage.verdict == "CRITICAL_OUTLIER"
   assert resp.triage.primary_vector == "markov_process_transition_rarity"
   assert resp.triage.recommended_action == "ISOLATE_HOST"
+
+
+@pytest.mark.anyio
+async def test_two_tier_strategy_decider():
+  from src.strategy_decider import StrategyDecider
+
+  # Tier 1 Baseline Directive
+  t1 = StrategyDecider.decide_tier1_360(
+      target_entity="target.analyst",
+      entity_type="USER",
+      case_id="case-999",
+      case_title="Phishing Investigation",
+  )
+  assert t1.selected_skill == "secops-risk-metrics-multistage"
+  assert t1.model_name == "360_DECOUPLED_RADAR"
+  assert t1.investigation_tier == "TIER_1_BASELINE"
+  assert len(t1.recommended_avenues) >= 2
+  assert "Tier 1 360° Behavioral Radar" in t1.flight_card_title
+
+  # Tier 2 Deep Dive: Egress Outlier
+  t2_egress = await StrategyDecider.decide_tier2_deep_dive(
+      target_entity="target.analyst",
+      entity_type="USER",
+      outlier_vector="Egress",
+      case_info={"id": "case-999", "title": "C2 Beaconing Investigation"},
+      alerts=[{"name": "Suspected Beaconing", "description": "Regular interval outbound connection"}],
+      connector_events=[],
+  )
+  assert t2_egress.selected_skill == "secops-statistical-hunter"
+  assert t2_egress.model_name == "C2_BEACONING_JITTER"
+  assert t2_egress.investigation_tier == "TIER_2_DEEP_DIVE"
+  assert t2_egress.outlier_vector == "Egress"
+  assert len(t2_egress.recommended_avenues) >= 2
+
+  # Tier 2 Deep Dive: Auth Outlier
+  t2_auth = await StrategyDecider.decide_tier2_deep_dive(
+      target_entity="target.analyst",
+      entity_type="USER",
+      outlier_vector="Auth",
+      case_info={"id": "case-999", "title": "Auth Spray Investigation"},
+      alerts=[{"name": "Failed Login Waves", "description": "Poisson burst spray"}],
+      connector_events=[],
+  )
+  assert t2_auth.selected_skill == "secops-statistical-hunter"
+  assert t2_auth.model_name == "POISSON_BURST_CLUSTERING"
+  assert t2_auth.investigation_tier == "TIER_2_DEEP_DIVE"
+
+  # Tier 2 Deep Dive: Cloud Outlier
+  t2_cloud = await StrategyDecider.decide_tier2_deep_dive(
+      target_entity="sa-deployer@proj.iam.gserviceaccount.com",
+      entity_type="USER",
+      outlier_vector="Cloud",
+      case_info={"id": "case-999", "title": "IAM Privilege Escalation"},
+      alerts=[{"name": "Resource Written Surge", "description": "Key minting"}],
+      connector_events=[],
+  )
+  assert t2_cloud.selected_skill == "secops-risk-metrics-multistage"
+  assert t2_cloud.model_name == "CLOUD_CRUD_SURGE"
+  assert t2_cloud.investigation_tier == "TIER_2_DEEP_DIVE"
+
+
+def test_case_wall_card_two_tier_and_avenues():
+  from src.formatters.case_wall_card import CaseWallCardFormatter
+  from src.models import StrategyDirective
+
+  directive = StrategyDirective(
+      selected_skill="secops-statistical-hunter",
+      model_name="C2_BEACONING_JITTER",
+      directive_query="c2_jitter",
+      target_entity="igw-ecs-bridge",
+      entity_type="ASSET",
+      investigation_tier="TIER_2_DEEP_DIVE",
+      outlier_vector="Egress",
+      threat_summary="Robotic polling detected.",
+      hypothesis_h0="Benign background traffic.",
+      hypothesis_h1="Automated C2 polling.",
+      selection_rationale="Evaluated CV regularity.",
+      flight_card_title="C2 Beaconing Jitter Analysis: `igw-ecs-bridge`",
+      recommended_avenues=[
+          "Inspect outbound firewall logs for destination IP.",
+          "Check process execution tree spawning network socket.",
+          "Isolate endpoint if beaconing persists.",
+      ],
+  )
+
+  card = CaseWallCardFormatter.format_card(
+      target_entity="igw-ecs-bridge",
+      entity_type="ASSET",
+      model_name="C2_BEACONING_JITTER",
+      calibrated_risk_index=75.0,
+      is_outlier=True,
+      case_id="case-20730",
+      rows_count=42,
+      directive=directive,
+  )
+
+  assert "Tier 2: Targeted Deep Dive (Egress)" in card
+  assert "### 🧭 Recommended Avenues to Pursue" in card
+  assert "1. Inspect outbound firewall logs for destination IP." in card
+  assert "2. Check process execution tree spawning network socket." in card
+  assert "3. Isolate endpoint if beaconing persists." in card
+  assert "### 🔬 Investigation Hypotheses & Model Selection" in card
+
+
+@pytest.mark.anyio
+async def test_host_360_radar_query_generation(monkeypatch):
+  from unittest.mock import AsyncMock, MagicMock
+  from src.risk_metrics_engine import RiskMetricsEngine
+  from src.config import TenantConfig
+
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  engine = RiskMetricsEngine(tenant)
+
+  captured_queries = []
+
+  async def mock_execute(session, query, start_iso, end_iso):
+    captured_queries.append(query)
+    mock_res = MagicMock()
+    mock_res.content = [MagicMock(text='{"stats": [{"z": 2.5, "obs": 15}]}')]
+    return mock_res
+
+  monkeypatch.setattr(engine.runner, "execute_query_via_mcp", mock_execute)
+
+  mock_session = AsyncMock()
+  res = await engine.run_360_behavioral_radar(
+      session=mock_session,
+      username="workstation-corp-01",
+      lookback_days=7,
+      entity_type="ASSET",
+  )
+
+  assert res["entity"] == "workstation-corp-01"
+  assert len(captured_queries) == 5  # Auth, Egress, DNS, Flows, Alerts
+  # Verify host-specific UDM predicates are used
+  assert any("principal.asset.hostname" in q for q in captured_queries)
+  assert any("metrics.auth_attempts_total" in q for q in captured_queries)
+  assert any("metrics.network_bytes_outbound" in q for q in captured_queries)
+  assert any("metrics.dns_queries_fail" in q for q in captured_queries)
