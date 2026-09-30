@@ -43,11 +43,168 @@ class RiskMetricsEngine:
       session: ClientSession,
       username: str,
       lookback_days: int = 14,
+      entity_type: str = "USER",
   ) -> Dict[str, Any]:
-    """Profiles user across 5 canonical orthogonal sectors via decoupled micro-queries."""
+    """Profiles user or host across canonical orthogonal sectors via decoupled micro-queries."""
     start_iso, end_iso = self._iso_window(lookback_days)
+    is_host = entity_type.upper() in ("ASSET", "HOST", "IP")
 
-    sector_queries = {
+    if is_host:
+      sector_queries = {
+          "Auth": f"""stage auth_risk {{
+    metadata.event_type = "USER_LOGIN"
+    (principal.hostname = "{username}" or principal.asset.hostname = "{username}" or principal.asset.ip = "{username}")
+    $host = principal.hostname
+  match:
+    $host by 1d
+  outcome:
+    $obs = count(metadata.id)
+    $avg = max(metrics.auth_attempts_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.asset.hostname: "{username}"
+    ))
+    $std = max(metrics.auth_attempts_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.asset.hostname: "{username}"
+    ))
+    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+}}
+
+$host = $auth_risk.host
+
+match:
+  $host by 1d
+
+outcome:
+  $z = max($auth_risk.z)
+  $observed = max($auth_risk.obs)
+
+order:
+  $z desc""",
+          "Egress": f"""stage egress_risk {{
+    metadata.event_type = "NETWORK_CONNECTION"
+    (principal.hostname = "{username}" or principal.asset.hostname = "{username}" or principal.asset.ip = "{username}")
+    $host = principal.hostname
+  match:
+    $host by 1d
+  outcome:
+    $obs = sum(network.sent_bytes)
+    $avg = max(metrics.network_bytes_outbound(
+        period: 1d, window: 30d, metric: value_sum, agg: avg,
+        principal.asset.hostname: "{username}"
+    ))
+    $std = max(metrics.network_bytes_outbound(
+        period: 1d, window: 30d, metric: value_sum, agg: stddev,
+        principal.asset.hostname: "{username}"
+    ))
+    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+}}
+
+$host = $egress_risk.host
+
+match:
+  $host by 1d
+
+outcome:
+  $z = max($egress_risk.z)
+  $observed = max($egress_risk.obs)
+
+order:
+  $z desc""",
+          "DNS": f"""stage dns_risk {{
+    metadata.event_type = "NETWORK_DNS"
+    network.dns.response_code != 0
+    (principal.hostname = "{username}" or principal.asset.hostname = "{username}" or principal.asset.ip = "{username}")
+    $host = principal.hostname
+  match:
+    $host by 1d
+  outcome:
+    $obs = count(metadata.id)
+    $avg = max(metrics.dns_queries_fail(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.asset.hostname: "{username}"
+    ))
+    $std = max(metrics.dns_queries_fail(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.asset.hostname: "{username}"
+    ))
+    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+}}
+
+$host = $dns_risk.host
+
+match:
+  $host by 1d
+
+outcome:
+  $z = max($dns_risk.z)
+  $observed = max($dns_risk.obs)
+
+order:
+  $z desc""",
+          "Flows": f"""stage flows_risk {{
+    metadata.event_type = "NETWORK_CONNECTION"
+    (principal.hostname = "{username}" or principal.asset.hostname = "{username}" or principal.asset.ip = "{username}")
+    $host = principal.hostname
+  match:
+    $host by 1d
+  outcome:
+    $obs = count(metadata.id)
+    $avg = max(metrics.network_flows_outbound(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.asset.hostname: "{username}"
+    ))
+    $std = max(metrics.network_flows_outbound(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.asset.hostname: "{username}"
+    ))
+    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+}}
+
+$host = $flows_risk.host
+
+match:
+  $host by 1d
+
+outcome:
+  $z = max($flows_risk.z)
+  $observed = max($flows_risk.obs)
+
+order:
+  $z desc""",
+          "Alerts": f"""stage alerts_risk {{
+    metadata.event_type = "SCAN_UNCATEGORIZED"
+    (principal.hostname = "{username}" or principal.asset.hostname = "{username}" or principal.asset.ip = "{username}")
+    $host = principal.hostname
+  match:
+    $host by 1d
+  outcome:
+    $obs = count(metadata.id)
+    $avg = max(metrics.alert_event_name_count(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.asset.hostname: "{username}"
+    ))
+    $std = max(metrics.alert_event_name_count(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.asset.hostname: "{username}"
+    ))
+    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+}}
+
+$host = $alerts_risk.host
+
+match:
+  $host by 1d
+
+outcome:
+  $z = max($alerts_risk.z)
+  $observed = max($alerts_risk.obs)
+
+order:
+  $z desc""",
+      }
+    else:
+      sector_queries = {
         "Auth": f"""stage auth_risk {{
     metadata.event_type = "USER_LOGIN"
     target.user.userid = "{username}"

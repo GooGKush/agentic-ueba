@@ -267,10 +267,20 @@ class AutonomousHunterEngine:
         # --- 1. Deterministic Fast-Path: Decoupled 360° Behavioral Risk Radar ---
         if query_str in ("profile_360_risk", "360_risk", "radar_360") or (req.skill == "risk-metrics" and not req.query):
           try:
+            if not req.directive:
+              req.directive = StrategyDecider.decide_tier1_360(
+                  target_entity=req.target_entity,
+                  entity_type=req.entity_type,
+                  case_id=req.case_id,
+                  case_title=req.alert_name or "",
+                  case_desc=req.alert_description or "",
+              )
+
             radar_result = await RiskMetricsEngine(tenant).run_360_behavioral_radar(
                 session=session,
                 username=req.target_entity,
                 lookback_days=req.lookback_days,
+                entity_type=req.entity_type,
             )
             radar_svg = self.generate_behavioral_radar(
                 req.target_entity,
@@ -303,7 +313,7 @@ class AutonomousHunterEngine:
                     f"Investigate high-drift sector `{top_sector}` (Composite Euclidean Distance D = {radar_result['composite_d']:.2f}). "
                     "Stage user containment if unauthorized data exfiltration or credential rotation is confirmed."
                     if radar_result["is_outlier"] else
-                    "All 5 behavioral sectors (Auth, Cloud, Workspace, Egress, DNS) conform to 30-day baseline. No containment needed."
+                    "All 5 behavioral sectors conform to 30-day baseline. No containment needed."
                 ),
             )
             case_wall_updated = False
@@ -331,6 +341,125 @@ class AutonomousHunterEngine:
                 entities_to_quarantine=[req.target_entity] if radar_result["is_outlier"] else [],
                 mitre_tactics=["TA0001", "TA0006"] if radar_result["is_outlier"] else [],
             )
+
+            # --- Tier 2 Secondary Sweep (Condition-Gated Deep Dive) ---
+            is_tier1 = not req.directive or getattr(req.directive, "investigation_tier", "TIER_1_BASELINE") == "TIER_1_BASELINE"
+            top_z = abs(float(radar_result["sector_z_scores"].get(top_sector, 0.0)))
+            alert_corpus = f"{req.alert_name or ''} {req.alert_description or ''}".lower()
+            kinetic_trigger = any(
+                k in alert_corpus for k in ("beacon", "jitter", "c2", "spray", "brute", "dropper", "exfil", "entropy", "privilege", "lateral", "rat")
+            )
+            needs_secondary = is_tier1 and (
+                radar_result["is_outlier"]
+                or top_z >= 2.0
+                or float(cri) >= 40.0
+                or kinetic_trigger
+            )
+
+            if needs_secondary and req.case_id:
+              try:
+                logger.info(
+                    f"Tier 1 baseline complete. Triggering Tier 2 Secondary Deep Dive on sector '{top_sector}' "
+                    f"(Z={top_z:+.2f}σ, CRI={cri:.0f}, kinetic_trigger={kinetic_trigger}) for '{req.target_entity}'..."
+                )
+                tier2_directive = await StrategyDecider.decide_tier2_deep_dive(
+                    target_entity=req.target_entity,
+                    entity_type=req.entity_type,
+                    outlier_vector=top_sector,
+                    case_info={"id": req.case_id, "title": req.alert_name or ""},
+                    alerts=[{"name": req.alert_name or "", "description": req.alert_description or ""}],
+                    connector_events=[],
+                    radar_result=radar_result,
+                )
+                sec_query = tier2_directive.directive_query.lower()
+                sec_report = None
+                sec_cri = cri
+                sec_outlier = False
+
+                if "c2_jitter" in sec_query:
+                  sec_res = await StatsHunterEngine(tenant).run_c2_beaconing_jitter(
+                      session=session, src_ip=req.target_entity, lookback_days=req.lookback_days
+                  )
+                  sec_cri = sec_res["calibrated_risk_index"]
+                  sec_outlier = sec_res["is_outlier"]
+                  sec_rows = [
+                      {"metric": "**Coefficient of Variation ($CV$)**", "observed": f"`{sec_res['coefficient_of_variation']:.3f}`", "threshold": "<= 0.20", "assessment": "⚠️ Low Jitter / Robotic Regularity" if sec_outlier else "✅ Normal Jitter Variance"},
+                      {"metric": "**Target Destination**", "observed": f"`{sec_res['target_destination']}`", "threshold": "N/A", "assessment": "Suspected C2 Exfiltration Socket" if sec_outlier else "Benign Traffic"},
+                  ]
+                  sec_report = CaseWallCardFormatter.format_card(
+                      target_entity=req.target_entity,
+                      entity_type=req.entity_type,
+                      model_name=tier2_directive.model_name,
+                      calibrated_risk_index=float(sec_cri),
+                      is_outlier=sec_outlier,
+                      case_id=req.case_id,
+                      rows_count=sec_res.get("stats_rows", 0),
+                      directive=tier2_directive,
+                      metrics_table_rows=sec_rows,
+                  )
+                elif "poisson_burst" in sec_query:
+                  sec_res = await StatsHunterEngine(tenant).run_poisson_burst_clustering(
+                      session=session, entity=req.target_entity, lookback_days=req.lookback_days
+                  )
+                  sec_cri = sec_res["calibrated_risk_index"]
+                  sec_outlier = sec_res["is_outlier"]
+                  sec_rows = [
+                      {"metric": "**Fano Factor ($F = \\sigma^2 / \\mu$)**", "observed": f"`{sec_res['fano_factor']:.2f}`", "threshold": "> 4.00", "assessment": "⚠️ Acute Clustered Spray Dispersion" if sec_outlier else "✅ Nominal Poisson Baseline"},
+                      {"metric": "**Total Failed Logins**", "observed": f"`{sec_res['total_failures']}`", "threshold": "Baseline", "assessment": "Authentication Failure Volatility"},
+                  ]
+                  sec_report = CaseWallCardFormatter.format_card(
+                      target_entity=req.target_entity,
+                      entity_type=req.entity_type,
+                      model_name=tier2_directive.model_name,
+                      calibrated_risk_index=float(sec_cri),
+                      is_outlier=sec_outlier,
+                      case_id=req.case_id,
+                      rows_count=sec_res.get("stats_rows", 0),
+                      directive=tier2_directive,
+                      metrics_table_rows=sec_rows,
+                  )
+                elif "cloud_crud" in sec_query:
+                  sec_res = await RiskMetricsEngine(tenant).run_cloud_crud_surge(
+                      session=session, username=req.target_entity, lookback_days=req.lookback_days
+                  )
+                  sec_cri = sec_res["calibrated_risk_index"]
+                  sec_outlier = sec_res["is_outlier"]
+                  sec_rows = [
+                      {"metric": "**Cloud CRUD Z-Score ($Z$)**", "observed": f"`{sec_res['z_score']:+.2f}σ`", "threshold": "|Z| <= 2.0σ", "assessment": "⚠️ IAM / Resource Mutation Surge" if sec_outlier else "✅ Normal Cloud Operations"},
+                      {"metric": "**Mutations Observed (24h)**", "observed": f"`{sec_res['observed_count']}` events", "threshold": f"μ={sec_res['baseline_avg']:.1f}, σ={sec_res['baseline_std']:.1f}", "assessment": "Significant Departure" if sec_outlier else "Baseline"},
+                  ]
+                  sec_report = CaseWallCardFormatter.format_card(
+                      target_entity=req.target_entity,
+                      entity_type=req.entity_type,
+                      model_name=tier2_directive.model_name,
+                      calibrated_risk_index=float(sec_cri),
+                      is_outlier=sec_outlier,
+                      case_id=req.case_id,
+                      rows_count=sec_res.get("observed_count", 0),
+                      directive=tier2_directive,
+                      metrics_table_rows=sec_rows,
+                  )
+
+                if sec_report and req.post_to_case_wall:
+                  await session.call_tool(
+                      "create_case_comment",
+                      {
+                          "projectId": tenant.project_id,
+                          "customerId": tenant.customer_id,
+                          "region": tenant.region,
+                          "caseId": str(req.case_id),
+                          "comment": sec_report,
+                      },
+                  )
+                  markdown_report = f"{markdown_report}\n\n---\n\n{sec_report}"
+                  cri = max(cri, sec_cri)
+                  if sec_outlier:
+                    triage.is_outlier = True
+                    triage.calibrated_risk_index = float(cri)
+                    triage.verdict = "CRITICAL_OUTLIER" if cri >= 80 else "HIGH_OUTLIER"
+                    triage.primary_vector = f"tier2_{tier2_directive.model_name.lower()}"
+              except Exception as sec_err:
+                logger.warning(f"Tier 2 secondary sweep encountered non-fatal error: {sec_err}")
             clean_hand_off = CleanHandOffPayload(
                 target_entity=req.target_entity,
                 entity_type=req.entity_type,

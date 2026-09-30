@@ -45,6 +45,9 @@ class StrategyDirective(BaseModel):
   hypothesis_h1: str = ""
   selection_rationale: str = ""
   flight_card_title: str = ""
+  investigation_tier: str = "TIER_1_BASELINE"  # "TIER_1_BASELINE" | "TIER_2_DEEP_DIVE"
+  outlier_vector: Optional[str] = None
+  recommended_avenues: List[str] = Field(default_factory=list)
 
 
 class JITHuntRequest(BaseModel):
