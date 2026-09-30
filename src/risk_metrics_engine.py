@@ -176,17 +176,18 @@ order:
   $z desc""",
         "DNS": f"""stage dns_risk {{
     metadata.event_type = "NETWORK_DNS"
+    network.dns.response_code != 0
     principal.user.userid = "{username}"
     $user = principal.user.userid
   match:
     $user by 1d
   outcome:
     $obs = count(metadata.id)
-    $avg = max(metrics.dns_queries_total(
+    $avg = max(metrics.dns_queries_fail(
         period: 1d, window: 30d, metric: event_count_sum, agg: avg,
         principal.user.userid: "{username}"
     ))
-    $std = max(metrics.dns_queries_total(
+    $std = max(metrics.dns_queries_fail(
         period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
         principal.user.userid: "{username}"
     ))
@@ -430,19 +431,33 @@ order:
     $user, $vendor, $product by 1d
   outcome:
     $obs = count(metadata.id)
-    $avg = max(metrics.resource_creation_total(
+    $create_avg = max(metrics.resource_creation_total(
         period: 1d, window: 30d, metric: event_count_sum, agg: avg,
         principal.user.userid: "{username}",
         metadata.vendor_name: $vendor,
         metadata.product_name: $product
     ))
-    $std = max(metrics.resource_creation_total(
+    $create_std = max(metrics.resource_creation_total(
         period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
         principal.user.userid: "{username}",
         metadata.vendor_name: $vendor,
         metadata.product_name: $product
     ))
-    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+    $delete_avg = max(metrics.resource_deletion_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.user.userid: "{username}",
+        metadata.vendor_name: $vendor,
+        metadata.product_name: $product
+    ))
+    $delete_std = max(metrics.resource_deletion_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.user.userid: "{username}",
+        metadata.vendor_name: $vendor,
+        metadata.product_name: $product
+    ))
+    $z_create = ($obs - $create_avg) / if($create_std > 0, $create_std, 1.0)
+    $z_delete = ($obs - $delete_avg) / if($delete_std > 0, $delete_std, 1.0)
+    $z = if($z_create > $z_delete, $z_create, $z_delete)
 }}
 
 $user = $cloud_risk.user
