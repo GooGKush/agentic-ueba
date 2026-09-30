@@ -69,7 +69,19 @@ class StatsHunterEngine:
     detected_dst = None
 
     if rows:
-      top_row = rows[0]
+      # Filter out multicast, broadcast, and loopback destinations
+      valid_rows = [
+          r for r in rows
+          if not any(
+              str(r.get("dst_ip", "")).startswith(p)
+              for p in (
+                  "224.", "225.", "226.", "227.", "228.", "229.", "230.",
+                  "231.", "232.", "233.", "234.", "235.", "236.", "237.",
+                  "238.", "239.", "255.", "127.", "0."
+              )
+          )
+      ]
+      top_row = valid_rows[0] if valid_rows else rows[0]
       top_cv = float(top_row.get("cv", top_row.get("coefficient_of_variation", 1.0)) or 1.0)
       detected_dst = top_row.get("dst_ip", "UNKNOWN")
       is_beaconing = top_cv <= cv_threshold
@@ -193,6 +205,9 @@ class StatsHunterEngine:
     start_iso, end_iso = self._iso_window(lookback_days)
     tpl_path = self.runner.find_template(self.SKILL_NAME, "markov_2gram_transition_rarity_2stage.yl2")
 
+    if entity_field == "principal.hostname" and (":" in host or re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", host)):
+      entity_field = "principal.asset.ip"
+
     params = {
         "event_type": event_type,
         "entity_field": entity_field,
@@ -297,6 +312,9 @@ class StatsHunterEngine:
     """Detects rare administrative tools in the enterprise Zipfian long tail."""
     start_iso, end_iso = self._iso_window(lookback_days)
     tpl_path = self.runner.find_template(self.SKILL_NAME, "zipfian_process_rarity_2stage.yl2")
+
+    if entity_field == "principal.hostname" and (":" in host or re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", host)):
+      entity_field = "principal.asset.ip"
 
     params = {
         "event_type": event_type,
