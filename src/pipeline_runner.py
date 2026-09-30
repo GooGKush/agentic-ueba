@@ -64,6 +64,19 @@ class PipelineRunner:
 
     return rendered
 
+  def validate_ast(self, query: str) -> List[str]:
+    """Validates YARA-L 2.0 query against Malachite AST grammar & metric invariants."""
+    try:
+      import sys
+      metrics_skill = self.skills_root / "secops-risk-metrics-multistage"
+      if metrics_skill.is_dir() and str(metrics_skill) not in sys.path:
+        sys.path.insert(0, str(metrics_skill))
+      from scripts.preflight_validator import MalachiteASTValidator
+      return MalachiteASTValidator.validate_query(query)
+    except Exception as e:
+      logger.debug(f"Malachite AST validator unavailable: {e}")
+      return []
+
   @staticmethod
   def calculate_cri(z_score: float) -> int:
     """Computes Calibrated Risk Index (CRI) [0–100] via sigmoid normalization.
@@ -145,6 +158,12 @@ class PipelineRunner:
         "customerId": self.tenant.customer_id,
         "region": self.tenant.region,
     }
+    # Preflight Malachite AST validation check
+    ast_errors = self.validate_ast(query)
+    crit_errors = [e for e in ast_errors if not e.startswith("MISSING_GOAL_HEADER")]
+    if crit_errors:
+      logger.warning(f"Malachite AST preflight invariant warnings: {crit_errors}")
+
     logger.info(f"Executing query over OneMCP: {query[:120]}...")
     res = await session.call_tool("udm_search", tool_args)
     if not res.content:
