@@ -213,27 +213,29 @@ Output must be valid JSON matching this schema:
     threats = ctx.get("threat_associations", [])
     outcomes = ctx.get("outcome_metrics", {})
 
-    # 1. Network / C2 Beaconing Indicators
+    # 1. Network / C2 Beaconing Indicators (timing regularity, periodic beaconing, C2 framework)
     if re.search(r"\b(beacon|beaconing|jitter|command\s+and\s+control|periodic\s+connection|outbound\s+regularity)\b", text_corpus) or (
         re.search(r"\bc2\b", text_corpus) and "ec2" not in text_corpus
-    ) or re.search(r"\b(agenttesla|mimikatz|trojan|malware|stealer|rat)\b", text_corpus):
-      threat_label = threats[0] if threats else "Malware Payload"
+    ):
+      threat_label = threats[0] if threats else "Command & Control"
       return StrategyDirective(
           selected_skill="secops-statistical-hunter",
           model_name="C2_BEACONING_JITTER",
           directive_query="c2_jitter",
           target_entity=target_entity,
           entity_type=entity_type,
-          threat_summary=f"Host `{target_entity}` associated with {threat_label} file execution or C2 telemetry.",
+          threat_summary=f"Host `{target_entity}` associated with {threat_label} periodic network communication or C2 telemetry.",
           hypothesis_h0="Outbound network connections originate from stochastic application background traffic ($CV > 0.30$).",
           hypothesis_h1="Host established automated, low-jitter periodic polling to external C2 exfiltration infrastructure ($CV \\le 0.30$).",
           selection_rationale="Applied Inverted Coefficient of Variation regularity modeling over sliding outbound network flows.",
           flight_card_title=f"C2 Beaconing Jitter Analysis: `{target_entity}`",
       )
 
-    # 2. Credential Spray / Burst Login Indicators
-    if re.search(r"\b(spray|brute\s+force|failed\s+login\s+surge|poisson|fano)\b", text_corpus) or (
+    # 2. Credential Spray / Burst Login Indicators / Credential Stealer on Identity
+    if re.search(r"\b(spray|brute\s+force|failed\s+login\s+surge|poisson|fano|mimikatz|pwdump|credential\s+theft)\b", text_corpus) or (
         "USER_LOGIN" in udm_events and ("fail" in text_corpus or "excessive" in text_corpus)
+    ) or (
+        entity_type in ("USER", "USER_ID", "EMAIL") and re.search(r"\b(agenttesla|stealer|infostealer|keylogger)\b", text_corpus)
     ):
       return StrategyDirective(
           selected_skill="secops-statistical-hunter",
@@ -241,7 +243,7 @@ Output must be valid JSON matching this schema:
           directive_query="poisson_burst",
           target_entity=target_entity,
           entity_type=entity_type,
-          threat_summary=f"Excessive authentication failures or brute force attempts targeting `{target_entity}`.",
+          threat_summary=f"Excessive authentication failures or credential spray attempts targeting `{target_entity}`.",
           hypothesis_h0="Failures stem from benign user password expiration or expired cached credentials ($Fano \\le 4.0$).",
           hypothesis_h1="Identity subjected to automated, high-dispersion Poisson credential spray bursts ($Fano > 4.0$).",
           selection_rationale="Fano Factor dispersion ($F = \\sigma^2 / \\mu$) evaluation over hourly authentication bins.",
@@ -278,18 +280,21 @@ Output must be valid JSON matching this schema:
           flight_card_title=f"Markov Process Transition Rarity: `{target_entity}`",
       )
 
-    # 5. Zipfian Power-Law / Long-Tail Rare Administrative Tools
-    if re.search(r"\b(zipf|zipfian|long\s+tail|rare\s+binary|rare\s+admin\s+tool|rare\s+process)\b", text_corpus):
+    # 5. Zipfian Power-Law / Long-Tail Rare Administrative Tools & File IoC Ingress
+    if re.search(r"\b(zipf|zipfian|long\s+tail|rare\s+binary|rare\s+admin\s+tool|rare\s+process)\b", text_corpus) or (
+        "FILE" in udm_events or "files" in udm_events or re.search(r"\b(file\s+ioc|target\.file|sha256|dropper|payload|trojan|malware)\b", text_corpus) or re.search(r"\b(agenttesla|originlogger|redline|vidar|lumma|raccoon|stealer|rat)\b", text_corpus)
+    ):
+      threat_label = threats[0] if threats else "Malware Dropper / IoC"
       return StrategyDirective(
           selected_skill="secops-statistical-hunter",
           model_name="ZIPFIAN_PROCESS_RARITY",
           directive_query="zipfian_rarity",
           target_entity=target_entity,
           entity_type=entity_type,
-          threat_summary=f"Long-tail rare binary execution observed across fleet on `{target_entity}`.",
-          hypothesis_h0="Binary execution represents standard software updates or developer tool usage.",
-          hypothesis_h1="Adversary utilizing long-tail administrative utilities to perform discovery or persistence.",
-          selection_rationale="Zipfian power-law fleet prevalence distribution over executable images.",
+          threat_summary=f"File IoC or malicious payload delivery ({threat_label}) targeting `{target_entity}`.",
+          hypothesis_h0="Executable binaries on host conform to widely adopted enterprise software baselines.",
+          hypothesis_h1=f"Adversary executed long-tail rare binaries or subordinate tools associated with {threat_label} intrusion.",
+          selection_rationale="Zipfian power-law fleet distribution over executable images following file IoC ingress.",
           flight_card_title=f"Zipfian Long-Tail Process Rarity: `{target_entity}`",
       )
 

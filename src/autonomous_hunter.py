@@ -789,14 +789,42 @@ class AutonomousHunterEngine:
             cri = shannon_result["calibrated_risk_index"]
             verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
             sample_tok = shannon_result.get("sample_token") or "N/A"
-            markdown_report = (
-                f"# Shannon Character Entropy Analysis: {req.target_entity}\n\n"
-                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
-                f"**Entropy Score**: {shannon_result['shannon_entropy_score']}\n"
-                f"**Sample Token/Command**: `{sample_tok}`\n"
-                f"**Is Outlier**: {shannon_result['is_outlier']}\n\n"
-                f"## Forensic Details\n"
-                f"- Evaluated token length and character-class randomness for command obfuscation and DGA payloads.\n"
+            shannon_rows = [
+                {
+                    "metric": "**Shannon Entropy ($H$)**",
+                    "observed": f"`{shannon_result['shannon_entropy_score']:.2f}` bits/char",
+                    "threshold": "> 6.00 bits/char",
+                    "assessment": "⚠️ Obfuscated / Encrypted Command Payload" if shannon_result["is_outlier"] else "✅ Standard Text Entropy",
+                },
+                {
+                    "metric": "**Sampled Execution Token**",
+                    "observed": f"`{sample_tok[:60]}`",
+                    "threshold": "Plaintext Command Line",
+                    "assessment": "Command Line Argument Inspection",
+                },
+                {
+                    "metric": "**Sampled Executions**",
+                    "observed": f"`{shannon_result.get('stats_rows', 0)}` records",
+                    "threshold": "$\\ge 1$ required",
+                    "assessment": "Process Launch Telemetry",
+                },
+            ]
+            markdown_report = CaseWallCardFormatter.format_card(
+                target_entity=req.target_entity,
+                entity_type=req.entity_type,
+                model_name="SHANNON_CHARACTER_ENTROPY",
+                calibrated_risk_index=float(cri),
+                is_outlier=shannon_result["is_outlier"],
+                case_id=req.case_id,
+                rows_count=shannon_result.get("stats_rows", 0),
+                directive=req.directive,
+                metrics_table_rows=shannon_rows,
+                soc_guidance=(
+                    f"Command line on `{req.target_entity}` exhibits high Shannon character-class entropy ($H = {shannon_result['shannon_entropy_score']:.2f}$ bits/char), indicating Base64/XOR obfuscated scripts. "
+                    "Terminate process and extract decoded command buffers."
+                    if shannon_result["is_outlier"] else
+                    f"Command line entropy on `{req.target_entity}` is within expected readable parameter distributions."
+                ),
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
@@ -856,15 +884,42 @@ class AutonomousHunterEngine:
             verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
             p_proc = markov_result.get("parent_process") or "UNKNOWN"
             c_proc = markov_result.get("child_process") or "UNKNOWN"
-            markdown_report = (
-                f"# Markov Process Transition Analysis: {req.target_entity}\n\n"
-                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
-                f"**Markov Threat Score**: {markov_result['markov_threat_score']}\n"
-                f"**Information Surprisal**: {markov_result['surprisal_score']}\n"
-                f"**Transition**: `{p_proc}` ➔ `{c_proc}`\n"
-                f"**Is Outlier**: {markov_result['is_outlier']}\n\n"
-                f"## Forensic Details\n"
-                f"- Evaluated conditional transition probability P(Child | Parent) to detect rare Living-off-the-Land execution chains.\n"
+            markov_rows = [
+                {
+                    "metric": "**Information Surprisal**",
+                    "observed": f"`{markov_result['surprisal_score']:.2f}` bits",
+                    "threshold": "> 4.00 bits",
+                    "assessment": "⚠️ Rare Living-off-the-Land Transition" if markov_result["is_outlier"] else "✅ Standard Process Transition",
+                },
+                {
+                    "metric": "**Observed Transition**",
+                    "observed": f"`{p_proc}` ➔ `{c_proc}`",
+                    "threshold": "P(Child|Parent) > 0.05",
+                    "assessment": "Parent-Child Process Lineage",
+                },
+                {
+                    "metric": "**Sampled Executions**",
+                    "observed": f"`{markov_result.get('stats_rows', 0)}` records",
+                    "threshold": "$\\ge 1$ required",
+                    "assessment": "Process Lineage Telemetry",
+                },
+            ]
+            markdown_report = CaseWallCardFormatter.format_card(
+                target_entity=req.target_entity,
+                entity_type=req.entity_type,
+                model_name="MARKOV_TRANSITION_RARITY",
+                calibrated_risk_index=float(cri),
+                is_outlier=markov_result["is_outlier"],
+                case_id=req.case_id,
+                rows_count=markov_result.get("stats_rows", 0),
+                directive=req.directive,
+                metrics_table_rows=markov_rows,
+                soc_guidance=(
+                    f"Process lineage `{p_proc}` ➔ `{c_proc}` exhibits extreme surprisal ({markov_result['surprisal_score']:.2f} bits) characteristic of Living-off-the-Land execution. "
+                    "Isolate host and investigate command line arguments."
+                    if markov_result["is_outlier"] else
+                    f"Process execution transitions on `{req.target_entity}` conform to standard enterprise operational tooling."
+                ),
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
@@ -923,14 +978,42 @@ class AutonomousHunterEngine:
             cri = zipf_result["calibrated_risk_index"]
             verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
             rare_bin = zipf_result.get("rare_binary") or "UNKNOWN"
-            markdown_report = (
-                f"# Zipfian Process Rarity Analysis: {req.target_entity}\n\n"
-                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
-                f"**Zipf Rarity Score**: {zipf_result['zipf_rarity_score']}\n"
-                f"**Rare Binary**: `{rare_bin}`\n"
-                f"**Is Outlier**: {zipf_result['is_outlier']}\n\n"
-                f"## Forensic Details\n"
-                f"- Evaluated power-law asymptotic long tail departure across fleetwide binary adoption.\n"
+            zipf_rows = [
+                {
+                    "metric": "**Zipf Rarity Score**",
+                    "observed": f"`{zipf_result['zipf_rarity_score']:.2f}`",
+                    "threshold": "> 3.50",
+                    "assessment": "⚠️ Long-Tail Fleet Outlier" if zipf_result["is_outlier"] else "✅ Common Fleet Software",
+                },
+                {
+                    "metric": "**Top Rare Binary**",
+                    "observed": f"`{rare_bin}`",
+                    "threshold": "<= 2 Fleet Hosts",
+                    "assessment": "Isolated Execution Image",
+                },
+                {
+                    "metric": "**Sampled Process Executions**",
+                    "observed": f"`{zipf_result.get('stats_rows', 0)}` records",
+                    "threshold": "$\\ge 1$ required",
+                    "assessment": "Process Launch Telemetry",
+                },
+            ]
+            markdown_report = CaseWallCardFormatter.format_card(
+                target_entity=req.target_entity,
+                entity_type=req.entity_type,
+                model_name="ZIPFIAN_PROCESS_RARITY",
+                calibrated_risk_index=float(cri),
+                is_outlier=zipf_result["is_outlier"],
+                case_id=req.case_id,
+                rows_count=zipf_result.get("stats_rows", 0),
+                directive=req.directive,
+                metrics_table_rows=zipf_rows,
+                soc_guidance=(
+                    f"Host `{req.target_entity}` executed rare binary `{rare_bin}` sitting in the extreme asymptotic fleet tail (Zipf Score = {zipf_result['zipf_rarity_score']:.2f}). "
+                    "Isolate host, terminate binary process, and inspect persistence entries."
+                    if zipf_result["is_outlier"] else
+                    f"Process execution telemetry on `{req.target_entity}` conforms to common enterprise software distributions."
+                ),
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:

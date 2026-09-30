@@ -254,6 +254,26 @@ def test_strategy_decider_routing_all_new_models():
   assert skill == "secops-risk-metrics-multistage"
   assert model == "360_DECOUPLED_RADAR"
 
+  # 11. File IoC / Dropper on Endpoint IP -> Zipfian Process Rarity
+  skill, query, model = StrategyDecider.decide(
+      case_title="ATI High Priority Rule Match for File IoCs (target.file.sha256)",
+      alert_name="ATI HIGH PRIORITY RULE MATCH FOR FILE IOCS (TARGET.FILE.SHA256)",
+      alert_desc="AgentTesla malware dropper binary delivered via HTTP",
+      entity_type="IP",
+  )
+  assert skill == "secops-statistical-hunter"
+  assert model == "ZIPFIAN_PROCESS_RARITY"
+
+  # 12. Credential Stealer on User Identity -> Poisson Burst Clustering
+  skill, query, model = StrategyDecider.decide(
+      case_title="",
+      alert_name="AgentTesla Credential Stealer Activity",
+      alert_desc="Harvested credentials attempted against single sign-on portal",
+      entity_type="USER",
+  )
+  assert skill == "secops-statistical-hunter"
+  assert model == "POISSON_BURST_CLUSTERING"
+
 
 def test_parse_stats_response():
   runner = PipelineRunner()
