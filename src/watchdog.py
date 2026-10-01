@@ -579,7 +579,7 @@ class WatchdogDaemon:
                   ident = ent.get("identifier") or ent.get("OriginalIdentifier")
                   if not ident:
                     continue
-                  if e_type in ("USER", "USER_ID", "EMAIL", "USERNAME", "ACCOUNT"):
+                  if e_type in ("USER", "USER_ID", "EMAIL", "USERNAME", "ACCOUNT", "USERUNIQNAME"):
                     target_entity = ident.lower()
                     entity_type = "USER"
                     break
@@ -672,6 +672,8 @@ class WatchdogDaemon:
                 query=directive_query,
                 skill=skill,
                 directive=directive,
+                alerts=alerts,
+                connector_events=all_conn_events,
                 post_to_case_wall=True,
             )
 

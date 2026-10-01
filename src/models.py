@@ -33,6 +33,33 @@ class CleanHandOffPayload(BaseModel):
   escalation_action: str = "MONITOR"
 
 
+class CandidateHypothesis(BaseModel):
+  """A defended secondary hunt hypothesis with a calibrated confidence score."""
+  hypothesis_title: str
+  selected_skill: str = "secops-risk-metrics-multistage"
+  model_name: str
+  directive_query: str
+  target_metric: Optional[str] = Field(
+      default=None,
+      description="Selected metric from the 38-metric catalog (e.g. 'workspace_total_download_actions', 'http_queries_fail', 'dns_queries_fail', 'file_executions_total', 'resource_written_total')",
+  )
+  fusion_metrics: List[str] = Field(
+      default_factory=list,
+      description="2 compatible metrics for Cross-Vector / Roll-Up Fusion, or 3 sibling metrics for Triad Multilevel",
+  )
+  identifier_field: Optional[str] = Field(
+      default=None,
+      description="UDM dimension field, e.g. 'principal.user.userid', 'target.user.userid', 'principal.asset.hostname'",
+  )
+  hypothesis_h0: str = ""
+  hypothesis_h1: str = ""
+  evidentiary_defense: str = ""
+  confidence_score: float = Field(default=0.50, ge=0.0, le=1.0)
+  confidence_band: str = "ANALYST_REVIEW"  # "AUTO_EXECUTE" | "ANALYST_REVIEW" | "SUPPRESSED"
+  confidence_breakdown: str = ""
+  pivot_reason: Optional[str] = None
+
+
 class StrategyDirective(BaseModel):
   """Formulated threat hunt hypothesis and model execution directive."""
   selected_skill: str = "secops-statistical-hunter"
@@ -40,14 +67,32 @@ class StrategyDirective(BaseModel):
   directive_query: str = ""
   target_entity: str = ""
   entity_type: str = "USER"
+  target_metric: Optional[str] = Field(
+      default=None,
+      description="Selected metric from the 38-metric catalog when executing a dynamic metric pipeline",
+  )
+  fusion_metrics: List[str] = Field(
+      default_factory=list,
+      description="2 compatible metrics for Cross-Vector / Roll-Up Fusion, or 3 sibling metrics for Triad Multilevel",
+  )
+  identifier_field: Optional[str] = Field(
+      default=None,
+      description="UDM dimension field, e.g. 'principal.user.userid', 'target.user.userid', 'principal.asset.hostname'",
+  )
   threat_summary: str = ""
   hypothesis_h0: str = ""
   hypothesis_h1: str = ""
   selection_rationale: str = ""
+  evidentiary_defense: str = ""
+  confidence_score: float = Field(default=0.80, ge=0.0, le=1.0)
+  confidence_band: str = "AUTO_EXECUTE"  # "AUTO_EXECUTE" | "ANALYST_REVIEW" | "SUPPRESSED"
+  confidence_breakdown: str = ""
+  pivot_reason: Optional[str] = None
   flight_card_title: str = ""
-  investigation_tier: str = "TIER_1_BASELINE"  # "TIER_1_BASELINE" | "TIER_2_DEEP_DIVE"
+  investigation_tier: str = "TIER_1_BASELINE"  # "TIER_1_BASELINE" | "TIER_2_DEEP_DIVE" | "TIER_2B_PIVOT"
   outlier_vector: Optional[str] = None
   recommended_avenues: List[str] = Field(default_factory=list)
+  candidate_hypotheses: List[CandidateHypothesis] = Field(default_factory=list)
 
 
 class JITHuntRequest(BaseModel):
@@ -66,6 +111,11 @@ class JITHuntRequest(BaseModel):
   alert_id: Optional[str] = Field(default=None, description="Chronicle SOAR Alert ID")
   alert_name: Optional[str] = Field(default=None, description="Title of the triggering alert")
   alert_description: Optional[str] = Field(default=None, description="Description/TTP of triggering alert")
+  alerts: List[Dict[str, Any]] = Field(default_factory=list, description="Case alert metadata list")
+  connector_events: List[Dict[str, Any]] = Field(
+      default_factory=list,
+      description="Raw UDM connector events extracted from case alerts",
+  )
   
   # Pre-formulated strategy directive (optional, populated by Agentic Strategy Reasoner)
   directive: Optional[StrategyDirective] = None

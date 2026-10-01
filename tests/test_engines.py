@@ -626,9 +626,262 @@ async def test_host_360_radar_query_generation(monkeypatch):
   )
 
   assert res["entity"] == "workstation-corp-01"
-  assert len(captured_queries) == 5  # Auth, Egress, DNS, Flows, Alerts
-  # Verify host-specific UDM predicates are used
+  assert len(captured_queries) == 6  # Auth, Egress, DNS, Flows, Alerts, Web
+  # Verify host-specific UDM predicates and v1.8.0 baseline-aligned metrics are used
   assert any("principal.asset.hostname" in q for q in captured_queries)
-  assert any("metrics.auth_attempts_total" in q for q in captured_queries)
+  assert any("metrics.auth_attempts_fail" in q for q in captured_queries)
   assert any("metrics.network_bytes_outbound" in q for q in captured_queries)
   assert any("metrics.dns_queries_fail" in q for q in captured_queries)
+  assert any("metrics.http_queries_total" in q for q in captured_queries)
+
+
+@pytest.mark.anyio
+async def test_situational_non_auth_non_network_metric_selection():
+  from src.strategy_decider import StrategyDecider
+
+  # 1. Workspace Outlier -> selects workspace_total_download_actions + MACD & Cross-Vector Fusion candidate
+  t2_ws = await StrategyDecider.decide_tier2_deep_dive(
+      target_entity="insider.user",
+      entity_type="USER",
+      outlier_vector="Workspace",
+      case_info={"id": "case-ws-1", "title": "Google Drive Mass Download"},
+      alerts=[{"name": "Workspace Exfiltration", "description": "Spike in Google Drive file downloads"}],
+      connector_events=[],
+  )
+  assert t2_ws.selected_skill == "secops-risk-metrics-multistage"
+  assert t2_ws.target_metric == "workspace_total_download_actions"
+  assert t2_ws.confidence_score >= StrategyDecider.TIER_2A_AUTO_EXECUTE_THRESHOLD
+  assert t2_ws.confidence_band == "AUTO_EXECUTE"
+  assert any("workspace_total_download_actions" in c.fusion_metrics for c in t2_ws.candidate_hypotheses)
+
+  # 2. Web / HTTP Proxy Outlier -> selects http_queries_total or http_queries_fail
+  t2_web = await StrategyDecider.decide_tier2_deep_dive(
+      target_entity="scraper.user",
+      entity_type="USER",
+      outlier_vector="Web",
+      case_info={"id": "case-web-1", "title": "Anomalous Web Proxy Activity"},
+      alerts=[{"name": "HTTP Proxy Surge", "description": "Unusual HTTP user_agent and URI scraping"}],
+      connector_events=[],
+  )
+  assert t2_web.selected_skill == "secops-risk-metrics-multistage"
+  assert t2_web.target_metric in ("http_queries_total", "http_queries_fail")
+  assert t2_web.confidence_score >= StrategyDecider.TIER_2A_AUTO_EXECUTE_THRESHOLD
+
+  # 3. DNS Outlier -> selects dns_queries_fail with LONGITUDINAL_CUSUM_DRIFT
+  t2_dns = await StrategyDecider.decide_tier2_deep_dive(
+      target_entity="10.20.30.40",
+      entity_type="IP",
+      outlier_vector="DNS",
+      case_info={"id": "case-dns-1", "title": "NXDOMAIN Resolution Surge"},
+      alerts=[{"name": "DNS Failure Spike", "description": "Elevated dns_queries_fail count"}],
+      connector_events=[],
+  )
+  assert t2_dns.selected_skill == "secops-risk-metrics-multistage"
+  assert t2_dns.model_name == "LONGITUDINAL_CUSUM_DRIFT"
+  assert t2_dns.target_metric == "dns_queries_fail"
+
+
+@pytest.mark.anyio
+async def test_sector_fusion_and_rollup_fusion_generation(monkeypatch):
+  from unittest.mock import AsyncMock, MagicMock
+  from src.risk_metrics_engine import RiskMetricsEngine
+  from src.config import TenantConfig
+
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  engine = RiskMetricsEngine(tenant)
+  captured_queries = []
+
+  async def mock_execute(session, query, start_iso, end_iso):
+    captured_queries.append(query)
+    return {"stats": [{"composite_threat_score": 4.6, "sector_a_z": 3.4, "sector_b_z": 3.1}]}
+
+  monkeypatch.setattr(engine.runner, "execute_query_via_mcp", mock_execute)
+  mock_session = AsyncMock()
+
+  # 1. Entity-keyed Dual-Sector Fusion: workspace_total_download_actions + network_bytes_outbound
+  res_dual = await engine.run_sector_fusion(
+      session=mock_session,
+      entity="alice.smith",
+      fusion_metrics=["workspace_total_download_actions", "network_bytes_outbound"],
+      lookback_days=7,
+  )
+  assert res_dual["template_name"] == "dual_sector_fusion_3stage.yl2"
+  assert res_dual["is_outlier"] is True
+  assert "metrics.workspace_total_download_actions" in res_dual["executed_query"]
+  assert "metrics.network_bytes_outbound" in res_dual["executed_query"]
+  assert 'alice.smith' in res_dual["executed_query"]
+
+  # 2. Composite Roll-Up Sector Fusion: resource_creation_total (composite) + auth_attempts_fail (entity-keyed)
+  res_rollup = await engine.run_sector_fusion(
+      session=mock_session,
+      entity="bob.devops",
+      fusion_metrics=["resource_creation_total", "auth_attempts_fail"],
+      lookback_days=7,
+  )
+  assert res_rollup["template_name"] == "rollup_sector_fusion_4stage.yl2"
+  assert "metrics.resource_creation_total" in res_rollup["executed_query"]
+  assert "metrics.auth_attempts_fail" in res_rollup["executed_query"]
+  assert 'bob.devops' in res_rollup["executed_query"]
+
+
+def test_confidence_scale_and_anti_runaway_guardrails():
+  from src.strategy_decider import StrategyDecider
+
+  radar_res = {
+      "sector_z_scores": {"Workspace": 3.8, "Egress": 3.2, "Auth": 0.1, "DNS": 0.0},
+      "sector_observed_counts": {"Workspace": 45, "Egress": 12000, "Auth": 2, "DNS": 0},
+      "outlier_sectors": ["Workspace", "Egress"],
+  }
+  ctx = {
+      "case_title": "Workspace Exfiltration",
+      "case_description": "User downloaded sensitive files from Google Drive",
+      "alerts": ["Drive Download Surge"],
+      "udm_event_types": ["USER_RESOURCE_ACCESS"],
+      "rule_generators": [],
+      "threat_associations": [],
+  }
+
+  # 1. High-Confidence Tier 2A Hypothesis -> AUTO_EXECUTE (>= 0.75)
+  score, band, breakdown = StrategyDecider.score_hypothesis_confidence(
+      model_name="MACD_MOMENTUM_VELOCITY",
+      target_metric="workspace_total_download_actions",
+      outlier_vector="Workspace",
+      ctx=ctx,
+      radar_result=radar_res,
+  )
+  assert score >= 0.75
+  assert band == "AUTO_EXECUTE"
+  assert "Tier1_Workspace_Z=+3.80σ" in breakdown
+
+  # 2. Duplicate Signature Veto -> 0.00 SUPPRESSED
+  sig = StrategyDecider.build_signature("MACD_MOMENTUM_VELOCITY", "workspace_total_download_actions", [])
+  score_dup, band_dup, _ = StrategyDecider.score_hypothesis_confidence(
+      model_name="MACD_MOMENTUM_VELOCITY",
+      target_metric="workspace_total_download_actions",
+      outlier_vector="Workspace",
+      ctx=ctx,
+      radar_result=radar_res,
+      executed_signatures={sig},
+  )
+  assert score_dup == 0.0
+  assert band_dup == "SUPPRESSED"
+
+  # 3. Zero-Telemetry Family Lockout -> 0.10 SUPPRESSED
+  score_empty, band_empty, _ = StrategyDecider.score_hypothesis_confidence(
+      model_name="LONGITUDINAL_CUSUM_DRIFT",
+      target_metric="dns_queries_fail",
+      outlier_vector="DNS",
+      ctx=ctx,
+      radar_result=radar_res,
+      empty_families={"DNS"},
+  )
+  assert score_empty == 0.10
+  assert band_empty == "SUPPRESSED"
+
+
+@pytest.mark.anyio
+async def test_bounded_tier2a_to_tier2b_epistemic_pivot_auto_execution(monkeypatch):
+  from unittest.mock import AsyncMock
+  from src.autonomous_hunter import AutonomousHunterEngine
+  from src.models import JITHuntRequest
+
+  engine = AutonomousHunterEngine()
+  req = JITHuntRequest(
+      target_entity="compromised_user",
+      entity_type="USER",
+      case_id="case-pivot-777",
+      alert_name="Suspicious Outbound Data Transfer",
+      alert_description="Elevated network egress and Workspace download activity",
+      query="profile_360_risk",
+      lookback_days=7,
+      post_to_case_wall=True,
+  )
+
+  # Tier 1 360° Radar returns Egress (Z=3.9) and Workspace (Z=3.4) outliers
+  mock_radar_res = {
+      "entity": "compromised_user",
+      "composite_d": 5.17,
+      "calibrated_risk_index": 82,
+      "top_sector": "Egress",
+      "is_outlier": True,
+      "outlier_sectors": ["Egress", "Workspace"],
+      "sector_z_scores": {"Auth": 0.2, "Cloud": 0.0, "Workspace": 3.4, "Egress": 3.9, "DNS": 0.1, "Web": 0.0},
+      "sector_observed_counts": {"Auth": 5, "Cloud": 0, "Workspace": 42, "Egress": 500, "DNS": 10, "Web": 0},
+      "sector_metrics": {
+          "Auth": "auth_attempts_fail",
+          "Cloud": "resource_creation_total",
+          "Workspace": "workspace_total_download_actions",
+          "Egress": "network_bytes_outbound",
+          "DNS": "dns_queries_fail",
+          "Web": "http_queries_total",
+      },
+      "verdict": "CRITICAL_OUTLIER",
+  }
+
+  # Tier 2A (C2_BEACONING_JITTER) runs first and REFUTES periodic beaconing (is_outlier=False, CV=0.85)
+  mock_c2_refuted = {
+      "entity": "compromised_user",
+      "model": "C2_BEACONING_JITTER",
+      "coefficient_of_variation": 0.85,
+      "target_destination": "203.0.113.50",
+      "top_z_score": 0.5,
+      "calibrated_risk_index": 20,
+      "is_outlier": False,
+      "stats_rows": 25,
+      "executed_query": "// C2 Jitter Query",
+  }
+
+  # Tier 2B Pivot (DUAL_SECTOR_FUSION_3STAGE) auto-executes and CONFIRMS multi-sector exfiltration (CRI=88)
+  mock_fusion_confirmed = {
+      "entity": "compromised_user",
+      "model": "DUAL_SECTOR_FUSION_3STAGE",
+      "template_name": "dual_sector_fusion_3stage.yl2",
+      "fusion_metrics": ["network_bytes_outbound", "workspace_total_download_actions"],
+      "composite_threat_score": 5.1,
+      "sector_a_z": 3.9,
+      "sector_b_z": 3.4,
+      "top_z_score": 5.1,
+      "calibrated_risk_index": 88,
+      "is_outlier": True,
+      "stats_rows": 2,
+      "executed_query": "// Dual Sector Fusion Query",
+  }
+
+  monkeypatch.setattr("src.autonomous_hunter.RiskMetricsEngine.run_360_behavioral_radar", AsyncMock(return_value=mock_radar_res))
+  monkeypatch.setattr("src.autonomous_hunter.StatsHunterEngine.run_c2_beaconing_jitter", AsyncMock(return_value=mock_c2_refuted))
+  monkeypatch.setattr("src.autonomous_hunter.RiskMetricsEngine.run_sector_fusion", AsyncMock(return_value=mock_fusion_confirmed))
+
+  posted_comments = []
+  mock_session = AsyncMock()
+  mock_session.initialize = AsyncMock()
+  mock_session.__aenter__.return_value = mock_session
+
+  async def mock_call_tool(tool_name, args):
+    if tool_name == "create_case_comment":
+      posted_comments.append(args["comment"])
+
+  mock_session.call_tool = mock_call_tool
+
+  class MockContext:
+    async def __aenter__(self):
+      return (AsyncMock(), AsyncMock())
+    async def __aexit__(self, *args):
+      pass
+
+  monkeypatch.setattr("src.autonomous_hunter.streamable_http_client", lambda *args, **kwargs: MockContext())
+  monkeypatch.setattr("src.autonomous_hunter.ClientSession", lambda *args, **kwargs: mock_session)
+  monkeypatch.setattr("src.config.TenantConfig.get_auth_headers", lambda self: {"Authorization": "Bearer test"})
+
+  resp = await engine.execute_jit_hunt(req)
+  assert resp.status == "SUCCESS"
+  # Verify exactly 3 Case Wall cards were posted: Tier 1 360° Radar, Tier 2A Refuted C2 Jitter, Tier 2B Confirmed Fusion Pivot
+  assert len(posted_comments) == 3
+  assert "Tier 1: 360° Behavioral Radar Baseline" in posted_comments[0]
+  assert "Tier 2: Targeted Deep Dive (Egress)" in posted_comments[1]
+  assert "Tier 2B: Autonomous Hypothesis Pivot" in posted_comments[2]
+  assert "Autonomous Pivot Lineage" in posted_comments[2]
+  assert "Hypothesis Confidence Scale" in posted_comments[1]
+  assert "Defense of Hypothesis" in posted_comments[1]
+  assert resp.triage.calibrated_risk_index == 88.0
+  assert resp.triage.primary_vector == "tier2b_dual_sector_fusion_3stage"
+

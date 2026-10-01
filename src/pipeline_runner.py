@@ -64,13 +64,62 @@ class PipelineRunner:
 
     return rendered
 
+  def _ensure_skill_path(self) -> Path:
+    """Ensures secops-risk-metrics-multistage is importable and returns its path."""
+    import sys
+    metrics_skill = self.skills_root / "secops-risk-metrics-multistage"
+    if metrics_skill.is_dir() and str(metrics_skill) not in sys.path:
+      sys.path.insert(0, str(metrics_skill))
+    return metrics_skill
+
+  def get_malachite_catalog(self) -> Any:
+    """Returns the compiler-grounded malachite_catalog module from secops-risk-metrics-multistage."""
+    self._ensure_skill_path()
+    from scripts import malachite_catalog
+    return malachite_catalog
+
+  def get_template_router(self) -> Any:
+    """Returns an initialized MultiStageTemplateRouter instance from secops-risk-metrics-multistage."""
+    metrics_skill = self._ensure_skill_path()
+    from scripts.template_router import MultiStageTemplateRouter
+    return MultiStageTemplateRouter(template_dir=metrics_skill / "templates")
+
+  def get_validator_enums(self) -> Tuple[Any, Any, Any, Any]:
+    """Returns (EntityType, PipelineArchitecture, StatisticalModel, PreFlightValidator)."""
+    self._ensure_skill_path()
+    from scripts.preflight_validator import (
+        EntityType,
+        PipelineArchitecture,
+        StatisticalModel,
+        PreFlightValidator,
+    )
+    return EntityType, PipelineArchitecture, StatisticalModel, PreFlightValidator
+
+  @staticmethod
+  def scope_query_to_entity(query: str, target_entity: Optional[str]) -> str:
+    """Scopes non-fleet Stage 1 / Sector stages to a specific target entity if provided."""
+    if not target_entity or target_entity.lower() in ("fleet", "unknown", "unknown_entity", "target_entity", "*"):
+      return query
+
+    def _scope_stage(match: re.Match) -> str:
+      stage_name = match.group(1)
+      stage_body = match.group(2)
+      # Preserve fleet-wide normalization stages intact
+      if any(w in stage_name.lower() for w in ("fleet", "enterprise", "cohort", "peer", "global")):
+        return match.group(0)
+      scoped_body = re.sub(
+          r'(\$(?:entity|user|host|asset)\s*)!=\s*""',
+          f'\\1= "{target_entity}"',
+          stage_body,
+      )
+      return f"stage {stage_name} {{{scoped_body}}}"
+
+    return re.sub(r"stage\s+([a-zA-Z0-9_]+)\s*\{(.*?)\}", _scope_stage, query, flags=re.DOTALL)
+
   def validate_ast(self, query: str) -> List[str]:
     """Validates YARA-L 2.0 query against Malachite AST grammar & metric invariants."""
     try:
-      import sys
-      metrics_skill = self.skills_root / "secops-risk-metrics-multistage"
-      if metrics_skill.is_dir() and str(metrics_skill) not in sys.path:
-        sys.path.insert(0, str(metrics_skill))
+      self._ensure_skill_path()
       from scripts.preflight_validator import MalachiteASTValidator
       return MalachiteASTValidator.validate_query(query)
     except Exception as e:
