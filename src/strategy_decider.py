@@ -296,9 +296,9 @@ class StrategyDecider:
   def format_hypothesis_for_avenue(cls, cand: CandidateHypothesis) -> str:
     """Formats a CandidateHypothesis into a rich markdown string for Case Wall presentation."""
     badge = (
-        "🟢 **AUTO-EXECUTED**"
+        "🟢 AUTO-EXECUTED"
         if cand.confidence_band == "AUTO_EXECUTE"
-        else ("🟡 **HELD FOR ANALYST REVIEW**" if cand.confidence_band == "ANALYST_REVIEW" else "⚪ **LOW CONFIDENCE**")
+        else ("🟡 HELD FOR ANALYST REVIEW" if cand.confidence_band == "ANALYST_REVIEW" else "⚪ LOW CONFIDENCE")
     )
     metric_tag = (
         f"Fusion({', '.join(cand.fusion_metrics)})"
@@ -306,7 +306,7 @@ class StrategyDecider:
         else (f"Metric: `{cand.target_metric}`" if cand.target_metric else f"Engine: `{cand.selected_skill}`")
     )
     return (
-        f"**[{cand.confidence_score:.2f}/1.00 {badge}] `{cand.model_name}` ({metric_tag}) — {cand.hypothesis_title}**\n"
+        f"**[{cand.confidence_score:.2f}/1.00 {badge}]** `{cand.model_name}` ({metric_tag}) — **{cand.hypothesis_title}**\n"
         f"   - **Hypothesis ($H_1$ vs $H_0$)**: *$H_1$: {cand.hypothesis_h1} | $H_0$: {cand.hypothesis_h0}*\n"
         f"   - **Defense of Hypothesis**: {cand.evidentiary_defense}\n"
         f"   - **Confidence Audit**: `{cand.confidence_breakdown}`"
