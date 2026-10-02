@@ -50,8 +50,19 @@ class PipelineRunner:
   def render_template(self, template_path: Path, params: Dict[str, Any]) -> str:
     """Renders a .yl2 template by substituting {{placeholder}} variables."""
     raw_text = template_path.read_text(encoding="utf-8")
+    merged_params = dict(params)
+    # v1.8.1 Entity Graph freshness filter: auto-populate {{today_date}} (YYYY-MM-DD in UTC)
+    if "{{today_date}}" in raw_text and "today_date" not in merged_params:
+      from datetime import datetime, timezone
+      merged_params["today_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if "{{today_start_epoch}}" in raw_text and "today_start_epoch" not in merged_params:
+      from datetime import datetime, timezone
+      now_utc = datetime.now(timezone.utc)
+      midnight_utc = datetime(now_utc.year, now_utc.month, now_utc.day, tzinfo=timezone.utc)
+      merged_params["today_start_epoch"] = int(midnight_utc.timestamp())
+
     rendered = raw_text
-    for key, val in params.items():
+    for key, val in merged_params.items():
       placeholder = f"{{{{{key}}}}}"
       rendered = rendered.replace(placeholder, str(val))
 
@@ -104,8 +115,8 @@ class PipelineRunner:
     def _scope_stage(match: re.Match) -> str:
       stage_name = match.group(1)
       stage_body = match.group(2)
-      # Preserve fleet-wide normalization stages intact
-      if any(w in stage_name.lower() for w in ("fleet", "enterprise", "cohort", "peer", "global")):
+      # Preserve fleet-wide normalization and Entity Graph stages intact
+      if any(w in stage_name.lower() for w in ("fleet", "enterprise", "cohort", "peer", "global", "rare_dest", "graph")):
         return match.group(0)
       scoped_body = re.sub(
           r'(\$(?:entity|user|host|asset)\s*)!=\s*""',

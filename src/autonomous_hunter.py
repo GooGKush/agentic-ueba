@@ -367,12 +367,15 @@ class AutonomousHunterEngine:
 
     if "dynamic_metric" in sec_query or "cusum" in sec_query:
       m_name = target_metric or "workspace_total_download_actions"
-      stat_model = "cusum" if "cusum" in sec_query else "zscore"
+      stat_model = getattr(directive, "model_name", None) or ("LONGITUDINAL_CUSUM_DRIFT" if "cusum" in sec_query else "STANDARD_Z_SCORE")
       sec_res = await RiskMetricsEngine(tenant).run_dynamic_metric_pipeline(
           session=session,
           entity=req.target_entity,
-          metric_name=m_name,
-          model=stat_model,
+          entity_type=req.entity_type,
+          target_metric=m_name,
+          model_name=stat_model,
+          identifier_field=ident_field,
+          fusion_metrics=fusion_metrics,
           lookback_days=req.lookback_days,
       )
       sec_cri = sec_res["calibrated_risk_index"]
@@ -387,7 +390,7 @@ class AutonomousHunterEngine:
           {
               "metric": "**Observed Metric Volume**",
               "observed": f"`{sec_res.get('observed_value', 0.0):.1f}`",
-              "threshold": f"Model: `{stat_model.upper()}`",
+              "threshold": f"Model: `{str(stat_model).upper()}`",
               "assessment": "Pre-Computed Malachite Metric Evaluation",
           },
       ]
@@ -401,6 +404,7 @@ class AutonomousHunterEngine:
           rows_count=sec_res.get("stats_rows", 0),
           directive=directive,
           metrics_table_rows=sec_rows,
+          second_order_ran=True,
       )
       return sec_res, sec_report
 
@@ -747,6 +751,13 @@ class AutonomousHunterEngine:
               except Exception as t2_plan_err:
                 logger.warning(f"Tier 2 hypothesis planning encountered non-fatal error: {t2_plan_err}")
 
+            will_run_second_order = bool(
+                needs_secondary
+                and req.case_id
+                and tier2_directive is not None
+                and tier2_directive.confidence_score >= StrategyDecider.TIER_2A_AUTO_EXECUTE_THRESHOLD
+            )
+
             sector_metrics_map = radar_result.get("sector_metrics", {})
             sector_rows = [
                 {
@@ -773,6 +784,8 @@ class AutonomousHunterEngine:
                     if radar_result["is_outlier"] else
                     "All evaluated behavioral sectors conform to 30-day baseline. No containment needed."
                 ),
+                primary_vector=top_sector,
+                second_order_ran=will_run_second_order,
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
@@ -793,6 +806,8 @@ class AutonomousHunterEngine:
                 verdict=verdict,
                 is_outlier=radar_result["is_outlier"],
                 primary_vector=f"{top_sector}_behavioral_drift",
+                common_vector=CaseWallCardFormatter.normalize_common_vector(raw_vector=top_sector),
+                second_order_ran=will_run_second_order,
                 top_z_score=float(radar_result["sector_z_scores"].get(top_sector, 0.0)),
                 radar_dimensions=radar_result["sector_z_scores"],
                 recommended_action="QUARANTINE" if cri >= 80 else ("INVESTIGATE" if cri >= 60 else "MONITOR"),
@@ -909,6 +924,20 @@ class AutonomousHunterEngine:
                           triage.calibrated_risk_index = float(cri)
                           triage.verdict = "CRITICAL_OUTLIER" if cri >= 80 else "HIGH_OUTLIER"
                           triage.primary_vector = f"tier2b_{pivot_directive.model_name.lower()}"
+
+                  if secondary_hunts_run > 0:
+                    triage.second_order_ran = True
+                    triage.common_vector = CaseWallCardFormatter.normalize_common_vector(
+                        raw_vector=top_sector,
+                        model_name=triage.primary_vector,
+                    )
+                    triage.tags = CaseWallCardFormatter.build_case_tags(
+                        calibrated_risk_index=triage.calibrated_risk_index,
+                        primary_vector=top_sector,
+                        model_name=triage.primary_vector,
+                        second_order_ran=True,
+                        is_outlier=triage.is_outlier,
+                    )
                 else:
                   logger.info(
                       f"Tier 2A Confidence Gate HELD (score={tier2_directive.confidence_score:.2f} < "

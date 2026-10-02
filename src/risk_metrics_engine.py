@@ -665,6 +665,100 @@ order:
         "executed_query": rendered,
     }
 
+  def _render_rare_destination_ecg_query(
+      self,
+      target_metric: str = "dns_queries_total",
+      host_field: str = "principal.asset.hostname",
+      max_fleet_prevalence: int = 3,
+      hypothesis_goal: Optional[str] = None,
+  ) -> str:
+    """Renders the v1.8.1 3-stage rare_destination_ecg_3stage.yl2 pipeline for DNS / HTTP / Outbound Bytes."""
+    mc = self.runner.get_malachite_catalog()
+    sem = mc.baseline_semantics(target_metric)
+    sector_filter = "\n    ".join(sem.observed_filter)
+    sector_avg = f"metrics.{target_metric}(period: 1d, window: 30d, metric: {sem.metric_arg}, agg: avg, {host_field}: $host)"
+    sector_std = f"metrics.{target_metric}(period: 1d, window: 30d, metric: {sem.metric_arg}, agg: stddev, {host_field}: $host)"
+
+    if "dns" in target_metric:
+      contact_sem = mc.baseline_semantics("dns_queries_total")
+      contact_filter = "\n    ".join(contact_sem.observed_filter)
+      dest_field = "network.dns.questions.name"
+      ecg_entity_type = '"DOMAIN_NAME"'
+      ecg_key_path = "entity.domain.name"
+      ecg_prevalence_path = "entity.domain.prevalence"
+    elif "http" in target_metric:
+      contact_sem = mc.baseline_semantics("http_queries_total")
+      contact_filter = "\n    ".join(contact_sem.observed_filter)
+      dest_field = "target.hostname"
+      ecg_entity_type = '"DOMAIN_NAME"'
+      ecg_key_path = "entity.domain.name"
+      ecg_prevalence_path = "entity.domain.prevalence"
+    else:
+      contact_sem = mc.baseline_semantics("network_bytes_outbound")
+      contact_filter = "\n    ".join(contact_sem.observed_filter)
+      dest_field = "target.ip"
+      ecg_entity_type = '"IP_ADDRESS"'
+      ecg_key_path = "entity.artifact.ip"
+      ecg_prevalence_path = "entity.artifact.prevalence"
+
+    tpl_path = self.runner.find_template(self.SKILL_NAME, "rare_destination_ecg_3stage.yl2")
+    rendered = self.runner.render_template(
+        tpl_path,
+        {
+            "sector_filter": sector_filter,
+            "host_field": host_field,
+            "sector_observation_agg": sem.observed_agg,
+            "sector_metric_func_avg": sector_avg,
+            "sector_metric_func_stddev": sector_std,
+            "contact_filter": contact_filter,
+            "dest_field": dest_field,
+            "ecg_entity_type": ecg_entity_type,
+            "ecg_key_path": ecg_key_path,
+            "ecg_prevalence_path": ecg_prevalence_path,
+            "max_fleet_prevalence": str(max_fleet_prevalence),
+        },
+    )
+    if hypothesis_goal:
+      rendered = f"// Goal: {hypothesis_goal}\n" + rendered
+    return rendered
+
+  def _render_fusion_rare_destination_query(
+      self,
+      sector_a_metric: str = "dns_queries_total",
+      sector_b_metric: str = "http_queries_total",
+      host_field: str = "principal.asset.hostname",
+      max_fleet_prevalence: int = 3,
+      hypothesis_goal: Optional[str] = None,
+  ) -> str:
+    """Renders the v1.8.1 3-stage fusion_rare_destination_3stage.yl2 pipeline."""
+    mc = self.runner.get_malachite_catalog()
+    sem_a = mc.baseline_semantics(sector_a_metric)
+    sem_b = mc.baseline_semantics(sector_b_metric)
+    dest_field = "network.dns_domain" if "dns" in sector_b_metric else "target.hostname"
+    tpl_path = self.runner.find_template(self.SKILL_NAME, "fusion_rare_destination_3stage.yl2")
+    rendered = self.runner.render_template(
+        tpl_path,
+        {
+            "host_field": host_field,
+            "sector_a_filter": "\n    ".join(sem_a.observed_filter),
+            "sector_a_observation_agg": sem_a.observed_agg,
+            "sector_a_metric_func_avg": f"metrics.{sector_a_metric}(period: 1d, window: 30d, metric: {sem_a.metric_arg}, agg: avg, {host_field}: $host)",
+            "sector_a_metric_func_stddev": f"metrics.{sector_a_metric}(period: 1d, window: 30d, metric: {sem_a.metric_arg}, agg: stddev, {host_field}: $host)",
+            "sector_b_filter": "\n    ".join(sem_b.observed_filter),
+            "dest_field": dest_field,
+            "sector_b_observation_agg": sem_b.observed_agg,
+            "sector_b_metric_func_avg": f"metrics.{sector_b_metric}(period: 1d, window: 30d, metric: {sem_b.metric_arg}, agg: avg, {host_field}: $host, {dest_field}: $dest)",
+            "sector_b_metric_func_stddev": f"metrics.{sector_b_metric}(period: 1d, window: 30d, metric: {sem_b.metric_arg}, agg: stddev, {host_field}: $host, {dest_field}: $dest)",
+            "ecg_entity_type": '"DOMAIN_NAME"',
+            "ecg_key_path": "entity.domain.name",
+            "ecg_prevalence_path": "entity.domain.prevalence",
+            "max_fleet_prevalence": str(max_fleet_prevalence),
+        },
+    )
+    if hypothesis_goal:
+      rendered = f"// Goal: {hypothesis_goal}\n" + rendered
+    return rendered
+
   async def run_dynamic_metric_pipeline(
       self,
       session: ClientSession,
@@ -676,17 +770,28 @@ order:
       fusion_metrics: Optional[Sequence[str]] = None,
       lookback_days: int = 14,
       hypothesis_goal: Optional[str] = None,
+      metric_name: Optional[str] = None,
+      model: Optional[str] = None,
   ) -> Dict[str, Any]:
     """Dynamically builds and executes ANY 2-stage math model or multi-stage pipeline on ANY catalog metric."""
+    if metric_name:
+      target_metric = metric_name
+    if model:
+      model_name = model
+
     EntityType, PipelineArchitecture, StatisticalModel, _ = self.runner.get_validator_enums()
     mc = self.runner.get_malachite_catalog()
     router = self.runner.get_template_router()
     ent_enum = self._resolve_entity_enum(entity_type)
 
     model_upper = (model_name or "STANDARD_Z_SCORE").upper()
+    if model_upper in ("CUSUM", "LONGITUDINAL_CUSUM"):
+      model_upper = "LONGITUDINAL_CUSUM_DRIFT"
+    elif model_upper in ("ZSCORE", "Z_SCORE"):
+      model_upper = "STANDARD_Z_SCORE"
 
-    # 1. Cross-Vector or Roll-Up Fusion
-    if "FUSION" in model_upper:
+    # 1. Cross-Vector or Roll-Up Fusion (excluding FUSION_RARE_DESTINATION_3STAGE which uses ECG)
+    if "FUSION" in model_upper and "RARE_DESTINATION" not in model_upper:
       metrics_pair = list(fusion_metrics) if fusion_metrics and len(fusion_metrics) >= 2 else [
           target_metric or "workspace_total_download_actions",
           "network_bytes_outbound" if target_metric != "network_bytes_outbound" else "http_queries_total",
@@ -705,6 +810,12 @@ order:
     # Validate / fallback target_metric against catalog & entity_type
     if target_metric not in mc.known_metrics():
       target_metric = "workspace_total_download_actions" if ent_enum == EntityType.USER else "http_queries_total"
+
+    # v1.8.1 Derived Prevalence Scoping Rule:
+    # HYBRID_METRIC_DERIVED_DOMAIN_PREVALENCE_2STAGE is strictly for HTTP request counts (http_queries_total).
+    # DNS volume (dns_*) or outbound bytes (network_bytes_*) against rare destinations must route to RARE_DESTINATION_ECG_3STAGE.
+    if model_upper == "HYBRID_METRIC_DERIVED_DOMAIN_PREVALENCE_2STAGE" and not target_metric.startswith("http_"):
+      model_upper = "RARE_DESTINATION_ECG_3STAGE"
 
     # Ensure entity_type is supported for target_metric; adjust if needed
     from scripts.preflight_validator import METRIC_CATALOG
@@ -753,11 +864,27 @@ order:
     }
 
     is_entity_graph = any(
-        k in model_upper for k in ("DERIVED_", "WHOIS_", "FLEET_PREVALENCE", "ASSET_AGE")
+        k in model_upper for k in ("DERIVED_", "WHOIS_", "FLEET_PREVALENCE", "ASSET_AGE", "RARE_DESTINATION")
     )
     start_iso, end_iso = self._iso_window(lookback_days, is_entity_graph=is_entity_graph)
 
-    if model_upper in pipeline_map and not mc.is_composite_only(target_metric):
+    if model_upper in ("RARE_DESTINATION_ECG_3STAGE", "RARE_DESTINATION_ECG"):
+      host_f = identifier_field if identifier_field and "asset" in identifier_field else "principal.asset.hostname"
+      rendered = self._render_rare_destination_ecg_query(
+          target_metric=target_metric,
+          host_field=host_f,
+          hypothesis_goal=hypothesis_goal or f"RARE_DESTINATION_ECG_3STAGE on {target_metric} for {entity}",
+      )
+    elif model_upper in ("FUSION_RARE_DESTINATION_3STAGE", "FUSION_RARE_DESTINATION"):
+      host_f = identifier_field if identifier_field and "asset" in identifier_field else "principal.asset.hostname"
+      pair = list(fusion_metrics) if fusion_metrics and len(fusion_metrics) >= 2 else [target_metric, "http_queries_total"]
+      rendered = self._render_fusion_rare_destination_query(
+          sector_a_metric=pair[0],
+          sector_b_metric=pair[1],
+          host_field=host_f,
+          hypothesis_goal=hypothesis_goal or f"FUSION_RARE_DESTINATION_3STAGE ({pair[0]} + {pair[1]}) for {entity}",
+      )
+    elif model_upper in pipeline_map and not mc.is_composite_only(target_metric):
       pipe_arch = pipeline_map[model_upper]
       rendered = router.build_pipeline_query(
           pipeline_type=pipe_arch,
@@ -794,6 +921,7 @@ order:
       for score_key in (
           "personal_z",
           "cusum_z",
+          "z_sector",
           "macd_momentum_score",
           "circadian_threat_score",
           "mad_z_score",
@@ -808,11 +936,13 @@ order:
         if score_key in top_row and top_row[score_key] is not None:
           top_score = float(top_row[score_key])
           break
-      for obs_key in ("observed", "observed_hour", "observed_val", "obs", "entity_obs"):
+      if top_score == 0.0 and "d_sq" in top_row and top_row["d_sq"] is not None:
+        top_score = math.sqrt(max(0.0, float(top_row["d_sq"])))
+      for obs_key in ("observed", "a_observed", "observed_hour", "observed_val", "obs", "entity_obs"):
         if obs_key in top_row and top_row[obs_key] is not None:
           observed_val = float(top_row[obs_key])
           break
-      for avg_key in ("hist_avg", "avg_hourly", "historical_avg", "avg", "personal_avg"):
+      for avg_key in ("hist_avg", "baseline_avg", "avg_hourly", "historical_avg", "avg", "personal_avg"):
         if avg_key in top_row and top_row[avg_key] is not None:
           hist_avg = float(top_row[avg_key])
           break

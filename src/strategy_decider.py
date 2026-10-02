@@ -816,7 +816,9 @@ Choose the metric(s) that match the actual situation in the case and Tier 1 360�
    - `CIRCADIAN_VON_MISES` (`directive_query`: `"circadian_von_mises"`): Use with ANY `target_metric` when off-hours activity or impossible travel velocity (`kph`) is observed.
    - `PART_OF_THE_WHOLE_MULTILEVEL` (`directive_query`: `"dynamic_metric"`): Use with ANY `target_metric` to compare entity Z-score against enterprise fleet peers.
    - `CLOUD_CRUD_SURGE` (`directive_query`: `"cloud_crud"`): Use when Cloud resource creation/deletion/IAM mutations surge.
-   - `HYBRID_METRIC_DERIVED_DOMAIN_PREVALENCE_2STAGE` / `HYBRID_METRIC_WHOIS_DOMAIN_LIFECYCLE_2STAGE` (`directive_query`: `"dynamic_metric"`): Use with `http_queries_total` or `dns_queries_total` when investigating rare/newly registered domains.
+   - `HYBRID_METRIC_DERIVED_DOMAIN_PREVALENCE_2STAGE` / `HYBRID_METRIC_WHOIS_DOMAIN_LIFECYCLE_2STAGE` (`directive_query`: `"dynamic_metric"`): Use strictly with `http_queries_total` when investigating HTTP request counts to rare (`DERIVED_CONTEXT` prevalence) or newly registered (`WHOIS`) domains.
+   - `RARE_DESTINATION_ECG_3STAGE` / `FUSION_RARE_DESTINATION_3STAGE` (`directive_query`: `"dynamic_metric"`): Use when investigating DNS volume (`dns_queries_total`, `dns_queries_fail` keyed on `network.dns.questions.name`) or outbound bytes (`network_bytes_outbound`) to low-prevalence destinations (`DERIVED_CONTEXT`).
+   - `HYBRID_METRIC_DERIVED_FILE_PREVALENCE_2STAGE` vs `HYBRID_METRIC_FLEET_PREVALENCE_2STAGE` (`directive_query`: `"dynamic_metric"`): Use `HYBRID_METRIC_DERIVED_FILE_PREVALENCE_2STAGE` (`file_executions_total`) to filter to rare binaries (dropping rollout binaries), or `HYBRID_METRIC_FLEET_PREVALENCE_2STAGE` to normalize a surge against an enterprise rollout (Patch Tuesday Shield).
 
 2. **Engine: `secops-statistical-hunter` (Raw Telemetry Micro-Math)**
    - `C2_BEACONING_JITTER` (`directive_query`: `"c2_jitter"`): Use when Egress is an outlier or alert indicates periodic robotic callback (CV <= 0.20).
@@ -1164,14 +1166,14 @@ Output valid JSON matching this schema:
         )
         cands = [
             CandidateHypothesis(
-                hypothesis_title=f"First-Contact / Rare Destination Domain Prevalence (`{web_metric}`)",
+                hypothesis_title="First-Contact / Rare Destination HTTP Domain Prevalence (`http_queries_total`)",
                 selected_skill="secops-risk-metrics-multistage",
                 model_name="HYBRID_METRIC_DERIVED_DOMAIN_PREVALENCE_2STAGE",
                 directive_query="dynamic_metric",
-                target_metric=web_metric,
+                target_metric="http_queries_total",
                 hypothesis_h0="HTTP requests target established enterprise SaaS domains.",
-                hypothesis_h1=f"Host/User `{target_entity}` is sending `{web_metric}` traffic to rare domains seen on <= 3 fleet hosts.",
-                evidentiary_defense=f"Combines `{web_metric}` 30-day baseline Z-score (Z = {z_val:+.2f}σ) with Entity Graph `DERIVED_CONTEXT` domain prevalence.",
+                hypothesis_h1=f"Host/User `{target_entity}` is sending `http_queries_total` traffic to rare domains seen on <= 3 fleet hosts.",
+                evidentiary_defense=f"Combines `http_queries_total` 30-day baseline Z-score (Z = {z_val:+.2f}σ) with Entity Graph `DERIVED_CONTEXT` domain prevalence (`timestamp.get_date`).",
                 confidence_score=0.78,
             ),
         ]
@@ -1380,6 +1382,17 @@ Output valid JSON matching this schema:
             f"Applying `LONGITUDINAL_CUSUM_DRIFT` directly to `{dns_metric}` evaluates whether NXDOMAIN / DNS traffic is accumulating over a multi-day tunneling or C2 reconnaissance horizon."
         )
         cands = [
+            CandidateHypothesis(
+                hypothesis_title=f"Rare Destination DNS ECG Filter (`{dns_metric}` via `network.dns.questions.name`)",
+                selected_skill="secops-risk-metrics-multistage",
+                model_name="RARE_DESTINATION_ECG_3STAGE",
+                directive_query="dynamic_metric",
+                target_metric=dns_metric,
+                hypothesis_h0="DNS queries resolve high-prevalence enterprise domains.",
+                hypothesis_h1=f"DNS surge (`{dns_metric}`) contacts low-prevalence domains (`<= 3` fleet hosts) in Entity Graph `DERIVED_CONTEXT`.",
+                evidentiary_defense=f"Uses v1.8.1 `rare_destination_ecg_3stage.yl2` keyed on `network.dns.questions.name` and `timestamp.get_date` freshness filter.",
+                confidence_score=0.75,
+            ),
             CandidateHypothesis(
                 hypothesis_title=f"DNS × Network Outbound Fusion (`{dns_metric}` + `network_bytes_outbound`)",
                 selected_skill="secops-risk-metrics-multistage",

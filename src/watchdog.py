@@ -206,8 +206,15 @@ class WatchdogState:
     self.triaged_count = 0
     self.save()
 
-  def get_activity_report(self, timeframe: str = "1h", hours: Optional[float] = None) -> Dict[str, Any]:
-    """Generates an activity summary for cases triaged within a lookback window."""
+  def get_activity_report(
+      self,
+      timeframe: str = "1h",
+      hours: Optional[float] = None,
+      tag: Optional[str] = None,
+  ) -> Dict[str, Any]:
+    """Generates an activity summary for cases triaged within a lookback window, optionally filtered by tag."""
+    from src.formatters.case_wall_card import CaseWallCardFormatter
+
     now = datetime.now(timezone.utc)
     lookback_delta: Optional[timedelta] = None
 
@@ -229,10 +236,14 @@ class WatchdogState:
         lookback_delta = timedelta(hours=1)
 
     cutoff = (now - lookback_delta) if lookback_delta else None
+    requested_tags = [
+        t.strip().upper() for t in (tag or "").split(",") if t.strip()
+    ]
 
     filtered_cases = []
     verdicts: Dict[str, int] = {}
     strategies: Dict[str, int] = {}
+    tags_summary: Dict[str, int] = {}
 
     for res in reversed(self.recent_results):
       ts_str = res.get("timestamp")
@@ -245,19 +256,53 @@ class WatchdogState:
         except Exception:
           pass
 
+      # Ensure tags and common_vector are populated (backfilling legacy records if needed)
+      rec_tags = res.get("tags")
+      if rec_tags is None:
+        p_vec = str(res.get("primary_vector") or "")
+        sec_ran = bool(res.get("second_order_ran") or p_vec.startswith("tier2"))
+        rec_tags = CaseWallCardFormatter.build_case_tags(
+            calibrated_risk_index=float(res.get("cri") or 0.0),
+            primary_vector=p_vec,
+            model_name=str(res.get("strategy") or ""),
+            second_order_ran=sec_ran,
+        )
+        res = dict(res)
+        res["tags"] = rec_tags
+        res.setdefault(
+            "common_vector",
+            CaseWallCardFormatter.normalize_common_vector(
+                raw_vector=p_vec,
+                model_name=str(res.get("strategy") or ""),
+            ),
+        )
+        res.setdefault("second_order_ran", sec_ran)
+
+      if requested_tags:
+        upper_rec_tags = [str(rt).upper() for rt in rec_tags]
+        if not all(
+            any(req_t == urt or req_t in urt for urt in upper_rec_tags)
+            for req_t in requested_tags
+        ):
+          continue
+
       filtered_cases.append(res)
       v = res.get("verdict", "UNKNOWN")
       verdicts[v] = verdicts.get(v, 0) + 1
       s = res.get("strategy", "UNKNOWN")
       strategies[s] = strategies.get(s, 0) + 1
+      for t_item in rec_tags:
+        tags_summary[t_item] = tags_summary.get(t_item, 0) + 1
 
     return {
         "status": "SUCCESS",
         "timeframe": timeframe_label,
+        "tag_filter": requested_tags if requested_tags else None,
         "window_start": cutoff.strftime("%Y-%m-%dT%H:%M:%SZ") if cutoff else "ALL_TIME",
         "window_end": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "total_cases_triaged": len(filtered_cases),
         "summary_by_verdict": verdicts,
+        "summary_by_tag": tags_summary,
         "summary_by_strategy": strategies,
         "cases": filtered_cases,
     }
@@ -387,6 +432,9 @@ class WatchdogDaemon:
             "cri": hunt_resp.triage.calibrated_risk_index,
             "verdict": hunt_resp.triage.verdict,
             "primary_vector": hunt_resp.triage.primary_vector,
+            "common_vector": hunt_resp.triage.common_vector,
+            "second_order_ran": hunt_resp.triage.second_order_ran,
+            "tags": hunt_resp.triage.tags,
             "case_wall_updated": hunt_resp.case_wall_updated,
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
@@ -711,6 +759,9 @@ class WatchdogDaemon:
                     "cri": hunt_resp.triage.calibrated_risk_index,
                     "verdict": hunt_resp.triage.verdict,
                     "primary_vector": hunt_resp.triage.primary_vector,
+                    "common_vector": hunt_resp.triage.common_vector,
+                    "second_order_ran": hunt_resp.triage.second_order_ran,
+                    "tags": hunt_resp.triage.tags,
                     "case_wall_updated": hunt_resp.case_wall_updated,
                     "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 }
