@@ -9,6 +9,8 @@ evidentiary defense, calibrated confidence scale, underlying UDM touchpoints,
 statistical metrics table, and defended follow-up hypotheses.
 """
 
+import html
+import re
 from typing import Any, Dict, List, Optional
 from src.models import StrategyDirective
 
@@ -181,3 +183,247 @@ class CaseWallCardFormatter:
       lines.append(f"{i}. {avenue}")
 
     return "\n".join(lines)
+
+  @classmethod
+  def _format_inline_html(cls, text: str) -> str:
+    """Converts inline Markdown (**bold**, *italic*, `code`) and LaTeX ($H_0$, $\\sigma$) to safevalues-compliant HTML."""
+    if not text:
+      return ""
+
+    # 1. Extract inline code spans first so their contents are not altered by math/bold regexes
+    code_spans: List[str] = []
+
+    def _stash_code(match: re.Match) -> str:
+      inner = match.group(1)
+      # Clean any inline LaTeX inside backticks (e.g. `$\ge 5$ required`)
+      inner_clean = (
+          inner.replace("$\\ge", "≥")
+          .replace("\\ge", "≥")
+          .replace("$\\le", "≤")
+          .replace("\\le", "≤")
+          .replace("\\sigma", "σ")
+          .replace("\\mu", "μ")
+          .replace("$", "")
+      )
+      idx = len(code_spans)
+      code_spans.append(f"<code>{html.escape(inner_clean, quote=False)}</code>")
+      return f"\x00CODE_{idx}\x00"
+
+    text = re.sub(r"`([^`]+)`", _stash_code, text)
+
+    # 2. Escape raw HTML characters in remaining text
+    text = html.escape(text, quote=False)
+
+    # 3. Convert inline LaTeX math expressions ($...$) to clean HTML / Unicode
+    def _convert_math(match: re.Match) -> str:
+      expr = match.group(1).strip()
+      expr = (
+          expr.replace("\\ge", "≥")
+          .replace("\\le", "≤")
+          .replace("\\sigma", "σ")
+          .replace("\\mu", "μ")
+          .replace("&gt;=", "≥")
+          .replace("&lt;=", "≤")
+          .replace("^2", "²")
+      )
+      expr = re.sub(r"\bH_0\b", "H<sub>0</sub>", expr)
+      expr = re.sub(r"\bH_1\b", "H<sub>1</sub>", expr)
+      expr = re.sub(r"\bZ_([A-Za-z0-9]+)\b", r"Z<sub>\1</sub>", expr)
+      if expr in ("Z", "D", "CV", "H", "F"):
+        return f"<i>{expr}</i>"
+      return expr
+
+    text = re.sub(r"\$([^$\n]+)\$", _convert_math, text)
+    # Catch any unescaped LaTeX tokens outside $...$
+    text = (
+        text.replace("\\ge", "≥")
+        .replace("\\le", "≤")
+        .replace("\\sigma", "σ")
+        .replace("\\mu", "μ")
+    )
+    text = re.sub(r"\bH_0\b", "H<sub>0</sub>", text)
+    text = re.sub(r"\bH_1\b", "H<sub>1</sub>", text)
+
+    # 4. Bold (**text**) and Italic (*text*)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", text)
+
+    # 5. Restore inline code spans
+    for idx, code_html in enumerate(code_spans):
+      text = text.replace(f"\x00CODE_{idx}\x00", code_html)
+
+    return text.strip()
+
+  @classmethod
+  def to_soar_html(cls, markdown_text: str) -> str:
+    """Converts Markdown triage cards into Chronicle SOAR Case Wall HTML.
+
+    Grounded in Chronicle SOAR UI source code:
+    - `evidence_activity.ng.html` binds `[innerHTML]="sanitizeContent(commentForClient)"`
+      inside `<p class="u-word-break--word u-white-space--pre-wrap ...">` with `[tnShowMore]="500"`.
+    - `show-more.directive.ts` runs `sanitizeHtmlAssertUnchanged()` against `safevalues`
+      `DEFAULT_SANITIZER_TABLE`, which strips `style` and `class` attributes while allowing
+      semantic HTML tags (`h3`, `h4`, `p`, `blockquote`, `ul`, `ol`, `li`, `table`, `thead`,
+      `tbody`, `tr`, `th`, `td`, `strong`, `em`, `code`, `pre`, `hr`, `br`, `sub`, `sup`)
+      and standard HTML table attributes (`border`, `cellpadding`, `cellspacing`, `width`, `align`).
+    - Because the container `<p>` applies `white-space: pre-wrap`, block-level HTML tags
+      must be emitted compactly without extraneous `\\n` characters between tags to avoid
+      phantom vertical whitespace.
+    """
+    if not markdown_text:
+      return ""
+
+    stripped = markdown_text.strip()
+    # Idempotency check if already converted to SOAR HTML
+    if (
+        (stripped.startswith("<h3>") or stripped.startswith("<h2>") or stripped.startswith("<h4>"))
+        and ("<strong>" in stripped or "</table>" in stripped or "</ul>" in stripped)
+        and "\n## " not in stripped
+    ):
+      return stripped
+
+    lines = stripped.splitlines()
+    blocks: List[str] = []
+    i = 0
+    n = len(lines)
+
+    while i < n:
+      raw_line = lines[i]
+      line = raw_line.strip()
+
+      # Skip empty lines (block elements provide natural vertical spacing)
+      if not line:
+        i += 1
+        continue
+
+      # 1. Fenced code block (```...```)
+      if line.startswith("```"):
+        i += 1
+        code_lines: List[str] = []
+        while i < n and not lines[i].strip().startswith("```"):
+          code_lines.append(html.escape(lines[i], quote=False))
+          i += 1
+        if i < n:
+          i += 1  # Skip closing ```
+        blocks.append(f"<pre><code>{chr(10).join(code_lines)}</code></pre>")
+        continue
+
+      # 2. Horizontal Rule (--- or ***)
+      if re.match(r"^[-*_]{3,}$", line):
+        blocks.append("<hr>")
+        i += 1
+        continue
+
+      # 3. Headings (#, ##, ###, ####)
+      heading_match = re.match(r"^(#{1,6})\s+(.*)$", line)
+      if heading_match:
+        level = len(heading_match.group(1))
+        content = cls._format_inline_html(heading_match.group(2))
+        tag = "h3" if level <= 2 else "h4"
+        blocks.append(f"<{tag}>{content}</{tag}>")
+        i += 1
+        continue
+
+      # 4. Blockquotes (> ...)
+      if line.startswith(">"):
+        quote_lines: List[str] = []
+        while i < n and lines[i].strip().startswith(">"):
+          q_text = re.sub(r"^>\s?", "", lines[i].strip())
+          q_text = re.sub(
+              r"^\[!WARNING\]\s*",
+              "**⚠️ WARNING:** ",
+              q_text,
+              flags=re.IGNORECASE,
+          )
+          q_text = re.sub(
+              r"^\[!IMPORTANT\]\s*",
+              "**❗ IMPORTANT:** ",
+              q_text,
+              flags=re.IGNORECASE,
+          )
+          q_text = re.sub(
+              r"^\[!NOTE\]\s*",
+              "**ℹ️ NOTE:** ",
+              q_text,
+              flags=re.IGNORECASE,
+          )
+          quote_lines.append(cls._format_inline_html(q_text))
+          i += 1
+        blocks.append(f"<blockquote>{'<br>'.join(quote_lines)}</blockquote>")
+        continue
+
+      # 5. Markdown Tables (| col1 | col2 |)
+      if line.startswith("|") and line.endswith("|"):
+        table_lines: List[str] = []
+        while i < n and lines[i].strip().startswith("|") and lines[i].strip().endswith("|"):
+          table_lines.append(lines[i].strip())
+          i += 1
+
+        parsed_rows: List[List[str]] = []
+        for t_line in table_lines:
+          # Protect absolute-value notation like |Z| before splitting on pipe delimiters
+          safe_t_line = re.sub(r"\|([A-Za-z_][A-Za-z0-9_]*)\|", r"∣\1∣", t_line)
+          cells = [c.strip() for c in safe_t_line.strip("|").split("|")]
+          # Skip Markdown alignment separator rows (e.g., | :--- | :--- |)
+          if all(re.match(r"^:?-{2,}:?$", c) for c in cells if c):
+            continue
+          parsed_rows.append([cls._format_inline_html(c) for c in cells])
+
+        if parsed_rows:
+          header_cells = "".join(f'<th align="left">{c}</th>' for c in parsed_rows[0])
+          thead_html = f"<thead><tr>{header_cells}</tr></thead>"
+          tbody_rows = []
+          for row in parsed_rows[1:]:
+            row_cells = "".join(f"<td>{c}</td>" for c in row)
+            tbody_rows.append(f"<tr>{row_cells}</tr>")
+          tbody_html = f"<tbody>{''.join(tbody_rows)}</tbody>" if tbody_rows else ""
+          blocks.append(
+              f'<table border="1" cellpadding="6" cellspacing="0" width="100%">{thead_html}{tbody_html}</table>'
+          )
+        continue
+
+      # 6. Unordered Lists (- ... or * ...)
+      if re.match(r"^[-*]\s+", line):
+        ul_items: List[str] = []
+        while i < n and re.match(r"^[-*]\s+", lines[i].strip()):
+          item_text = re.sub(r"^[-*]\s+", "", lines[i].strip())
+          ul_items.append(f"<li>{cls._format_inline_html(item_text)}</li>")
+          i += 1
+        blocks.append(f"<ul>{''.join(ul_items)}</ul>")
+        continue
+
+      # 7. Ordered Lists (1. ... with optional indented sub-bullets)
+      if re.match(r"^\d+\.\s+", line):
+        ol_items: List[str] = []
+        while i < n and re.match(r"^\d+\.\s+", lines[i].strip()):
+          item_text = re.sub(r"^\d+\.\s+", "", lines[i].strip())
+          item_html = cls._format_inline_html(item_text)
+          i += 1
+          sub_bullets: List[str] = []
+          while i < n and re.match(r"^\s{2,}[-*]\s+", lines[i]):
+            sub_text = re.sub(r"^[-*]\s+", "", lines[i].strip())
+            sub_bullets.append(f"<li>{cls._format_inline_html(sub_text)}</li>")
+            i += 1
+          if sub_bullets:
+            item_html = f"{item_html}<ul>{''.join(sub_bullets)}</ul>"
+          ol_items.append(f"<li>{item_html}</li>")
+        blocks.append(f"<ol>{''.join(ol_items)}</ol>")
+        continue
+
+      # 8. Standard Paragraphs / Metadata Lines
+      para_lines: List[str] = []
+      while (
+          i < n
+          and lines[i].strip()
+          and not lines[i].strip().startswith(("```", "#", ">", "|"))
+          and not re.match(r"^[-*_]{3,}$", lines[i].strip())
+          and not re.match(r"^[-*]\s+", lines[i].strip())
+          and not re.match(r"^\d+\.\s+", lines[i].strip())
+      ):
+        para_lines.append(cls._format_inline_html(lines[i].strip()))
+        i += 1
+      if para_lines:
+        blocks.append(f"<p>{'<br>'.join(para_lines)}</p>")
+
+    return "".join(blocks)
+

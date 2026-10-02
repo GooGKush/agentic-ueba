@@ -96,11 +96,13 @@ class AutonomousHunterEngine:
 
   @staticmethod
   def sanitize_case_comment(comment: str) -> str:
-    """Sanitizes raw LLM output for human presentation on Chronicle SOAR case wall.
+    """Sanitizes and converts Markdown output into Chronicle SOAR Case Wall HTML.
 
     - Unescapes literal '\\n' and quotes into real newlines and formatting.
     - Strips machine-readable ```json_triage ... ``` code blocks.
-    - Preserves Markdown headers, bullet points, tables, and YARA-L blocks.
+    - Converts Markdown headers, tables, lists, inline code, and LaTeX math into
+      compact, `safevalues`-compliant semantic HTML for Chronicle SOAR's Case Wall
+      (`[innerHTML]="sanitizeContent(commentForClient)"`).
     """
     if not comment:
       return ""
@@ -108,7 +110,7 @@ class AutonomousHunterEngine:
     comment = comment.replace("\\n", "\n").replace('\\"', '"').replace("\\'", "'")
     # Strip machine-readable json_triage code block from user-facing case wall comment
     comment = re.sub(r"```(?:json_triage|json)\s*\{.*?\}\s*```\s*", "", comment, flags=re.DOTALL)
-    return comment.strip()
+    return CaseWallCardFormatter.to_soar_html(comment.strip())
 
   def generate_behavioral_radar(self, username: str, telemetry_data: Dict[str, float]) -> str:
     """Computes 360-degree behavioral risk metrics and returns raw SVG string."""
@@ -781,7 +783,7 @@ class AutonomousHunterEngine:
                       "customerId": tenant.customer_id,
                       "region": tenant.region,
                       "caseId": str(req.case_id),
-                      "comment": markdown_report,
+                      "comment": self.sanitize_case_comment(markdown_report),
                   },
               )
               case_wall_updated = True
@@ -837,7 +839,7 @@ class AutonomousHunterEngine:
                             "customerId": tenant.customer_id,
                             "region": tenant.region,
                             "caseId": str(req.case_id),
-                            "comment": sec_report,
+                            "comment": self.sanitize_case_comment(sec_report),
                         },
                     )
                     markdown_report = f"{markdown_report}\n\n---\n\n{sec_report}"
@@ -895,7 +897,7 @@ class AutonomousHunterEngine:
                                 "customerId": tenant.customer_id,
                                 "region": tenant.region,
                                 "caseId": str(req.case_id),
-                                "comment": piv_report,
+                                "comment": self.sanitize_case_comment(piv_report),
                             },
                         )
                         markdown_report = f"{markdown_report}\n\n---\n\n{piv_report}"
@@ -998,7 +1000,7 @@ class AutonomousHunterEngine:
                       "customerId": tenant.customer_id,
                       "region": tenant.region,
                       "caseId": str(req.case_id),
-                      "comment": markdown_report,
+                      "comment": self.sanitize_case_comment(markdown_report),
                   },
               )
               case_wall_updated = True
@@ -1085,7 +1087,7 @@ class AutonomousHunterEngine:
                       "customerId": tenant.customer_id,
                       "region": tenant.region,
                       "caseId": str(req.case_id),
-                      "comment": markdown_report,
+                      "comment": self.sanitize_case_comment(markdown_report),
                   },
               )
               case_wall_updated = True
@@ -1172,7 +1174,7 @@ class AutonomousHunterEngine:
                       "customerId": tenant.customer_id,
                       "region": tenant.region,
                       "caseId": str(req.case_id),
-                      "comment": markdown_report,
+                      "comment": self.sanitize_case_comment(markdown_report),
                   },
               )
               case_wall_updated = True
@@ -1261,7 +1263,7 @@ class AutonomousHunterEngine:
                       "customerId": tenant.customer_id,
                       "region": tenant.region,
                       "caseId": str(req.case_id),
-                      "comment": markdown_report,
+                      "comment": self.sanitize_case_comment(markdown_report),
                   },
               )
               case_wall_updated = True
@@ -1344,7 +1346,7 @@ class AutonomousHunterEngine:
                       "customerId": tenant.customer_id,
                       "region": tenant.region,
                       "caseId": str(req.case_id),
-                      "comment": markdown_report,
+                      "comment": self.sanitize_case_comment(markdown_report),
                   },
               )
               case_wall_updated = True
@@ -1438,7 +1440,7 @@ class AutonomousHunterEngine:
                       "customerId": tenant.customer_id,
                       "region": tenant.region,
                       "caseId": str(req.case_id),
-                      "comment": markdown_report,
+                      "comment": self.sanitize_case_comment(markdown_report),
                   },
               )
               case_wall_updated = True
@@ -1533,7 +1535,7 @@ class AutonomousHunterEngine:
                       "customerId": tenant.customer_id,
                       "region": tenant.region,
                       "caseId": str(req.case_id),
-                      "comment": markdown_report,
+                      "comment": self.sanitize_case_comment(markdown_report),
                   },
               )
               case_wall_updated = True
@@ -1627,7 +1629,7 @@ class AutonomousHunterEngine:
                       "customerId": tenant.customer_id,
                       "region": tenant.region,
                       "caseId": str(req.case_id),
-                      "comment": markdown_report,
+                      "comment": self.sanitize_case_comment(markdown_report),
                   },
               )
               case_wall_updated = True
@@ -1691,7 +1693,7 @@ class AutonomousHunterEngine:
                       "customerId": tenant.customer_id,
                       "region": tenant.region,
                       "caseId": str(req.case_id),
-                      "comment": markdown_report,
+                      "comment": self.sanitize_case_comment(markdown_report),
                   },
               )
               case_wall_updated = True
@@ -1779,7 +1781,7 @@ class AutonomousHunterEngine:
                       "customerId": tenant.customer_id,
                       "region": tenant.region,
                       "caseId": str(req.case_id),
-                      "comment": markdown_report,
+                      "comment": self.sanitize_case_comment(markdown_report),
                   },
               )
               case_wall_updated = True
@@ -1864,7 +1866,7 @@ class AutonomousHunterEngine:
                       "customerId": tenant.customer_id,
                       "region": tenant.region,
                       "caseId": str(req.case_id),
-                      "comment": markdown_report,
+                      "comment": self.sanitize_case_comment(markdown_report),
                   },
               )
               case_wall_updated = True
@@ -2142,7 +2144,7 @@ class AutonomousHunterEngine:
                     "customerId": tenant.customer_id,
                     "region": tenant.region,
                     "caseId": str(req.case_id),
-                    "comment": markdown_report,
+                    "comment": self.sanitize_case_comment(markdown_report),
                 },
             )
             case_wall_updated = True
@@ -2199,7 +2201,7 @@ class AutonomousHunterEngine:
                     "customerId": tenant.customer_id,
                     "region": tenant.region,
                     "caseId": str(req.case_id),
-                    "comment": markdown_report,
+                    "comment": self.sanitize_case_comment(markdown_report),
                 },
             )
             case_wall_updated = True

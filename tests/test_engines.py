@@ -386,9 +386,68 @@ def test_sanitize_case_comment():
   assert "json_triage" not in clean
   assert "\\n" not in clean
   assert '{\n  "version"' not in clean
-  assert "#### 1. Statistical Outlier Report" in clean
-  assert "- **Target Entity**: `timaddler-pc`" in clean
-  assert "- **CRI**: 0 / 100" in clean
+  assert "<h4>1. Statistical Outlier Report: Rare Process Execution Prevalence</h4>" in clean
+  assert "<li><strong>Target Entity</strong>: <code>timaddler-pc</code></li>" in clean
+  assert "<li><strong>CRI</strong>: 0 / 100</li>" in clean
+  assert "style=" not in clean
+  assert "class=" not in clean
+
+
+def test_case_wall_card_to_soar_html():
+  from src.formatters.case_wall_card import CaseWallCardFormatter
+  from src.strategy_decider import StrategyDecider
+
+  directive = StrategyDecider.decide_tier1_360(
+      target_entity="tim.smith",
+      entity_type="USER",
+      case_id="20794",
+      case_title="Workspace File Download Surge",
+  )
+  sector_rows = [
+      {
+          "metric": "**Auth Sector** (`auth_attempts_total`)",
+          "observed": "Z = +0.00 (0 events)",
+          "threshold": "|Z| <= 2.0σ",
+          "assessment": "✅ Nominal Baseline",
+      },
+      {
+          "metric": "**Workspace Sector** (`workspace_total_download_actions`)",
+          "observed": "Z = +3.45 (42 events)",
+          "threshold": "|Z| <= 2.0σ",
+          "assessment": "⚠️ Significant Behavioral Drift",
+      },
+  ]
+  md_card = CaseWallCardFormatter.format_card(
+      target_entity="tim.smith",
+      entity_type="USER",
+      model_name="360_DECOUPLED_RADAR",
+      calibrated_risk_index=65.0,
+      is_outlier=True,
+      case_id="20794",
+      rows_count=42,
+      directive=directive,
+      metrics_table_rows=sector_rows,
+  )
+  soar_html = CaseWallCardFormatter.to_soar_html(md_card)
+
+  # Verify semantic HTML tags and table structure
+  assert "<h3>🛡️ Tier 1 360° Behavioral Radar: <code>tim.smith</code></h3>" in soar_html
+  assert '<table border="1" cellpadding="6" cellspacing="0" width="100%">' in soar_html
+  assert '<th align="left">Metric / Dimension</th>' in soar_html
+  assert "<td><strong>Auth Sector</strong> (<code>auth_attempts_total</code>)</td>" in soar_html
+  # Verify |Z| in table cell was preserved without splitting into extra columns
+  assert "<td>∣Z∣ &lt;= 2.0σ</td>" in soar_html
+  # Verify LaTeX ($H_0$, $H_1$) converted to HTML subscripts
+  assert "H<sub>0</sub>" in soar_html
+  assert "H<sub>1</sub>" in soar_html
+  assert "$H_0$" not in soar_html
+  assert "| :--- |" not in soar_html
+  # Verify safevalues DEFAULT_SANITIZER_TABLE compliance (no style/class attributes, no stray newlines)
+  assert "style=" not in soar_html
+  assert "class=" not in soar_html
+  assert "\n" not in soar_html
+  # Verify idempotency
+  assert CaseWallCardFormatter.to_soar_html(soar_html) == soar_html
 
 
 @pytest.mark.anyio
