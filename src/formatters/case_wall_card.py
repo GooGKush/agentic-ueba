@@ -47,6 +47,95 @@ class CaseWallCardFormatter:
       label = "⚪ **LOW CONFIDENCE**"
     return f"`{clamped:.2f}/1.00` [{bar}] {label}"
 
+  @staticmethod
+  def normalize_common_vector(
+      raw_vector: Optional[str] = None,
+      model_name: Optional[str] = None,
+      target_metric: Optional[str] = None,
+  ) -> str:
+    """Normalizes any 360° radar sector, deep-dive model, or metric into a canonical Common Vector."""
+    combined = f"{raw_vector or ''} {model_name or ''} {target_metric or ''}".lower()
+
+    if any(k in combined for k in ("fusion", "multi_sector", "dual_sector", "rollup_sector")):
+      return "MULTI_SECTOR"
+    if any(k in combined for k in ("workspace", "drive")):
+      return "WORKSPACE"
+    if any(k in combined for k in ("cloud", "resource_creation", "resource_deletion", "resource_written", "resource_read", "iam")):
+      return "CLOUD"
+    if any(k in combined for k in ("dns", "nxdomain", "dga")):
+      return "DNS"
+    if any(k in combined for k in ("web", "http", "proxy", "whois", "domain_prevalence")):
+      return "WEB"
+    if any(k in combined for k in ("alert_event_name", "alerts")):
+      return "ALERTS"
+    if any(k in combined for k in ("endpoint", "file_executions", "markov", "zipf", "shannon", "obfuscation", "file_prevalence", "fleet_prevalence")):
+      return "ENDPOINT"
+    if any(k in combined for k in ("auth", "login", "poisson_burst", "spray", "lateral_expansion", "circadian")):
+      return "AUTH"
+    if any(k in combined for k in ("flows", "network_flows", "ewma")):
+      return "FLOWS"
+    if any(k in combined for k in ("egress", "network_bytes", "c2", "jitter", "beaconing", "elephant_flow", "macd", "rare_destination")):
+      return "EGRESS"
+    return "MULTI_SECTOR"
+
+  @classmethod
+  def build_case_tags(
+      cls,
+      calibrated_risk_index: float,
+      primary_vector: Optional[str] = None,
+      model_name: Optional[str] = None,
+      target_metric: Optional[str] = None,
+      second_order_ran: bool = False,
+      investigation_tier: Optional[str] = None,
+      is_outlier: bool = False,
+  ) -> List[str]:
+    """Builds the deterministic Case Wall tag taxonomy for filtering cases of interest.
+
+    Taxonomy:
+    1. Binary Risk Finding Tag (emitted strictly when a risk finding exists, CRI >= 60):
+       - `RISK:CRITICAL` (CRI >= 80)
+       - `RISK:HIGH` (60 <= CRI < 80)
+    2. Common Vector Tag (shared across 360° Radar and deep-dive models when a finding or second-order hunt occurs):
+       - `VECTOR:<SECTOR>` (e.g. `VECTOR:EGRESS`, `VECTOR:AUTH`, `VECTOR:CLOUD`, `VECTOR:WORKSPACE`,
+         `VECTOR:DNS`, `VECTOR:WEB`, `VECTOR:FLOWS`, `VECTOR:ALERTS`, `VECTOR:ENDPOINT`, `VECTOR:MULTI_SECTOR`)
+    3. Generic Second-Order Investigation Tag (emitted whenever a Tier 2A or Tier 2B hunt was executed):
+       - `SECOND_ORDER_HUNT`
+    """
+    tags: List[str] = []
+    cri = float(calibrated_risk_index or 0.0)
+    is_tier2 = second_order_ran or (
+        investigation_tier in ("TIER_2_DEEP_DIVE", "TIER_2B_PIVOT")
+    )
+    has_finding = cri >= 60.0
+
+    # 1. Binary Risk Finding Taxonomy (Critical vs High)
+    if cri >= 80.0:
+      tags.append("RISK:CRITICAL")
+    elif cri >= 60.0:
+      tags.append("RISK:HIGH")
+
+    # 2. Common Vector Tag (emitted when there is a finding, outlier, or second-order hunt)
+    if has_finding or is_outlier or is_tier2:
+      common_vec = cls.normalize_common_vector(
+          raw_vector=primary_vector,
+          model_name=model_name,
+          target_metric=target_metric,
+      )
+      tags.append(f"VECTOR:{common_vec}")
+
+    # 3. Generic Second-Order Investigation Tag
+    if is_tier2:
+      tags.append("SECOND_ORDER_HUNT")
+
+    return tags
+
+  @staticmethod
+  def render_tags_line(tags: List[str]) -> str:
+    """Renders tags as inline code badges for Case Wall filtering."""
+    if not tags:
+      return "`NONE (Nominal Baseline)`"
+    return " ".join(f"`{t}`" for t in tags)
+
   @classmethod
   def format_card(
       cls,
@@ -61,6 +150,9 @@ class CaseWallCardFormatter:
       directive: Optional[StrategyDirective] = None,
       metrics_table_rows: Optional[List[Dict[str, str]]] = None,
       soc_guidance: Optional[str] = None,
+      primary_vector: Optional[str] = None,
+      second_order_ran: bool = False,
+      tags: Optional[List[str]] = None,
   ) -> str:
     """Renders a full 5-section Markdown Case Wall Triage Card with Hypothesis Defense & Confidence Scale."""
     risk_bar = cls.render_risk_bar(calibrated_risk_index)
@@ -87,10 +179,26 @@ class CaseWallCardFormatter:
           else "Tier 2: Targeted Deep Dive"
       )
 
+    resolved_tags = (
+        tags
+        if tags is not None
+        else cls.build_case_tags(
+            calibrated_risk_index=calibrated_risk_index,
+            primary_vector=primary_vector or (directive.outlier_vector if directive else None),
+            model_name=model_name,
+            target_metric=getattr(directive, "target_metric", None) if directive else None,
+            second_order_ran=second_order_ran,
+            investigation_tier=tier_label,
+            is_outlier=is_outlier,
+        )
+    )
+    tags_display = cls.render_tags_line(resolved_tags)
+
     lines = [
         f"## 🛡️ {card_title}",
         "",
         f"**Calibrated Risk Index**: {risk_bar}  ",
+        f"**Case Triage Tags**: {tags_display}  ",
         f"**Target Entity**: `{target_entity}` ({entity_type}) | **Investigation Phase**: `{tier_display}`  ",
         f"**Case ID**: {case_id or 'Ad-Hoc'} | **Window**: {evaluated_window} ({rows_count} telemetry records)  ",
         "",

@@ -340,20 +340,21 @@ async def hunt_ewma_burst(
 
 
 @mcp.tool()
-async def get_case_activity(timeframe: str = "1h") -> Dict[str, Any]:
-  """Returns an activity summary report of cases touched by the agent (e.g. '1h', '24h', '7d', 'all')."""
-  return watchdog.state.get_activity_report(timeframe=timeframe)
+async def get_case_activity(timeframe: str = "1h", tag: Optional[str] = None) -> Dict[str, Any]:
+  """Returns an activity summary report of cases touched by the agent (e.g. '1h', '24h', '7d', 'all'), optionally filtered by tag (e.g. 'RISK:CRITICAL', 'RISK:HIGH', 'VECTOR:EGRESS', 'SECOND_ORDER_HUNT')."""
+  return watchdog.state.get_activity_report(timeframe=timeframe, tag=tag)
 
 
 # --- 2. REST Endpoints (Playbook-to-Agent Gateway) ---
 
 @mcp.custom_route("/api/v1/cases/activity", methods=["GET"])
 async def cases_activity_endpoint(request: Request) -> JSONResponse:
-  """Returns an activity summary report of cases touched by the agent (e.g. ?timeframe=1h or ?timeframe=24h or ?hours=1)."""
+  """Returns an activity summary report of cases touched by the agent (e.g. ?timeframe=24h&tag=RISK:CRITICAL)."""
   timeframe = request.query_params.get("timeframe", "1h")
   hours_param = request.query_params.get("hours")
+  tag = request.query_params.get("tag")
   hours = float(hours_param) if hours_param else None
-  report = watchdog.state.get_activity_report(timeframe=timeframe, hours=hours)
+  report = watchdog.state.get_activity_report(timeframe=timeframe, hours=hours, tag=tag)
   return JSONResponse(report, status_code=200)
 
 
@@ -396,6 +397,9 @@ async def jit_playbook_endpoint(request: Request) -> JSONResponse:
                 "cri": resp.triage.calibrated_risk_index,
                 "verdict": resp.triage.verdict,
                 "primary_vector": resp.triage.primary_vector,
+                "common_vector": resp.triage.common_vector,
+                "second_order_ran": resp.triage.second_order_ran,
+                "tags": resp.triage.tags,
                 "source": "JIT_PLAYBOOK",
                 "case_wall_updated": resp.case_wall_updated,
                 "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

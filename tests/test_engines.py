@@ -943,4 +943,201 @@ async def test_bounded_tier2a_to_tier2b_epistemic_pivot_auto_execution(monkeypat
   assert "Defense of Hypothesis" in posted_comments[1]
   assert resp.triage.calibrated_risk_index == 88.0
   assert resp.triage.primary_vector == "tier2b_dual_sector_fusion_3stage"
+  assert resp.triage.common_vector == "MULTI_SECTOR"
+  assert resp.triage.second_order_ran is True
+  assert "RISK:CRITICAL" in resp.triage.tags
+  assert "VECTOR:MULTI_SECTOR" in resp.triage.tags
+  assert "SECOND_ORDER_HUNT" in resp.triage.tags
+
+
+@pytest.mark.anyio
+async def test_v181_risk_metrics_date_filter_and_rare_destination_scoping(monkeypatch):
+  from unittest.mock import AsyncMock
+  from src.risk_metrics_engine import RiskMetricsEngine
+  from src.config import TenantConfig
+
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  engine = RiskMetricsEngine(tenant)
+
+  async def mock_execute(session, query, start_iso, end_iso):
+    return {"stats": [{"z": 3.5, "z_sector": 3.2, "d_sq": 12.4}]}
+
+  monkeypatch.setattr(engine.runner, "execute_query_via_mcp", mock_execute)
+  mock_session = AsyncMock()
+
+  # 1. v1.8.1: HYBRID_METRIC_DERIVED_DOMAIN_PREVALENCE_2STAGE with http_queries_total uses {{today_date}}
+  res_http = await engine.run_dynamic_metric_pipeline(
+      session=mock_session,
+      entity="web.user",
+      metric_name="http_queries_total",
+      model_name="HYBRID_METRIC_DERIVED_DOMAIN_PREVALENCE_2STAGE",
+      lookback_days=7,
+  )
+  assert res_http["model"] == "HYBRID_METRIC_DERIVED_DOMAIN_PREVALENCE_2STAGE"
+  assert "timestamp.get_date(metadata.event_timestamp.seconds) =" in res_http["executed_query"]
+  assert "{{today_date}}" not in res_http["executed_query"]
+  assert "{{today_start_epoch}}" not in res_http["executed_query"]
+  assert "metrics.http_queries_total" in res_http["executed_query"]
+
+  # 2. v1.8.1: Non-HTTP metric (dns_queries_fail) passed to HYBRID_METRIC_DERIVED_DOMAIN_PREVALENCE_2STAGE
+  # automatically reroutes to RARE_DESTINATION_ECG_3STAGE (rare_destination_ecg_3stage.yl2)
+  res_dns_reroute = await engine.run_dynamic_metric_pipeline(
+      session=mock_session,
+      entity="10.20.30.40",
+      metric_name="dns_queries_fail",
+      model_name="HYBRID_METRIC_DERIVED_DOMAIN_PREVALENCE_2STAGE",
+      lookback_days=7,
+  )
+  assert res_dns_reroute["model"] == "RARE_DESTINATION_ECG_3STAGE"
+  assert "stage rare_dest" in res_dns_reroute["executed_query"]
+  assert "network.dns.questions.name" in res_dns_reroute["executed_query"]
+  assert "timestamp.get_date(metadata.event_timestamp.seconds) =" in res_dns_reroute["executed_query"]
+
+  # 3. v1.8.1: FUSION_RARE_DESTINATION_3STAGE renders multi-sector fusion with rare destination ECG
+  res_fusion_rare = await engine.run_dynamic_metric_pipeline(
+      session=mock_session,
+      entity="alice.smith",
+      metric_name="network_bytes_outbound",
+      model_name="FUSION_RARE_DESTINATION_3STAGE",
+      lookback_days=7,
+  )
+  assert res_fusion_rare["model"] == "FUSION_RARE_DESTINATION_3STAGE"
+  assert "stage rare_dest" in res_fusion_rare["executed_query"]
+  assert "metrics.http_queries_total" in res_fusion_rare["executed_query"]
+  assert "metrics.network_bytes_outbound" in res_fusion_rare["executed_query"]
+
+
+def test_case_triage_tagging_taxonomy_and_watchdog_filtering(tmp_path):
+  from src.formatters.case_wall_card import CaseWallCardFormatter
+  from src.models import TriageSummary, StrategyDirective
+  from src.watchdog import WatchdogState
+
+  # 1. Critical finding (CRI >= 80) + Common Vector + Second-Order Hunt
+  triage_crit = TriageSummary(
+      is_outlier=True,
+      calibrated_risk_index=85.0,
+      verdict="CRITICAL_OUTLIER",
+      top_z_score=4.8,
+      primary_vector="Workspace_behavioral_drift",
+      second_order_ran=True,
+      recommended_action="REVOKE_SESSION",
+  )
+  assert triage_crit.common_vector == "WORKSPACE"
+  assert triage_crit.tags == ["RISK:CRITICAL", "VECTOR:WORKSPACE", "SECOND_ORDER_HUNT"]
+
+  # 2. High finding (60 <= CRI < 80) + Common Vector without Second-Order Hunt
+  triage_high = TriageSummary(
+      is_outlier=True,
+      calibrated_risk_index=68.0,
+      verdict="HIGH_OUTLIER",
+      top_z_score=3.4,
+      primary_vector="Auth_behavioral_drift",
+      second_order_ran=False,
+      recommended_action="INVESTIGATE_EVENTS",
+  )
+  assert triage_high.common_vector == "AUTH"
+  assert triage_high.tags == ["RISK:HIGH", "VECTOR:AUTH"]
+
+  # 3. Nominal / Low finding (CRI < 60) with no Second-Order Hunt -> No tags
+  triage_low = TriageSummary(
+      is_outlier=False,
+      calibrated_risk_index=25.0,
+      verdict="NOMINAL_BASELINE",
+      top_z_score=0.8,
+      primary_vector="Auth",
+      second_order_ran=False,
+      recommended_action="CLOSE_FALSE_POSITIVE",
+  )
+  assert triage_low.tags == []
+
+  # 4. Nominal finding (CRI < 60) where a Second-Order Hunt ran and refuted the anomaly
+  triage_refuted = TriageSummary(
+      is_outlier=False,
+      calibrated_risk_index=20.0,
+      verdict="NOMINAL_BASELINE",
+      top_z_score=0.5,
+      primary_vector="Egress",
+      second_order_ran=True,
+      recommended_action="CLOSE_FALSE_POSITIVE",
+  )
+  assert triage_refuted.tags == ["VECTOR:EGRESS", "SECOND_ORDER_HUNT"]
+
+  # 5. Verify Case Wall card renders Case Triage Tags in Markdown and SOAR HTML
+  directive = StrategyDirective(
+      selected_skill="secops-risk-metrics-multistage",
+      model_name="MACD_MOMENTUM_VELOCITY",
+      target_metric="workspace_total_download_actions",
+      directive_query="macd",
+      target_entity="insider.user",
+      entity_type="USER",
+      investigation_tier="TIER_2_DEEP_DIVE",
+      outlier_vector="Workspace",
+  )
+  md_card = CaseWallCardFormatter.format_card(
+      target_entity="insider.user",
+      entity_type="USER",
+      model_name="MACD_MOMENTUM_VELOCITY",
+      calibrated_risk_index=85.0,
+      is_outlier=True,
+      case_id="20999",
+      rows_count=12,
+      directive=directive,
+  )
+  assert "**Case Triage Tags**: `RISK:CRITICAL` `VECTOR:WORKSPACE` `SECOND_ORDER_HUNT`" in md_card
+  html_card = CaseWallCardFormatter.to_soar_html(md_card)
+  assert "<strong>Case Triage Tags</strong>: <code>RISK:CRITICAL</code>" in html_card
+  assert "<code>VECTOR:WORKSPACE</code>" in html_card
+  assert "<code>SECOND_ORDER_HUNT</code>" in html_card
+
+  # 6. WatchdogState activity filtering by tag
+  state_file = tmp_path / "watchdog_state.json"
+  wd = WatchdogState(state_file=state_file)
+  wd.record_case("1001", {
+      "case_id": "1001",
+      "target_entity": "alice",
+      "entity_type": "USER",
+      "calibrated_risk_index": 88.0,
+      "verdict": "CRITICAL_OUTLIER",
+      "primary_vector": "Workspace",
+      "common_vector": "WORKSPACE",
+      "second_order_ran": True,
+      "tags": ["RISK:CRITICAL", "VECTOR:WORKSPACE", "SECOND_ORDER_HUNT"],
+  })
+  wd.record_case("1002", {
+      "case_id": "1002",
+      "target_entity": "bob",
+      "entity_type": "USER",
+      "calibrated_risk_index": 64.0,
+      "verdict": "HIGH_OUTLIER",
+      "primary_vector": "Auth",
+      "common_vector": "AUTH",
+      "second_order_ran": False,
+      "tags": ["RISK:HIGH", "VECTOR:AUTH"],
+  })
+  wd.record_case("1003", {
+      "case_id": "1003",
+      "target_entity": "carol",
+      "entity_type": "USER",
+      "calibrated_risk_index": 12.0,
+      "verdict": "NOMINAL_BASELINE",
+      "primary_vector": "none",
+      "common_vector": "NONE",
+      "second_order_ran": False,
+      "tags": [],
+  })
+
+  all_report = wd.get_activity_report()
+  assert all_report["total_cases_triaged"] == 3
+  assert all_report["summary_by_tag"]["RISK:CRITICAL"] == 1
+  assert all_report["summary_by_tag"]["RISK:HIGH"] == 1
+  assert all_report["summary_by_tag"]["SECOND_ORDER_HUNT"] == 1
+
+  crit_report = wd.get_activity_report(tag="RISK:CRITICAL")
+  assert crit_report["total_cases_triaged"] == 1
+  assert crit_report["cases"][0]["case_id"] == "1001"
+
+  second_order_report = wd.get_activity_report(tag="SECOND_ORDER_HUNT")
+  assert second_order_report["total_cases_triaged"] == 1
+  assert second_order_report["cases"][0]["case_id"] == "1001"
+
 

@@ -137,6 +137,18 @@ class TriageSummary(BaseModel):
   verdict: str  # "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "BENIGN"
   is_outlier: bool
   primary_vector: str
+  common_vector: str = Field(
+      default="NONE",
+      description="Normalized common behavioral vector shared across 360 radar and deep-dive models (e.g. AUTH, CLOUD, WORKSPACE, EGRESS, DNS, WEB, FLOWS, ALERTS, ENDPOINT, MULTI_SECTOR)",
+  )
+  second_order_ran: bool = Field(
+      default=False,
+      description="True if a Tier 2A or Tier 2B second-order investigation was executed",
+  )
+  tags: List[str] = Field(
+      default_factory=list,
+      description="Filterable case tags: binary risk finding (RISK:CRITICAL | RISK:HIGH), common vector (VECTOR:<SECTOR>), and SECOND_ORDER_HUNT",
+  )
   top_z_score: float
   radar_dimensions: Dict[str, float] = Field(default_factory=dict)
   recommended_action: str
@@ -148,6 +160,20 @@ class TriageSummary(BaseModel):
       default_factory=list,
       description="Mapped MITRE ATT&CK tactics, e.g. ['TA0006', 'TA0010']",
   )
+
+  def model_post_init(self, __context: Any) -> None:
+    from src.formatters.case_wall_card import CaseWallCardFormatter
+    if not self.common_vector or self.common_vector == "NONE":
+      self.common_vector = CaseWallCardFormatter.normalize_common_vector(
+          raw_vector=self.primary_vector
+      )
+    if not self.tags:
+      self.tags = CaseWallCardFormatter.build_case_tags(
+          calibrated_risk_index=self.calibrated_risk_index,
+          primary_vector=self.primary_vector,
+          second_order_ran=self.second_order_ran,
+          is_outlier=self.is_outlier,
+      )
 
 
 class ForensicsSummary(BaseModel):
