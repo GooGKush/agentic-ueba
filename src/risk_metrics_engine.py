@@ -131,11 +131,11 @@ stage auth_risk {{
     $obs = count(metadata.id)
     $avg = max(metrics.auth_attempts_fail(
         period: 1d, window: 30d, metric: event_count_sum, agg: avg,
-        principal.asset.hostname: "{username}"
+        principal.asset.hostname: principal.asset.hostname
     ))
     $std = max(metrics.auth_attempts_fail(
         period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
-        principal.asset.hostname: "{username}"
+        principal.asset.hostname: principal.asset.hostname
     ))
     $z = ($obs - $avg) / if($std > 0, $std, 1.0)
 }}
@@ -163,11 +163,11 @@ stage egress_risk {{
     $obs = sum(network.sent_bytes)
     $avg = max(metrics.network_bytes_outbound(
         period: 1d, window: 30d, metric: value_sum, agg: avg,
-        principal.asset.hostname: "{username}"
+        principal.asset.hostname: principal.asset.hostname
     ))
     $std = max(metrics.network_bytes_outbound(
         period: 1d, window: 30d, metric: value_sum, agg: stddev,
-        principal.asset.hostname: "{username}"
+        principal.asset.hostname: principal.asset.hostname
     ))
     $z = ($obs - $avg) / if($std > 0, $std, 1.0)
 }}
@@ -195,11 +195,11 @@ stage dns_risk {{
     $obs = count(metadata.id)
     $avg = max(metrics.dns_queries_fail(
         period: 1d, window: 30d, metric: event_count_sum, agg: avg,
-        principal.asset.hostname: "{username}"
+        principal.asset.hostname: principal.asset.hostname
     ))
     $std = max(metrics.dns_queries_fail(
         period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
-        principal.asset.hostname: "{username}"
+        principal.asset.hostname: principal.asset.hostname
     ))
     $z = ($obs - $avg) / if($std > 0, $std, 1.0)
 }}
@@ -226,11 +226,11 @@ stage flows_risk {{
     $obs = count(metadata.id)
     $avg = max(metrics.network_flows_outbound(
         period: 1d, window: 30d, metric: event_count_sum, agg: avg,
-        principal.asset.hostname: "{username}"
+        principal.asset.hostname: principal.asset.hostname
     ))
     $std = max(metrics.network_flows_outbound(
         period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
-        principal.asset.hostname: "{username}"
+        principal.asset.hostname: principal.asset.hostname
     ))
     $z = ($obs - $avg) / if($std > 0, $std, 1.0)
 }}
@@ -259,13 +259,13 @@ stage alerts_risk {{
     $obs = count(metadata.id)
     $avg = max(metrics.alert_event_name_count(
         period: 1d, window: 30d, metric: event_count_sum, agg: avg,
-        principal.asset.hostname: "{username}",
-        security_result.rule_name: $rule_name
+        principal.asset.hostname: principal.asset.hostname,
+        security_result.rule_name: security_result.rule_name
     ))
     $std = max(metrics.alert_event_name_count(
         period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
-        principal.asset.hostname: "{username}",
-        security_result.rule_name: $rule_name
+        principal.asset.hostname: principal.asset.hostname,
+        security_result.rule_name: security_result.rule_name
     ))
     $z = ($obs - $avg) / if($std > 0, $std, 1.0)
 }}
@@ -292,11 +292,11 @@ stage web_risk {{
     $obs = count(metadata.id)
     $avg = max(metrics.http_queries_total(
         period: 1d, window: 30d, metric: event_count_sum, agg: avg,
-        principal.asset.hostname: "{username}"
+        principal.asset.hostname: principal.asset.hostname
     ))
     $std = max(metrics.http_queries_total(
         period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
-        principal.asset.hostname: "{username}"
+        principal.asset.hostname: principal.asset.hostname
     ))
     $z = ($obs - $avg) / if($std > 0, $std, 1.0)
 }}
@@ -327,11 +327,11 @@ stage auth_risk {{
     $obs = count(metadata.id)
     $avg = max(metrics.auth_attempts_fail(
         period: 1d, window: 30d, metric: event_count_sum, agg: avg,
-        target.user.userid: "{username}"
+        target.user.userid: target.user.userid
     ))
     $std = max(metrics.auth_attempts_fail(
         period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
-        target.user.userid: "{username}"
+        target.user.userid: target.user.userid
     ))
     $z = ($obs - $avg) / if($std > 0, $std, 1.0)
 }}
@@ -352,26 +352,23 @@ stage cloud_risk {{
     (metadata.event_type = "RESOURCE_CREATION" or metadata.event_type = "USER_RESOURCE_CREATION")
     principal.user.userid = "{username}"
     $user = principal.user.userid
-    $event_type = metadata.event_type
     $vendor = metadata.vendor_name
     $product = metadata.product_name
   match:
-    $user, $event_type, $vendor, $product by 1d
+    $user, $vendor, $product by 1d
   outcome:
     $obs = count(metadata.id)
     $avg = max(metrics.resource_creation_total(
         period: 1d, window: 30d, metric: event_count_sum, agg: avg,
-        principal.user.userid: "{username}",
-        metadata.event_type: $event_type,
-        metadata.vendor_name: $vendor,
-        metadata.product_name: $product
+        principal.user.userid: principal.user.userid,
+        metadata.vendor_name: metadata.vendor_name,
+        metadata.product_name: metadata.product_name
     ))
     $std = max(metrics.resource_creation_total(
         period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
-        principal.user.userid: "{username}",
-        metadata.event_type: $event_type,
-        metadata.vendor_name: $vendor,
-        metadata.product_name: $product
+        principal.user.userid: principal.user.userid,
+        metadata.vendor_name: metadata.vendor_name,
+        metadata.product_name: metadata.product_name
     ))
     $z = ($obs - $avg) / if($std > 0, $std, 1.0)
 }}
@@ -399,11 +396,11 @@ stage workspace_risk {{
     $obs = count(metadata.id)
     $avg = max(metrics.workspace_total_download_actions(
         period: 1d, window: 30d, metric: event_count_sum, agg: avg,
-        principal.user.userid: "{username}"
+        principal.user.userid: principal.user.userid
     ))
     $std = max(metrics.workspace_total_download_actions(
         period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
-        principal.user.userid: "{username}"
+        principal.user.userid: principal.user.userid
     ))
     $z = ($obs - $avg) / if($std > 0, $std, 1.0)
 }}
@@ -431,11 +428,11 @@ stage egress_risk {{
     $obs = sum(network.sent_bytes)
     $avg = max(metrics.network_bytes_outbound(
         period: 1d, window: 30d, metric: value_sum, agg: avg,
-        principal.user.userid: "{username}"
+        principal.user.userid: principal.user.userid
     ))
     $std = max(metrics.network_bytes_outbound(
         period: 1d, window: 30d, metric: value_sum, agg: stddev,
-        principal.user.userid: "{username}"
+        principal.user.userid: principal.user.userid
     ))
     $z = ($obs - $avg) / if($std > 0, $std, 1.0)
 }}
@@ -463,11 +460,11 @@ stage dns_risk {{
     $obs = count(metadata.id)
     $avg = max(metrics.dns_queries_fail(
         period: 1d, window: 30d, metric: event_count_sum, agg: avg,
-        principal.user.userid: "{username}"
+        principal.user.userid: principal.user.userid
     ))
     $std = max(metrics.dns_queries_fail(
         period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
-        principal.user.userid: "{username}"
+        principal.user.userid: principal.user.userid
     ))
     $z = ($obs - $avg) / if($std > 0, $std, 1.0)
 }}
@@ -494,11 +491,11 @@ stage web_risk {{
     $obs = count(metadata.id)
     $avg = max(metrics.http_queries_total(
         period: 1d, window: 30d, metric: event_count_sum, agg: avg,
-        principal.user.userid: "{username}"
+        principal.user.userid: principal.user.userid
     ))
     $std = max(metrics.http_queries_total(
         period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
-        principal.user.userid: "{username}"
+        principal.user.userid: principal.user.userid
     ))
     $z = ($obs - $avg) / if($std > 0, $std, 1.0)
 }}
@@ -676,8 +673,8 @@ order:
     mc = self.runner.get_malachite_catalog()
     sem = mc.baseline_semantics(target_metric)
     sector_filter = "\n    ".join(sem.observed_filter)
-    sector_avg = f"metrics.{target_metric}(period: 1d, window: 30d, metric: {sem.metric_arg}, agg: avg, {host_field}: $host)"
-    sector_std = f"metrics.{target_metric}(period: 1d, window: 30d, metric: {sem.metric_arg}, agg: stddev, {host_field}: $host)"
+    sector_avg = f"metrics.{target_metric}(period: 1d, window: 30d, metric: {sem.metric_arg}, agg: avg, {host_field}: {host_field})"
+    sector_std = f"metrics.{target_metric}(period: 1d, window: 30d, metric: {sem.metric_arg}, agg: stddev, {host_field}: {host_field})"
 
     if "dns" in target_metric:
       contact_sem = mc.baseline_semantics("dns_queries_total")
@@ -742,13 +739,13 @@ order:
             "host_field": host_field,
             "sector_a_filter": "\n    ".join(sem_a.observed_filter),
             "sector_a_observation_agg": sem_a.observed_agg,
-            "sector_a_metric_func_avg": f"metrics.{sector_a_metric}(period: 1d, window: 30d, metric: {sem_a.metric_arg}, agg: avg, {host_field}: $host)",
-            "sector_a_metric_func_stddev": f"metrics.{sector_a_metric}(period: 1d, window: 30d, metric: {sem_a.metric_arg}, agg: stddev, {host_field}: $host)",
+            "sector_a_metric_func_avg": f"metrics.{sector_a_metric}(period: 1d, window: 30d, metric: {sem_a.metric_arg}, agg: avg, {host_field}: {host_field})",
+            "sector_a_metric_func_stddev": f"metrics.{sector_a_metric}(period: 1d, window: 30d, metric: {sem_a.metric_arg}, agg: stddev, {host_field}: {host_field})",
             "sector_b_filter": "\n    ".join(sem_b.observed_filter),
             "dest_field": dest_field,
             "sector_b_observation_agg": sem_b.observed_agg,
-            "sector_b_metric_func_avg": f"metrics.{sector_b_metric}(period: 1d, window: 30d, metric: {sem_b.metric_arg}, agg: avg, {host_field}: $host, {dest_field}: $dest)",
-            "sector_b_metric_func_stddev": f"metrics.{sector_b_metric}(period: 1d, window: 30d, metric: {sem_b.metric_arg}, agg: stddev, {host_field}: $host, {dest_field}: $dest)",
+            "sector_b_metric_func_avg": f"metrics.{sector_b_metric}(period: 1d, window: 30d, metric: {sem_b.metric_arg}, agg: avg, {host_field}: {host_field}, {dest_field}: {dest_field})",
+            "sector_b_metric_func_stddev": f"metrics.{sector_b_metric}(period: 1d, window: 30d, metric: {sem_b.metric_arg}, agg: stddev, {host_field}: {host_field}, {dest_field}: {dest_field})",
             "ecg_entity_type": '"DOMAIN_NAME"',
             "ecg_key_path": "entity.domain.name",
             "ecg_prevalence_path": "entity.domain.prevalence",
@@ -1149,51 +1146,56 @@ order:
       username: str,
       lookback_days: int = 14,
   ) -> Dict[str, Any]:
-    """Profiles user cloud infrastructure creation, deletion, modification, and permissions changes."""
+    """Profiles user cloud resource activity across all 4 CRUD families (read, write, delete, create).
+
+    Mirrors secops-risk-metrics-multistage v1.8.2: each family's observed count is
+    scored against its own resource_*_total baseline, and every metrics.* call
+    passes direct UDM field paths (<field>: <field>) on the PRINCIPAL_USER +
+    PRODUCT_NAME + VENDOR_NAME dimension set so the query returns the same
+    baselines when pasted into the SecOps Search UI with Case Sensitivity Off.
+    """
     start_iso, end_iso = self._iso_window(lookback_days)
-    query = f"""// Sector: Cloud Infrastructure CRUD Surge
+    dims = (
+        "principal.user.userid: principal.user.userid, "
+        "metadata.vendor_name: metadata.vendor_name, "
+        "metadata.product_name: metadata.product_name"
+    )
+
+    def _metric(name: str, agg: str) -> str:
+      return f"max(metrics.{name}(period: 1d, window: 30d, metric: event_count_sum, agg: {agg}, {dims}))"
+
+    query = f"""// Sector: Cloud Resource CRUD Surge (read, write, delete, create)
 stage cloud_risk {{
-    (metadata.event_type = "RESOURCE_CREATION" or metadata.event_type = "USER_RESOURCE_CREATION" or metadata.event_type = "RESOURCE_DELETION" or metadata.event_type = "USER_RESOURCE_DELETION")
+    (
+        metadata.event_type = "RESOURCE_READ" or metadata.event_type = "USER_RESOURCE_ACCESS" or
+        metadata.event_type = "RESOURCE_WRITTEN" or metadata.event_type = "USER_RESOURCE_UPDATE_CONTENT" or
+        metadata.event_type = "RESOURCE_DELETION" or metadata.event_type = "USER_RESOURCE_DELETION" or
+        metadata.event_type = "RESOURCE_CREATION" or metadata.event_type = "USER_RESOURCE_CREATION"
+    )
     principal.user.userid = "{username}"
     $user = principal.user.userid
-    $event_type = metadata.event_type
     $vendor = metadata.vendor_name
     $product = metadata.product_name
   match:
-    $user, $event_type, $vendor, $product by 1d
+    $user, $vendor, $product by 1d
   outcome:
-    $obs = count(metadata.id)
-    $create_avg = max(metrics.resource_creation_total(
-        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
-        principal.user.userid: "{username}",
-        metadata.event_type: $event_type,
-        metadata.vendor_name: $vendor,
-        metadata.product_name: $product
-    ))
-    $create_std = max(metrics.resource_creation_total(
-        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
-        principal.user.userid: "{username}",
-        metadata.event_type: $event_type,
-        metadata.vendor_name: $vendor,
-        metadata.product_name: $product
-    ))
-    $delete_avg = max(metrics.resource_deletion_total(
-        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
-        principal.user.userid: "{username}",
-        metadata.event_type: $event_type,
-        metadata.vendor_name: $vendor,
-        metadata.product_name: $product
-    ))
-    $delete_std = max(metrics.resource_deletion_total(
-        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
-        principal.user.userid: "{username}",
-        metadata.event_type: $event_type,
-        metadata.vendor_name: $vendor,
-        metadata.product_name: $product
-    ))
-    $z_create = ($obs - $create_avg) / if($create_std > 0, $create_std, 1.0)
-    $z_delete = ($obs - $delete_avg) / if($delete_std > 0, $delete_std, 1.0)
-    $z = if($z_create > $z_delete, $z_create, $z_delete)
+    // Each count matches its resource_*_total baseline population
+    $obs_read = sum(if(metadata.event_type = "RESOURCE_READ" or metadata.event_type = "USER_RESOURCE_ACCESS", 1, 0))
+    $obs_write = sum(if(metadata.event_type = "RESOURCE_WRITTEN" or metadata.event_type = "USER_RESOURCE_UPDATE_CONTENT", 1, 0))
+    $obs_delete = sum(if(metadata.event_type = "RESOURCE_DELETION" or metadata.event_type = "USER_RESOURCE_DELETION", 1, 0))
+    $obs_create = sum(if(metadata.event_type = "RESOURCE_CREATION" or metadata.event_type = "USER_RESOURCE_CREATION", 1, 0))
+    $read_avg = {_metric("resource_read_total", "avg")}
+    $read_std = {_metric("resource_read_total", "stddev")}
+    $write_avg = {_metric("resource_written_total", "avg")}
+    $write_std = {_metric("resource_written_total", "stddev")}
+    $delete_avg = {_metric("resource_deletion_total", "avg")}
+    $delete_std = {_metric("resource_deletion_total", "stddev")}
+    $create_avg = {_metric("resource_creation_total", "avg")}
+    $create_std = {_metric("resource_creation_total", "stddev")}
+    $z_read = ($obs_read - $read_avg) / if($read_std > 0, $read_std, 1.0)
+    $z_write = ($obs_write - $write_avg) / if($write_std > 0, $write_std, 1.0)
+    $z_delete = ($obs_delete - $delete_avg) / if($delete_std > 0, $delete_std, 1.0)
+    $z_create = ($obs_create - $create_avg) / if($create_std > 0, $create_std, 1.0)
 }}
 
 $user = $cloud_risk.user
@@ -1201,31 +1203,54 @@ $user = $cloud_risk.user
 match:
   $user by 1d
 
+// Per-family columns are returned so the peak family's observed count and
+// baseline are selected in Python (keeps both stages under the 20-outcome limit).
 outcome:
-  $top_z = max($cloud_risk.z)
-  $observed = max($cloud_risk.obs)
-  $baseline_avg = max($cloud_risk.create_avg)
-  $baseline_std = max($cloud_risk.create_std)
+  $z_read = max($cloud_risk.z_read)
+  $z_write = max($cloud_risk.z_write)
+  $z_delete = max($cloud_risk.z_delete)
+  $z_create = max($cloud_risk.z_create)
+  $top_z = if(if($z_read > $z_write, $z_read, $z_write) > if($z_delete > $z_create, $z_delete, $z_create), if($z_read > $z_write, $z_read, $z_write), if($z_delete > $z_create, $z_delete, $z_create))
+  $obs_read = max($cloud_risk.obs_read)
+  $obs_write = max($cloud_risk.obs_write)
+  $obs_delete = max($cloud_risk.obs_delete)
+  $obs_create = max($cloud_risk.obs_create)
+  $read_avg = max($cloud_risk.read_avg)
+  $read_std = max($cloud_risk.read_std)
+  $write_avg = max($cloud_risk.write_avg)
+  $write_std = max($cloud_risk.write_std)
+  $delete_avg = max($cloud_risk.delete_avg)
+  $delete_std = max($cloud_risk.delete_std)
+  $create_avg = max($cloud_risk.create_avg)
+  $create_std = max($cloud_risk.create_std)
 
 order:
   $top_z desc"""
 
     resp = await self.runner.execute_query_via_mcp(session, query, start_iso, end_iso)
     rows = self.runner.parse_stats_response(resp)
-    top_z = 0.0
-    observed = 0
-    base_avg = 0.0
-    base_std = 1.0
-    if rows:
-      top_z = float(rows[0].get("top_z", rows[0].get("z", 0.0)) or 0.0)
-      observed = int(float(rows[0].get("observed", rows[0].get("obs", 0)) or 0))
-      base_avg = float(rows[0].get("baseline_avg", 0.0) or 0.0)
-      base_std = float(rows[0].get("baseline_std", 1.0) or 1.0)
+
+    def _f(row: Dict[str, Any], key: str, default: float = 0.0) -> float:
+      try:
+        val = row.get(key)
+        return float(val) if val not in (None, "") else default
+      except (TypeError, ValueError):
+        return default
+
+    families = ("read", "write", "delete", "create")
+    row = rows[0] if rows else {}
+    family_z = {fam: round(_f(row, f"z_{fam}"), 2) for fam in families}
+    top_family = max(families, key=lambda fam: _f(row, f"z_{fam}", float("-inf")))
+    top_z = _f(row, "top_z", family_z[top_family]) if rows else 0.0
+    observed = int(_f(row, f"obs_{top_family}")) if rows else 0
+    base_avg = _f(row, f"{top_family}_avg") if rows else 0.0
+    base_std = (_f(row, f"{top_family}_std", 1.0) or 1.0) if rows else 1.0
 
     cri = self.runner.calculate_cri(top_z)
     return {
         "entity": username,
         "model": "CLOUD_INFRASTRUCTURE_CRUD_SURGE",
+        "family_z_scores": family_z,
         "top_z_score": round(top_z, 2),
         "z_score": round(top_z, 2),
         "observed_events": observed,
