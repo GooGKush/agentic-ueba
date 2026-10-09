@@ -2019,6 +2019,11 @@ order:
       return 0.0
 
     sector_items = list(fleet_queries.items())
+    logger.info(
+        f"Fleet 360 [{norm_type}] sweep started: window={start_iso}..{end_iso}, "
+        f"sectors={len(sector_items)}, spike_threshold_z={spike_threshold_z}, "
+        f"spoke_inclusion_z={spoke_inclusion_z}, min_obs={min_observed}."
+    )
     for idx, (sector_name, q_str) in enumerate(sector_items):
       try:
         resp = await self.runner.execute_query_via_mcp(session, q_str, start_iso, end_iso)
@@ -2161,6 +2166,11 @@ order:
     if ingest_events and udm_events_to_ingest:
       try:
         ingestion_result = self.ingest_udm_events(udm_events_to_ingest)
+        logger.info(
+            f"Fleet 360 [{norm_type}] UDM ingestion succeeded: "
+            f"events_ingested={ingestion_result.get('events_ingested', 0)}, "
+            f"batches={ingestion_result.get('batches', 0)}, campaign={campaign_id}."
+        )
       except Exception as ing_err:
         logger.error(f"Fleet 360 UDM ingestion failed: {ing_err}")
         ingestion_result = {
@@ -2169,6 +2179,23 @@ order:
             "events_ingested": 0,
             "batches": 0,
         }
+
+    outlier_preview = (
+        ", ".join(
+            f"{o['entity']}(CRI={o['composite_cri']},D={o['composite_d']:.2f}σ,{o['primary_vector']})"
+            for o in outliers[:10]
+        )
+        if outliers
+        else "none"
+    )
+    logger.info(
+        f"Fleet 360 [{norm_type}] sweep complete: campaign={campaign_id}, window={start_iso}..{end_iso}, "
+        f"queries={queries_executed}/{len(sector_items)}, sector_rows={sector_row_counts}, "
+        f"candidates_above_floor={len(entity_vectors)}, outliers_detected={total_detected}, "
+        f"outliers_emitted={len(outliers)}, suppressed_dedup={suppressed_duplicates}, "
+        f"udm_events={len(udm_events_to_ingest)}, ingestion_status={ingestion_result.get('status')} "
+        f"(ingested={ingestion_result.get('events_ingested', 0)}), outliers=[{outlier_preview}]."
+    )
 
     return {
         "status": "SUCCESS",

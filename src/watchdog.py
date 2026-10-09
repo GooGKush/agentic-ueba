@@ -950,6 +950,11 @@ class WatchdogDaemon:
       mcp_session: Optional[Any] = None,
   ) -> Dict[str, Any]:
     sweep_ts = (now_utc or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    norm_entity_types = [str(e).upper().strip() for e in entity_types]
+    logger.info(
+        f"Fleet 360 radar sweep starting: timestamp={sweep_ts}, "
+        f"entity_types={norm_entity_types}, lookback_days={lookback_days}."
+    )
     risk_engine: RiskMetricsEngine = (
         getattr(self.engine, "risk_engine", None) or RiskMetricsEngine(self.tenant)
     )
@@ -972,7 +977,7 @@ class WatchdogDaemon:
             max_outliers_per_sector=max_outliers_per_sector,
             inter_query_delay_sec=inter_query_delay_sec,
             ingest_events=ingest_events,
-              now_utc=now_utc,
+            now_utc=now_utc,
             lookback_days=lookback_days,
             should_emit_fn=self.state.should_emit_fleet_360,
             record_emit_fn=self.state.record_fleet_360_emission,
@@ -986,7 +991,7 @@ class WatchdogDaemon:
       combined = {
           "status": "SUCCESS",
           "timestamp": sweep_ts,
-          "entity_types": [str(e).upper().strip() for e in entity_types],
+          "entity_types": norm_entity_types,
           "total_outliers_detected": total_outliers,
           "total_outliers_emitted": total_emitted,
           "total_outliers_suppressed_dedup": total_suppressed,
@@ -1001,6 +1006,17 @@ class WatchdogDaemon:
           "total_outliers_suppressed_dedup": total_suppressed,
           "total_udm_events_generated": total_events,
       })
+      verdict_tag = (
+          "EMITTED_UDM_EVENTS"
+          if total_events > 0
+          else ("SUPPRESSED_DUPLICATES" if total_suppressed > 0 else "NO_OUTLIERS_FOUND")
+      )
+      logger.info(
+          f"Fleet 360 radar sweep complete [{verdict_tag}]: timestamp={sweep_ts}, "
+          f"entity_types={combined['entity_types']}, outliers_detected={total_outliers}, "
+          f"outliers_emitted={total_emitted}, suppressed_dedup={total_suppressed}, "
+          f"udm_events_generated={total_events}."
+      )
       return combined
 
     if mcp_session is not None:
