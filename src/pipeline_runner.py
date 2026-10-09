@@ -224,7 +224,8 @@ class PipelineRunner:
     if crit_errors:
       logger.warning(f"Malachite AST preflight invariant warnings: {crit_errors}")
 
-    logger.info(f"Executing query over OneMCP: {query[:120]}...")
+    query_preview = " ".join(query[:120].split())
+    logger.info(f"Executing query over OneMCP: {query_preview}...")
     res = await session.call_tool("udm_search", tool_args)
     if not res.content:
       return {"stats": [], "events": []}
