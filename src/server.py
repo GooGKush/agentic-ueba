@@ -124,10 +124,9 @@ async def run_fleet_360_sweep(
     min_observed: int = 5,
     max_outliers_per_sector: int = 250,
     ingest_events: bool = True,
-    emit_all_spokes: bool = True,
     lookback_days: int = 1,
 ) -> Dict[str, Any]:
-  """Executes a deterministic Mode A fleetwide 360° behavioral risk radar sweep across all entities and emits Composite Summary + Per-Vector UDM events for any entity with a vector spike >= spike_threshold_z."""
+  """Executes a deterministic Mode A fleetwide 360° behavioral risk radar sweep across all entities and emits one BEHAVIORAL_RISK_RADAR_360 UDM event for each entity with a vector spike >= spike_threshold_z."""
   types_list = [t.strip().upper() for t in entity_types.split(",") if t.strip()]
   return await watchdog.run_fleet_360_sweep_once(
       entity_types=types_list or ["USER", "ASSET"],
@@ -136,7 +135,6 @@ async def run_fleet_360_sweep(
       min_observed=min_observed,
       max_outliers_per_sector=max_outliers_per_sector,
       ingest_events=ingest_events,
-      emit_all_spokes=emit_all_spokes,
       lookback_days=lookback_days,
   )
 
@@ -524,9 +522,6 @@ async def fleet_360_sweep_endpoint(request: Request) -> JSONResponse:
             else None
         ),
         ingest_events=bool(body["ingest_events"]) if "ingest_events" in body else None,
-        emit_all_spokes=(
-            bool(body["emit_all_spokes"]) if "emit_all_spokes" in body else None
-        ),
         lookback_days=int(body["lookback_days"]) if "lookback_days" in body else 1,
     )
     return JSONResponse(res, status_code=200)

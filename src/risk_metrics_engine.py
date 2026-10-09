@@ -1771,342 +1771,111 @@ order:
   $z desc""",
     }
 
-  def build_360_summary_udm_event(
+  # Fixed identity shared by every event the 360 sweep ingests. One event per
+  # outlier entity; the catch-all rule keys on product_name + event_type.
+  RADAR_360_EVENT_METADATA: Dict[str, str] = {
+      "product_name": "SecOps Risk Metrics Hunter",
+      "vendor_name": "Google SecOps",
+      "event_type": "GENERIC_EVENT",
+      "product_event_type": "BEHAVIORAL_RISK_RADAR_360",
+  }
+
+  RADAR_360_CATEGORY_BY_SECTOR: Dict[str, str] = {
+      "AUTH": "AUTH_VIOLATION",
+      "EGRESS": "DATA_EXFILTRATION",
+      "WORKSPACE": "DATA_EXFILTRATION",
+      "CLOUD": "ACL_VIOLATION",
+      "DNS": "NETWORK_SUSPICIOUS",
+      "WEB": "NETWORK_SUSPICIOUS",
+      "FLOWS": "NETWORK_SUSPICIOUS",
+      "ALERTS": "SOFTWARE_SUSPICIOUS",
+  }
+
+  def build_360_outlier_udm_event(
       self,
       entity_id: str,
       entity_type: str,
       sectors: Dict[str, Dict[str, float]],
       composite_d: float,
-      cri: int,
+      composite_cri: int,
       campaign_id: str,
-      start_iso: str,
-      end_iso: str,
+      run_timestamp_iso: str,
+      evaluated_day: str,
       spike_threshold_z: float = 3.0,
   ) -> Dict[str, Any]:
-    """Constructs the Euclidean Distance Composite Summary UDM event (BEHAVIORAL_RISK_RADAR_360)."""
+    """Builds the single 360 Radar UDM event for one outlier entity.
+
+    Carries only: composite CRI, composite distance D (in sigma), and each of the
+    6 sector vectors as "CRI <n> | Z <z>". `event_timestamp` is the time the sweep
+    ran the query (the 30d baseline is evaluated as of that moment);
+    `evaluated_day` is the UTC day bucket that was scored.
+    """
     is_asset = entity_type.upper() in ("ASSET", "HOST", "IP")
     norm_type = "ASSET" if is_asset else "USER"
-    canonical_order = (
-        ["Auth", "Egress", "DNS", "Flows", "Alerts", "Web"]
-        if is_asset
-        else ["Auth", "Cloud", "Workspace", "Egress", "DNS", "Web"]
-    )
-    severity = self.derive_cri_severity(cri)
+    sector_map = self.ASSET_SECTOR_METRICS if is_asset else self.USER_SECTOR_METRICS
 
-    spoke_records = []
-    for sec in canonical_order:
-      s_data = sectors.get(sec, {"z": 0.0, "obs": 0.0, "avg": 0.0, "std": 0.0})
-      z_val = float(s_data.get("z", 0.0) or 0.0)
-      spoke_cri = self.runner.calculate_cri(z_val) if z_val > 0.0 else 0
-      spoke_records.append({
-          "sector": sec,
-          "key": sec.lower(),
-          "upper": sec.upper(),
-          "z": z_val,
-          "cri": spoke_cri,
-          "obs": float(s_data.get("obs", 0.0) or 0.0),
-          "avg": float(s_data.get("avg", 0.0) or 0.0),
-          "std": float(s_data.get("std", 0.0) or 0.0),
-      })
+    vectors = []
+    for sec in sector_map:
+      z_val = float((sectors.get(sec) or {}).get("z", 0.0) or 0.0)
+      cri = self.runner.calculate_cri(z_val) if z_val > 0.0 else 0
+      vectors.append((sec.upper(), z_val, cri))
 
-    sorted_spokes = sorted(spoke_records, key=lambda r: r["z"], reverse=True)
-    primary = sorted_spokes[0]
-    breached = [r for r in sorted_spokes if r["z"] >= spike_threshold_z]
-    summary_ribbon = " | ".join(f"{r['upper']}:{r['cri']}" for r in sorted_spokes)
+    peak_name, peak_z, peak_cri = max(vectors, key=lambda v: v[1])
+    breached = [v[0] for v in sorted(vectors, key=lambda v: v[1], reverse=True)
+                if v[1] >= spike_threshold_z]
 
-    category_map = {
-        "AUTH": "AUTH_VIOLATION",
-        "EGRESS": "DATA_EXFILTRATION",
-        "WORKSPACE": "DATA_EXFILTRATION",
-        "CLOUD": "ACL_VIOLATION",
-        "DNS": "NETWORK_COMMAND_AND_CONTROL",
-        "WEB": "NETWORK_SUSPICIOUS",
-        "FLOWS": "NETWORK_SUSPICIOUS",
-        "ALERTS": "SOFTWARE_SUSPICIOUS",
-    }
-    primary_category = category_map.get(primary["upper"], "POLICY_VIOLATION")
-
-    detection_fields = [
-        {"key": "entity_id", "value": entity_id},
-        {"key": "entity_type", "value": norm_type},
-        {"key": "composite_d", "value": f"{composite_d:.2f}"},
-        {"key": "composite_cri", "value": str(cri)},
-        {"key": "primary_vector", "value": primary["upper"]},
-        {"key": "primary_vector_cri", "value": str(primary["cri"])},
-        {"key": "primary_vector_z", "value": f"{primary['z']:.2f}"},
-        {"key": "sectors_breached_count", "value": str(len(breached))},
-        {"key": "vector_cri_summary", "value": summary_ribbon},
-        {"key": "window_start", "value": start_iso},
-        {"key": "window_end", "value": end_iso},
-    ]
-
-    # Repeated "breached_vector" keys allow native YARA-L group-by unpacking in Dashboards
-    for b in breached:
-      detection_fields.append({"key": "breached_vector", "value": b["upper"]})
-
-    resource_labels = [
+    labels = [
         {"key": "Hunt Campaign ID", "value": campaign_id},
-        {"key": "Entity Type", "value": norm_type},
-        {"key": "Composite CRI", "value": str(cri)},
-        {"key": "Euclidean Threat Distance D", "value": f"{composite_d:.2f}"},
-        {"key": "Sectors Breached Count", "value": str(len(breached))},
+        {"key": "Evaluated Day", "value": evaluated_day},
+        {"key": "Composite CRI", "value": str(composite_cri)},
+        {"key": "Composite D", "value": f"{composite_d:.2f}"},
     ]
+    labels.extend(
+        {"key": name, "value": f"CRI {cri} | Z {z:.2f}"} for name, z, cri in vectors
+    )
 
-    for r in spoke_records:
-      k = r["key"]
-      detection_fields.append({"key": f"cri_{k}", "value": str(r["cri"])})
-      detection_fields.append({"key": f"z_{k}", "value": f"{r['z']:.2f}"})
-      resource_labels.append({
-          "key": f"{k}_stats",
-          "value": f"CRI:{r['cri']} | Z:+{r['z']:.2f}σ | Obs:{r['obs']:.0f} | 30d:{r['avg']:.1f}±{r['std']:.1f}",
-      })
-
-    principal_block = (
+    principal = (
         {"hostname": entity_id, "asset": {"hostname": entity_id}}
         if is_asset
         else {"user": {"userid": entity_id}}
+    )
+    summary = (
+        f"{norm_type} {entity_id}: Composite CRI {composite_cri} (D={composite_d:.2f}σ); "
+        f"breached {', '.join(breached) or 'none'}; peak {peak_name} CRI {peak_cri} (Z {peak_z:.2f})."
     )
 
     return {
         "metadata": {
-            "event_timestamp": end_iso,
-            "ingested_timestamp": end_iso,
-            "product_name": "SecOps Risk Metrics Hunter",
-            "vendor_name": "Google SecOps",
-            "event_type": "GENERIC_EVENT",
-            "product_event_type": "BEHAVIORAL_RISK_RADAR_360",
-            "description": (
-                f"360° Composite Outlier [{norm_type}]: {entity_id} "
-                f"Composite CRI={cri} (D={composite_d:.2f}σ) | "
-                f"Peak: {primary['upper']} (CRI:{primary['cri']}, +{primary['z']:.2f}σ)"
-            ),
+            "event_timestamp": run_timestamp_iso,
+            **self.RADAR_360_EVENT_METADATA,
+            "description": summary,
             "ingestion_labels": [
                 {"key": "hunt_campaign_id", "value": campaign_id},
-                {"key": "record_scope", "value": "ENTITY_COMPOSITE_SUMMARY"},
-                {"key": "sweep_mode", "value": "MODE_A_4H_FLEET"},
-                {"key": "source_skill", "value": "secops-risk-metrics-multistage"},
+                {"key": "source_skill", "value": self.SKILL_NAME},
             ],
         },
         "observer": {
-            "hostname": "agentic-ueba-watchdog",
+            "hostname": "secops-risk-metrics-hunter",
             "application": "Google SecOps Multi-Stage Risk Analytics",
         },
-        "principal": principal_block,
+        "principal": principal,
         "target": {
             "resource": {
-                "name": "BEHAVIORAL_RISK_RADAR_360",
-                "attribute": {"labels": resource_labels},
+                "name": self.RADAR_360_EVENT_METADATA["product_event_type"],
+                "attribute": {"labels": labels},
             }
         },
         "security_result": [
             {
-                "rule_id": "RADAR_360_COMPOSITE",
-                "rule_name": "360 Behavioral Risk Radar — Composite Euclidean Distance",
-                "threat_name": "Statistical Outlier: Multi-Sector Behavioral Risk Surge",
-                "category": [primary_category],
+                "rule_name": "360 Behavioral Risk Radar",
+                "category": [self.RADAR_360_CATEGORY_BY_SECTOR.get(peak_name, "POLICY_VIOLATION")],
                 "action": ["UNKNOWN_ACTION"],
-                "risk_score": cri,
-                "severity": severity,
-                "summary": (
-                    f"{norm_type} {entity_id} breached {len(breached)}/6 risk sectors "
-                    f"(Composite CRI={cri}, D={composite_d:.2f}σ; Peak={primary['upper']} CRI:{primary['cri']})."
-                ),
-                "detection_fields": detection_fields,
+                "risk_score": int(composite_cri),
+                "severity": self.derive_cri_severity(composite_cri),
+                "summary": summary,
             }
         ],
     }
-
-  def build_360_vector_udm_event(
-      self,
-      entity_id: str,
-      entity_type: str,
-      sector_name: str,
-      metric_table: str,
-      z_score: float,
-      vector_cri: int,
-      observed: float,
-      baseline_mean: float,
-      baseline_stddev: float,
-      composite_d: float,
-      composite_cri: int,
-      campaign_id: str,
-      start_iso: str,
-      end_iso: str,
-      spike_threshold_z: float = 3.0,
-  ) -> Dict[str, Any]:
-    """Constructs a Per-Vector Breakdown UDM event (BEHAVIORAL_RISK_VECTOR_SPIKE).
-
-    Places `vector_cri` directly into `security_result.risk_score` (int32) so
-    Chronicle Dashboards can compute native `avg()` and `max()` CRI trends per vector.
-    """
-    is_asset = entity_type.upper() in ("ASSET", "HOST", "IP")
-    norm_type = "ASSET" if is_asset else "USER"
-    sector_upper = sector_name.upper()
-    is_breached = z_score >= spike_threshold_z
-    severity = self.derive_cri_severity(vector_cri)
-
-    category_map = {
-        "AUTH": "AUTH_VIOLATION",
-        "EGRESS": "DATA_EXFILTRATION",
-        "WORKSPACE": "DATA_EXFILTRATION",
-        "CLOUD": "ACL_VIOLATION",
-        "DNS": "NETWORK_COMMAND_AND_CONTROL",
-        "WEB": "NETWORK_SUSPICIOUS",
-        "FLOWS": "NETWORK_SUSPICIOUS",
-        "ALERTS": "SOFTWARE_SUSPICIOUS",
-    }
-    sec_category = category_map.get(sector_upper, "POLICY_VIOLATION")
-
-    principal_block = (
-        {"hostname": entity_id, "asset": {"hostname": entity_id}}
-        if is_asset
-        else {"user": {"userid": entity_id}}
-    )
-
-    event: Dict[str, Any] = {
-        "metadata": {
-            "event_timestamp": end_iso,
-            "ingested_timestamp": end_iso,
-            "product_name": "SecOps Risk Metrics Hunter",
-            "vendor_name": "Google SecOps",
-            "event_type": "GENERIC_EVENT",
-            "product_event_type": "BEHAVIORAL_RISK_VECTOR_SPIKE",
-            "description": (
-                f"360° Vector Breakdown [{norm_type} / {sector_upper}]: {entity_id} "
-                f"Vector CRI={vector_cri} (Z=+{z_score:.2f}σ) | Composite CRI={composite_cri} (D={composite_d:.2f}σ)"
-            ),
-            "ingestion_labels": [
-                {"key": "hunt_campaign_id", "value": campaign_id},
-                {"key": "record_scope", "value": "VECTOR_BREAKDOWN"},
-                {"key": "vector_name", "value": sector_upper},
-                {"key": "source_skill", "value": "secops-risk-metrics-multistage"},
-            ],
-        },
-        "observer": {
-            "hostname": "agentic-ueba-watchdog",
-            "application": "Google SecOps Multi-Stage Risk Analytics",
-        },
-        "principal": principal_block,
-        "target": {
-            "resource": {
-                "name": f"VECTOR:{sector_upper}",
-                "attribute": {
-                    "labels": [
-                        {"key": "Hunt Campaign ID", "value": campaign_id},
-                        {"key": "Entity Type", "value": norm_type},
-                        {"key": "Vector", "value": sector_upper},
-                        {"key": "Metric Table", "value": metric_table},
-                        {"key": "Vector CRI", "value": str(vector_cri)},
-                        {"key": "Vector Z-Score", "value": f"{z_score:.2f}"},
-                        {"key": "Observed Value", "value": f"{observed:.0f}"},
-                        {"key": "Baseline 30d Mean", "value": f"{baseline_mean:.1f}"},
-                        {"key": "Baseline 30d StdDev", "value": f"{baseline_stddev:.1f}"},
-                        {"key": "Parent Composite CRI", "value": str(composite_cri)},
-                        {"key": "Parent Euclidean D", "value": f"{composite_d:.2f}"},
-                    ]
-                },
-            }
-        },
-        "security_result": [
-            {
-                "rule_id": f"RADAR_360_VECTOR_{sector_upper}",
-                "rule_name": f"VECTOR:{sector_upper}",
-                "threat_name": f"360 Vector Outlier: {sector_upper}",
-                "category": [sec_category],
-                "action": ["UNKNOWN_ACTION"],
-                "risk_score": vector_cri,
-                "severity": severity,
-                "summary": (
-                    f"{norm_type} {entity_id} {sector_upper} vector CRI={vector_cri} "
-                    f"(+{z_score:.2f}σ; Observed={observed:.0f} vs 30d={baseline_mean:.1f}±{baseline_stddev:.1f})."
-                ),
-                "detection_fields": [
-                    {"key": "entity_id", "value": entity_id},
-                    {"key": "entity_type", "value": norm_type},
-                    {"key": "vector", "value": sector_upper},
-                    {"key": "metric_table", "value": metric_table},
-                    {"key": "is_breached", "value": "true" if is_breached else "false"},
-                    {"key": "vector_cri", "value": str(vector_cri)},
-                    {"key": "vector_z", "value": f"{z_score:.2f}"},
-                    {"key": "observed", "value": f"{observed:.0f}"},
-                    {"key": "baseline_mean", "value": f"{baseline_mean:.1f}"},
-                    {"key": "baseline_stddev", "value": f"{baseline_stddev:.1f}"},
-                    {"key": "composite_cri", "value": str(composite_cri)},
-                    {"key": "composite_d", "value": f"{composite_d:.2f}"},
-                    {"key": "window_start", "value": start_iso},
-                    {"key": "window_end", "value": end_iso},
-                ],
-            }
-        ],
-    }
-
-    if sector_upper == "EGRESS" and observed > 0:
-      event["network"] = {"sent_bytes": int(observed)}
-
-    return event
-
-  def build_360_outlier_event_bundle(
-      self,
-      entity_id: str,
-      entity_type: str,
-      sectors: Dict[str, Dict[str, float]],
-      composite_d: float,
-      composite_cri: int,
-      campaign_id: str,
-      start_iso: str,
-      end_iso: str,
-      spike_threshold_z: float = 3.0,
-      emit_all_spokes: bool = True,
-  ) -> List[Dict[str, Any]]:
-    """Builds the correlated Dual-Event UDM bundle for an outlier entity.
-
-    Returns:
-      1 Composite Summary event (`BEHAVIORAL_RISK_RADAR_360`) +
-      N Per-Vector Breakdown events (`BEHAVIORAL_RISK_VECTOR_SPIKE`).
-    """
-    events: List[Dict[str, Any]] = []
-    summary_ev = self.build_360_summary_udm_event(
-        entity_id=entity_id,
-        entity_type=entity_type,
-        sectors=sectors,
-        composite_d=composite_d,
-        cri=composite_cri,
-        campaign_id=campaign_id,
-        start_iso=start_iso,
-        end_iso=end_iso,
-        spike_threshold_z=spike_threshold_z,
-    )
-    events.append(summary_ev)
-
-    is_asset = entity_type.upper() in ("ASSET", "HOST", "IP")
-    sector_map = self.ASSET_SECTOR_METRICS if is_asset else self.USER_SECTOR_METRICS
-
-    for sec_name, metric_name in sector_map.items():
-      s_data = sectors.get(sec_name, {"z": 0.0, "obs": 0.0, "avg": 0.0, "std": 0.0})
-      z_val = float(s_data.get("z", 0.0) or 0.0)
-      if not emit_all_spokes and z_val <= 0.0:
-        continue
-      vec_cri = self.runner.calculate_cri(z_val) if z_val > 0.0 else 0
-      vec_ev = self.build_360_vector_udm_event(
-          entity_id=entity_id,
-          entity_type=entity_type,
-          sector_name=sec_name,
-          metric_table=f"metrics.{metric_name}",
-          z_score=z_val,
-          vector_cri=vec_cri,
-          observed=float(s_data.get("obs", 0.0) or 0.0),
-          baseline_mean=float(s_data.get("avg", 0.0) or 0.0),
-          baseline_stddev=float(s_data.get("std", 0.0) or 0.0),
-          composite_d=composite_d,
-          composite_cri=composite_cri,
-          campaign_id=campaign_id,
-          start_iso=start_iso,
-          end_iso=end_iso,
-          spike_threshold_z=spike_threshold_z,
-      )
-      events.append(vec_ev)
-
-    return events
 
   def ingest_udm_events(
       self,
@@ -2165,7 +1934,6 @@ order:
       max_outliers_per_sector: Optional[int] = None,
       inter_query_delay_sec: Optional[float] = None,
       ingest_events: Optional[bool] = None,
-      emit_all_spokes: Optional[bool] = None,
       should_emit_fn: Optional[Any] = None,
       record_emit_fn: Optional[Any] = None,
       now_utc: Optional[datetime] = None,
@@ -2176,8 +1944,8 @@ order:
     - Evaluates all entities in 6 sequential fleetwide queries (O(1) API calls).
     - Supports multi-day historical backfills via `lookback_days` using Chronicle's `by 1d` TIME_BUCKET.
     - Computes Euclidean Distance D = sqrt(sum max(0, Z_i)^2) and Composite CRI.
-    - For any entity with >= 1 vector above `spike_threshold_z` (3.0σ), emits a
-      correlated Dual-Event UDM bundle (Composite Summary + Per-Vector Breakdown).
+    - For any entity with >= 1 vector above `spike_threshold_z` (3.0σ), emits ONE
+      `BEHAVIORAL_RISK_RADAR_360` UDM event stamped with the sweep's run time.
     """
     t_cfg = self.runner.tenant
     spike_threshold_z = (
@@ -2210,11 +1978,10 @@ order:
         if ingest_events is not None
         else bool(getattr(t_cfg, "fleet_360_ingest_events", True))
     )
-    emit_all_spokes = (
-        bool(emit_all_spokes)
-        if emit_all_spokes is not None
-        else bool(getattr(t_cfg, "fleet_360_emit_all_spokes", True))
-    )
+
+    # Every event from this sweep is stamped with the moment its queries started.
+    stamp_dt = now_utc or datetime.now(timezone.utc)
+    run_timestamp_iso = stamp_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     is_multi_day = bool(lookback_days and int(lookback_days) > 1)
     if is_multi_day:
@@ -2237,6 +2004,7 @@ order:
     )
 
     entity_vectors: Dict[Tuple[str, str], Dict[str, Dict[str, float]]] = {}
+    display_ids: Dict[str, Tuple[float, str]] = {}
     sector_row_counts: Dict[str, int] = {}
     circuit_breaker_tripped: List[str] = []
     queries_executed = 0
@@ -2281,9 +2049,17 @@ order:
               or row.get("entity")
               or row.get("$entity")
               or ""
-          ).strip().lower()
+          ).strip()
           if not ent_id:
             continue
+          # Merge case variants of one entity across sectors on a lowercase key, but
+          # emit the ID exactly as the source telemetry spelled it (spelling from the
+          # highest-Z sector wins) so exact-match pivots to raw events still work.
+          ent_key = ent_id.lower()
+          row_z = _extract_num(row, ("z", "z_score", "$z"))
+          if ent_key not in display_ids or row_z > display_ids[ent_key][0]:
+            display_ids[ent_key] = (row_z, ent_id)
+          ent_id = ent_key
           raw_tb = str(
               row.get("TIME_BUCKET")
               or row.get("time_bucket")
@@ -2312,7 +2088,6 @@ order:
       if inter_query_delay_sec > 0 and idx < len(sector_items) - 1:
         await asyncio.sleep(inter_query_delay_sec)
 
-    stamp_dt = now_utc or datetime.now(timezone.utc)
     campaign_id = f"sweep-360-{norm_type.lower()}-{bucket_date}-{stamp_dt.strftime('%H%M%S')}"
     udm_events_to_ingest: List[Dict[str, Any]] = []
     outliers: List[Dict[str, Any]] = []
@@ -2340,27 +2115,20 @@ order:
           suppressed_duplicates += 1
           continue
 
-      if is_multi_day:
-        day_start_iso = f"{day_bucket}T00:00:00Z"
-        day_end_iso = f"{day_bucket}T23:59:00Z"
-      else:
-        day_start_iso = start_iso
-        day_end_iso = end_iso
       day_campaign_id = f"sweep-360-{norm_type.lower()}-{day_bucket}-{stamp_dt.strftime('%H%M%S')}"
 
-      bundle = self.build_360_outlier_event_bundle(
-          entity_id=ent_id,
+      udm_event = self.build_360_outlier_udm_event(
+          entity_id=display_ids.get(ent_id, (0.0, ent_id))[1],
           entity_type=norm_type,
           sectors=sec_map,
           composite_d=composite_d,
           composite_cri=composite_cri,
           campaign_id=day_campaign_id,
-          start_iso=day_start_iso,
-          end_iso=day_end_iso,
+          run_timestamp_iso=run_timestamp_iso,
+          evaluated_day=day_bucket,
           spike_threshold_z=spike_threshold_z,
-          emit_all_spokes=emit_all_spokes,
       )
-      udm_events_to_ingest.extend(bundle)
+      udm_events_to_ingest.append(udm_event)
 
       if record_emit_fn is not None:
         record_emit_fn(day_bucket, norm_type, ent_id, breached_sectors, composite_d, composite_cri)
@@ -2371,7 +2139,7 @@ order:
       }
       outliers.append({
           "bucket_date": day_bucket,
-          "entity": ent_id,
+          "entity": display_ids.get(ent_id, (0.0, ent_id))[1],
           "entity_type": norm_type,
           "composite_d": round(composite_d, 2),
           "composite_cri": composite_cri,
@@ -2381,7 +2149,6 @@ order:
           "breached_sectors": [s.upper() for s in breached_sectors],
           "sector_z_scores": {s: round(v["z"], 2) for s, v in sec_map.items()},
           "sector_cri_scores": vector_cri_map,
-          "udm_events_count": len(bundle),
       })
 
     outliers.sort(key=lambda x: (x["composite_d"], x.get("bucket_date", "")), reverse=True)
