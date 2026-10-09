@@ -1456,3 +1456,46 @@ async def test_run_fleet_360_sweep_preserves_source_entity_casing(monkeypatch):
   # ... and the event carries the ID exactly as the source telemetry spelled it.
   assert res["outliers"][0]["entity"] == "CYM-PROD-GCP-WIN01"
   assert res["udm_events"][0]["principal"]["asset"]["hostname"] == "CYM-PROD-GCP-WIN01"
+
+
+def test_build_360_outlier_udm_event_matches_skill_handoff_schema():
+  """Drift guard: the sweep event must have the same shape as skill §10."""
+  import json as _json
+  import re as _re
+
+  eng = RiskMetricsEngine()
+  schema = eng.runner._ensure_skill_path() / "references" / "clean-handoff-udm-schema.md"
+  if not schema.is_file():
+    pytest.skip("secops-risk-metrics-multistage skill not available")
+  text = schema.read_text(encoding="utf-8")
+  sec = text[text.index("### 10. `BEHAVIORAL_RISK_RADAR_360`"):]
+  doc = _json.loads(_re.search(r"```json\n(.*?)\n```", sec, _re.S).group(1))["udm"]
+
+  labels = {l["key"]: l["value"] for l in doc["target"]["resource"]["attribute"]["labels"]}
+  sectors = {
+      name.title(): {"z": float(val.split("Z ")[1])}
+      for name, val in labels.items() if val.startswith("CRI ")
+  }
+  sectors = {("DNS" if k == "Dns" else k): v for k, v in sectors.items()}
+  ev = eng.build_360_outlier_udm_event(
+      entity_id=doc["principal"]["user"]["userid"],
+      entity_type="USER",
+      sectors=sectors,
+      composite_d=float(labels["Composite D"]),
+      composite_cri=int(labels["Composite CRI"]),
+      campaign_id=labels["Hunt Campaign ID"],
+      run_timestamp_iso=doc["metadata"]["event_timestamp"],
+      evaluated_day=labels["Evaluated Day"],
+  )
+
+  # Same identity, observer, principal and label keys/values as the documented event.
+  for k in ("product_name", "vendor_name", "event_type", "product_event_type", "event_timestamp"):
+    assert ev["metadata"][k] == doc["metadata"][k], k
+  assert sorted(ev["metadata"]) == sorted(doc["metadata"])
+  assert ev["observer"] == doc["observer"]
+  assert ev["principal"] == doc["principal"]
+  assert ev["target"]["resource"]["attribute"]["labels"] == doc["target"]["resource"]["attribute"]["labels"]
+  assert sorted(ev["security_result"][0]) == sorted(doc["security_result"][0])
+  assert ev["security_result"][0]["risk_score"] == doc["security_result"][0]["risk_score"]
+  assert ev["security_result"][0]["severity"] == doc["security_result"][0]["severity"]
+  assert ev["security_result"][0]["summary"] == doc["security_result"][0]["summary"]
