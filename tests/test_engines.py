@@ -1184,68 +1184,74 @@ def test_mode_a_today_window_and_midnight_rollover_guard():
   assert bucket_roll == "2026-10-07"
 
 
-def test_build_360_outlier_event_bundle_schema_and_validation():
+def test_build_360_outlier_udm_event_minimal_consistent_schema():
   eng = RiskMetricsEngine()
   eng.runner._ensure_skill_path()
   from scripts import chronicle_ingest
 
   sector_stats = {
       "Auth": {"z": 2.2, "obs": 12.0, "avg": 3.0, "std": 2.0},
-      "Cloud": {"z": 0.0, "obs": 0.0, "avg": 0.0, "std": 0.0},
       "Workspace": {"z": 4.8, "obs": 95.0, "avg": 8.0, "std": 6.0},
       "Egress": {"z": 3.5, "obs": 50000000.0, "avg": 2000000.0, "std": 1500000.0},
-      "DNS": {"z": 0.0, "obs": 0.0, "avg": 0.0, "std": 0.0},
-      "Web": {"z": 0.0, "obs": 0.0, "avg": 0.0, "std": 0.0},
   }
-  # D = sqrt(2.2^2 + 4.8^2 + 3.5^2) = sqrt(4.84 + 23.04 + 12.25) = sqrt(40.13) = 6.33
   composite_d = eng.runner.compute_euclidean_distance(
       {k: v["z"] for k, v in sector_stats.items()}
   )
   composite_cri = eng.runner.calculate_cri(composite_d)
 
-  bundle = eng.build_360_outlier_event_bundle(
+  ev = eng.build_360_outlier_udm_event(
       entity_id="alex.mercer",
       entity_type="USER",
       sectors=sector_stats,
       composite_d=composite_d,
       composite_cri=composite_cri,
       campaign_id="sweep-360-user-2026-10-08-160000",
-      start_iso="2026-10-08T00:00:00Z",
-      end_iso="2026-10-08T16:00:00Z",
-      spike_threshold_z=3.0,
-      emit_all_spokes=True,
+      run_timestamp_iso="2026-10-08T16:00:00Z",
+      evaluated_day="2026-10-08",
   )
 
-  # 1 Summary Event + 6 sector spokes (when emit_all_spokes=True)
-  assert len(bundle) == 7
-  summary_ev = bundle[0]
-  assert summary_ev["metadata"]["product_event_type"] == "BEHAVIORAL_RISK_RADAR_360"
-  assert summary_ev["principal"]["user"]["userid"] == "alex.mercer"
-  assert summary_ev["security_result"][0]["risk_score"] == composite_cri
-  assert isinstance(summary_ev["security_result"][0]["risk_score"], int)
+  md = ev["metadata"]
+  for k, v in RiskMetricsEngine.RADAR_360_EVENT_METADATA.items():
+    assert md[k] == v
+  # Event time is the sweep run time; ingestion time is left to Chronicle.
+  assert md["event_timestamp"] == "2026-10-08T16:00:00Z"
+  assert "ingested_timestamp" not in md
+  assert ev["principal"] == {"user": {"userid": "alex.mercer"}}
 
-  det_fields = summary_ev["security_result"][0]["detection_fields"]
-  breached_vals = [df["value"] for df in det_fields if df["key"] == "breached_vector"]
-  assert breached_vals == ["WORKSPACE", "EGRESS"]
-  det_map = {df["key"]: df["value"] for df in det_fields if df["key"] != "breached_vector"}
-  assert det_map["cri_workspace"] == str(eng.runner.calculate_cri(4.8))
-  assert det_map["cri_egress"] == str(eng.runner.calculate_cri(3.5))
-  assert det_map["cri_auth"] == str(eng.runner.calculate_cri(2.2))
+  sr = ev["security_result"]
+  assert len(sr) == 1
+  assert sr[0]["risk_score"] == composite_cri and isinstance(sr[0]["risk_score"], int)
+  assert "detection_fields" not in sr[0]
+  assert "network" not in ev
 
-  # Verify per-vector spoke events carry native int32 risk_score = vector CRI
-  spoke_events = bundle[1:]
-  assert all(
-      ev["metadata"]["product_event_type"] == "BEHAVIORAL_RISK_VECTOR_SPIKE"
-      for ev in spoke_events
+  labels = {l["key"]: l["value"] for l in ev["target"]["resource"]["attribute"]["labels"]}
+  # Only: campaign, evaluated day, composite CRI, composite D, and the 6 vectors.
+  assert list(labels) == [
+      "Hunt Campaign ID", "Evaluated Day", "Composite CRI", "Composite D",
+      "AUTH", "CLOUD", "WORKSPACE", "EGRESS", "DNS", "WEB",
+  ]
+  assert labels["Composite CRI"] == str(composite_cri)
+  assert labels["Composite D"] == f"{composite_d:.2f}"
+  assert labels["WORKSPACE"] == f"CRI {eng.runner.calculate_cri(4.8)} | Z 4.80"
+  assert labels["CLOUD"] == "CRI 0 | Z 0.00"
+
+  assert chronicle_ingest.validate_events([ev]) == []
+
+
+def test_build_360_outlier_udm_event_asset_identity_matches_user():
+  eng = RiskMetricsEngine()
+  common = dict(
+      sectors={"Flows": {"z": 3.9}}, composite_d=3.9, composite_cri=60,
+      campaign_id="c", run_timestamp_iso="2026-10-08T16:00:00Z", evaluated_day="2026-10-08",
   )
-  spoke_by_sector = {ev["target"]["resource"]["name"]: ev for ev in spoke_events}
-  assert spoke_by_sector["VECTOR:WORKSPACE"]["security_result"][0]["risk_score"] == eng.runner.calculate_cri(4.8)
-  assert spoke_by_sector["VECTOR:EGRESS"]["security_result"][0]["risk_score"] == eng.runner.calculate_cri(3.5)
-  assert spoke_by_sector["VECTOR:AUTH"]["security_result"][0]["risk_score"] == eng.runner.calculate_cri(2.2)
-
-  # Validate all generated UDM events against Chronicle schema validator
-  validation_errors = chronicle_ingest.validate_events(bundle)
-  assert validation_errors == []
+  user_ev = eng.build_360_outlier_udm_event(entity_id="u", entity_type="USER", **common)
+  asset_ev = eng.build_360_outlier_udm_event(entity_id="h", entity_type="ASSET", **common)
+  ident = ("product_name", "vendor_name", "event_type", "product_event_type")
+  assert {k: user_ev["metadata"][k] for k in ident} == {k: asset_ev["metadata"][k] for k in ident}
+  assert user_ev["observer"] == asset_ev["observer"]
+  assert asset_ev["principal"] == {"hostname": "h", "asset": {"hostname": "h"}}
+  asset_keys = [l["key"] for l in asset_ev["target"]["resource"]["attribute"]["labels"]][4:]
+  assert asset_keys == ["AUTH", "EGRESS", "DNS", "FLOWS", "ALERTS", "WEB"]
 
 
 @pytest.mark.anyio
@@ -1302,7 +1308,6 @@ async def test_run_fleet_360_sweep_euclidean_aggregation_and_circuit_breaker(mon
       max_outliers_per_sector=3,
       inter_query_delay_sec=0.0,
       ingest_events=True,
-      emit_all_spokes=False,
       now_utc=datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc),
   )
 
@@ -1316,10 +1321,11 @@ async def test_run_fleet_360_sweep_euclidean_aggregation_and_circuit_breaker(mon
   # Alice's Euclidean D combines Workspace (4.0) + Auth (2.5): sqrt(16 + 6.25) = sqrt(22.25) = 4.72
   assert pytest.approx(alice_rec["composite_d"], 0.01) == math.sqrt(4.0**2 + 2.5**2)
   assert alice_rec["breached_sectors"] == ["WORKSPACE"]
-  # With emit_all_spokes=False: 1 summary event + 2 active spokes (Workspace, Auth) = 3 UDM events
-  assert res["udm_events_generated"] == 3
+  # Exactly one UDM event per outlier entity, stamped with the sweep run time
+  assert res["udm_events_generated"] == 1
   assert len(ingested_batches) == 1
-  assert len(ingested_batches[0]) == 3
+  assert len(ingested_batches[0]) == 1
+  assert ingested_batches[0][0]["metadata"]["event_timestamp"] == "2026-10-08T15:00:00Z"
 
 
 @pytest.mark.anyio
@@ -1399,7 +1405,6 @@ async def test_run_fleet_360_sweep_multiday_backfill_time_buckets(monkeypatch):
       min_observed=5,
       inter_query_delay_sec=0.0,
       ingest_events=True,
-      emit_all_spokes=True,
       now_utc=datetime(2026, 10, 7, 23, 59, 0, tzinfo=timezone.utc),
       lookback_days=7,
   )
@@ -1411,12 +1416,43 @@ async def test_run_fleet_360_sweep_multiday_backfill_time_buckets(monkeypatch):
   assert res["outliers_emitted"] == 2
   dates = [o["bucket_date"] for o in res["outliers"]]
   assert dates == ["2026-10-05", "2026-10-03"]
-  # Verify UDM events are stamped with each historical day's timestamp
-  summary_timestamps = sorted([
-      ev["metadata"]["event_timestamp"]
+  # One event per outlier day; all stamped with the sweep run time, scored day in a label
+  assert len(res["udm_events"]) == 2
+  assert {ev["metadata"]["event_timestamp"] for ev in res["udm_events"]} == {"2026-10-07T23:59:00Z"}
+  evaluated = sorted(
+      l["value"]
       for ev in res["udm_events"]
-      if ev["metadata"]["product_event_type"] == "BEHAVIORAL_RISK_RADAR_360"
-  ])
-  assert summary_timestamps == ["2026-10-03T23:59:00Z", "2026-10-05T23:59:00Z"]
+      for l in ev["target"]["resource"]["attribute"]["labels"]
+      if l["key"] == "Evaluated Day"
+  )
+  assert evaluated == ["2026-10-03", "2026-10-05"]
 
 
+
+@pytest.mark.anyio
+async def test_run_fleet_360_sweep_preserves_source_entity_casing(monkeypatch):
+  from datetime import datetime, timezone
+  from unittest.mock import AsyncMock
+  from src.config import TenantConfig
+
+  eng = RiskMetricsEngine(TenantConfig(project_id="p", customer_id="c"))
+
+  async def fake_execute(session, query, start_iso, end_iso):
+    if "network_flows_outbound" in query:
+      return {"stats": [{"host": "CYM-PROD-GCP-WIN01", "z": 4.0, "observed": 60, "baseline": 5.0, "dispersion": 3.0}]}
+    if "dns_queries_fail" in query:
+      return {"stats": [{"host": "cym-prod-gcp-win01", "z": 2.5, "observed": 9, "baseline": 2.0, "dispersion": 1.0}]}
+    return {"stats": []}
+
+  monkeypatch.setattr(eng.runner, "execute_query_via_mcp", fake_execute)
+  res = await eng.run_fleet_360_sweep(
+      session=AsyncMock(), entity_type="ASSET", inter_query_delay_sec=0.0,
+      ingest_events=False, now_utc=datetime(2026, 10, 8, 16, 0, 0, tzinfo=timezone.utc),
+  )
+
+  # Case variants merge into one entity (both sectors in D) ...
+  assert res["outliers_detected"] == 1
+  assert pytest.approx(res["outliers"][0]["composite_d"], 0.01) == math.sqrt(4.0**2 + 2.5**2)
+  # ... and the event carries the ID exactly as the source telemetry spelled it.
+  assert res["outliers"][0]["entity"] == "CYM-PROD-GCP-WIN01"
+  assert res["udm_events"][0]["principal"]["asset"]["hostname"] == "CYM-PROD-GCP-WIN01"

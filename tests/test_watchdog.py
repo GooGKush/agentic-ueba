@@ -715,7 +715,7 @@ async def test_watchdog_daemon_run_fleet_360_sweep_once_deduplicates_across_4h_r
   t1 = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
   t2 = datetime(2026, 10, 8, 16, 0, 0, tzinfo=timezone.utc)
 
-  # Pass 1 at 12:00Z -> emits 1 outlier (1 summary + 6 vector spokes = 7 UDM events)
+  # Pass 1 at 12:00Z -> emits 1 outlier (exactly 1 UDM event per outlier entity)
   res1 = await daemon.run_fleet_360_sweep_once(
       entity_types=("USER",),
       inter_query_delay_sec=0.0,
@@ -726,7 +726,7 @@ async def test_watchdog_daemon_run_fleet_360_sweep_once_deduplicates_across_4h_r
   assert res1["total_outliers_detected"] == 1
   assert res1["total_outliers_emitted"] == 1
   assert res1["total_outliers_suppressed_dedup"] == 0
-  assert res1["total_udm_events_generated"] == 7
+  assert res1["total_udm_events_generated"] == 1
 
   # Pass 2 at 16:00Z (4 hours later, same day, same vector spike) -> suppressed by intra-day deduplication
   res2 = await daemon.run_fleet_360_sweep_once(

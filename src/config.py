@@ -117,9 +117,6 @@ class TenantConfig(BaseModel):
   fleet_360_ingest_events: bool = Field(
       default_factory=lambda: os.environ.get("FLEET_360_INGEST_EVENTS", "true").lower() in ("true", "1", "yes")
   )
-  fleet_360_emit_all_spokes: bool = Field(
-      default_factory=lambda: os.environ.get("FLEET_360_EMIT_ALL_SPOKES", "true").lower() in ("true", "1", "yes")
-  )
 
   @property
   def mcp_url(self) -> str:
