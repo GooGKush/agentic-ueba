@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import httpx
 from mcp import ClientSession
@@ -33,6 +33,7 @@ except ImportError:
 
 from src.config import TenantConfig
 from src.models import JITHuntRequest, JITHuntResponse
+from src.risk_metrics_engine import RiskMetricsEngine
 from src.strategy_decider import StrategyDecider
 
 logger = logging.getLogger("WatchdogDaemon")
@@ -137,7 +138,7 @@ def _extract_entity_from_connector_events(events: List[Dict[str, Any]]) -> Optio
 
 
 class WatchdogState:
-  """Persistent state tracking for processed cases with sliding-window FIFO eviction."""
+  """Persistent state tracking for processed cases and intra-day 360 radar emissions."""
 
   def __init__(self, state_file: Optional[Path] = None, max_state_size: int = 2000, max_results: int = 1000):
     self.state_file = state_file or Path("data/watchdog_state.json")
@@ -147,6 +148,9 @@ class WatchdogState:
     self.last_scan_time: Optional[str] = None
     self.triaged_count: int = 0
     self.recent_results: List[Dict[str, Any]] = []
+    self.fleet_360_emissions: Dict[str, Dict[str, Any]] = {}
+    self.last_fleet_360_sweep_time: Optional[str] = None
+    self.fleet_360_sweeps: List[Dict[str, Any]] = []
     self.load()
 
   def load(self) -> None:
@@ -160,6 +164,13 @@ class WatchdogState:
         self.last_scan_time = data.get("last_scan_time")
         self.triaged_count = int(data.get("triaged_count", len(self.seen_case_ids)))
         self.recent_results = data.get("recent_results", [])
+        raw_emissions = data.get("fleet_360_emissions", {})
+        if isinstance(raw_emissions, dict):
+          self.fleet_360_emissions = raw_emissions
+        self.last_fleet_360_sweep_time = data.get("last_fleet_360_sweep_time")
+        raw_sweeps = data.get("fleet_360_sweeps", [])
+        if isinstance(raw_sweeps, list):
+          self.fleet_360_sweeps = raw_sweeps[-50:]
         logger.info(f"Loaded watchdog state with {len(self.seen_case_ids)} seen cases.")
       except Exception as e:
         logger.warning(f"Failed loading watchdog state file: {e}")
@@ -172,6 +183,9 @@ class WatchdogState:
           "last_scan_time": self.last_scan_time,
           "triaged_count": self.triaged_count,
           "recent_results": self.recent_results[-self.max_results:],
+          "fleet_360_emissions": self.fleet_360_emissions,
+          "last_fleet_360_sweep_time": self.last_fleet_360_sweep_time,
+          "fleet_360_sweeps": self.fleet_360_sweeps[-50:],
       }
       # Atomic file replacement prevents corrupted state writes during process interruption
       tmp_file = self.state_file.with_suffix(".tmp")
@@ -200,10 +214,83 @@ class WatchdogState:
   def is_seen(self, case_id: str) -> bool:
     return str(case_id) in self.seen_case_ids
 
+  def should_emit_fleet_360(
+      self,
+      bucket_date: str,
+      entity_type: str,
+      entity_id: str,
+      breached_sectors: List[str],
+      composite_d: float,
+      min_delta_d: float = 2.0,
+  ) -> bool:
+    """Intra-day deduplication check for 4-hour Mode A fleet 360 radar sweeps.
+
+    Returns True if:
+    - Entity has not been emitted yet on `bucket_date`, OR
+    - At least one sector in `breached_sectors` was not previously breached on `bucket_date`, OR
+    - The Euclidean composite distance D escalated by >= `min_delta_d` (+2.0 sigma).
+    """
+    key = f"{bucket_date}:{entity_type.upper()}:{entity_id.lower()}"
+    prev = self.fleet_360_emissions.get(key)
+    if not prev:
+      return True
+    prev_sectors = set(prev.get("breached_sectors", []))
+    if any(sec not in prev_sectors for sec in breached_sectors):
+      return True
+    prev_d = float(prev.get("composite_d", 0.0))
+    if (float(composite_d) - prev_d) >= min_delta_d:
+      return True
+    return False
+
+  def record_fleet_360_emission(
+      self,
+      bucket_date: str,
+      entity_type: str,
+      entity_id: str,
+      breached_sectors: List[str],
+      composite_d: float,
+      composite_cri: int,
+  ) -> None:
+    """Records an intra-day 360 radar emission for deduplication across 4-hour sweeps."""
+    key = f"{bucket_date}:{entity_type.upper()}:{entity_id.lower()}"
+    prev = self.fleet_360_emissions.get(key, {})
+    merged_sectors = sorted(set(prev.get("breached_sectors", [])) | set(breached_sectors))
+    prev_d = float(prev.get("composite_d", 0.0))
+    prev_cri = int(prev.get("composite_cri", 0))
+    self.fleet_360_emissions[key] = {
+        "bucket_date": bucket_date,
+        "entity_type": entity_type.upper(),
+        "entity_id": entity_id.lower(),
+        "breached_sectors": merged_sectors,
+        "composite_d": round(max(prev_d, float(composite_d)), 2),
+        "composite_cri": max(prev_cri, int(composite_cri)),
+        "emission_count": int(prev.get("emission_count", 0)) + 1,
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    # Evict oldest entries if dictionary grows beyond max_state_size
+    while len(self.fleet_360_emissions) > self.max_state_size:
+      oldest_key = next(iter(self.fleet_360_emissions))
+      self.fleet_360_emissions.pop(oldest_key, None)
+    self.save()
+
+  def record_fleet_360_sweep(self, sweep_summary: Dict[str, Any]) -> None:
+    """Persists summary telemetry for a completed fleetwide 360 radar sweep."""
+    self.last_fleet_360_sweep_time = (
+        sweep_summary.get("timestamp")
+        or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    self.fleet_360_sweeps.append(sweep_summary)
+    if len(self.fleet_360_sweeps) > 50:
+      self.fleet_360_sweeps = self.fleet_360_sweeps[-50:]
+    self.save()
+
   def reset(self) -> None:
     self.seen_case_ids.clear()
     self.recent_results.clear()
     self.triaged_count = 0
+    self.fleet_360_emissions.clear()
+    self.fleet_360_sweeps.clear()
+    self.last_fleet_360_sweep_time = None
     self.save()
 
   def get_activity_report(
@@ -326,13 +413,17 @@ class WatchdogDaemon:
     self.scan_lookback_hours = getattr(self.tenant, "watchdog_scan_lookback_hours", 4)
     self.worker_concurrency = getattr(self.tenant, "watchdog_worker_concurrency", 3)
     self.queue_size = getattr(self.tenant, "watchdog_queue_size", 100)
+    self.fleet_360_enabled = getattr(self.tenant, "fleet_360_enabled", True)
+    self.fleet_360_interval_seconds = getattr(self.tenant, "fleet_360_interval_seconds", 14400)
 
     self._scan_task: Optional[asyncio.Task] = None
+    self._fleet_360_task: Optional[asyncio.Task] = None
     self._task: Optional[asyncio.Task] = None  # Backward-compatibility alias
     self._workers: List[asyncio.Task] = []
     self._work_queue: Optional[asyncio.Queue] = None
     self._in_flight_case_ids: Set[str] = set()
     self._scan_lock = asyncio.Lock()
+    self._fleet_360_lock = asyncio.Lock()
     self._active_worker_count = 0
     self._is_running = False
 
@@ -341,7 +432,7 @@ class WatchdogDaemon:
     return self._is_running and self._scan_task is not None and not self._scan_task.done()
 
   def start(self) -> Dict[str, Any]:
-    """Starts the background producer-consumer monitoring loop and worker pool."""
+    """Starts the background producer-consumer monitoring loop, worker pool, and 4h fleet 360 sweep."""
     if self.is_running:
       return {"status": "ALREADY_RUNNING", "interval_seconds": self.interval_seconds}
 
@@ -353,15 +444,20 @@ class WatchdogDaemon:
     ]
     self._scan_task = asyncio.create_task(self._run_loop())
     self._task = self._scan_task
+    if self.fleet_360_enabled:
+      self._fleet_360_task = asyncio.create_task(self._fleet_360_loop())
     logger.info(
         f"Watchdog daemon started. Polling every {self.interval_seconds}s "
-        f"with {self.worker_concurrency} workers (queue capacity {self.queue_size})."
+        f"with {self.worker_concurrency} workers (queue capacity {self.queue_size}, "
+        f"fleet_360_enabled={self.fleet_360_enabled}, fleet_360_interval={self.fleet_360_interval_seconds}s)."
     )
     return {
         "status": "STARTED",
         "interval_seconds": self.interval_seconds,
         "worker_concurrency": self.worker_concurrency,
         "queue_size": self.queue_size,
+        "fleet_360_enabled": self.fleet_360_enabled,
+        "fleet_360_interval_seconds": self.fleet_360_interval_seconds,
     }
 
   def stop(self) -> Dict[str, Any]:
@@ -372,6 +468,8 @@ class WatchdogDaemon:
     self._is_running = False
     if self._scan_task and not self._scan_task.done():
       self._scan_task.cancel()
+    if self._fleet_360_task and not self._fleet_360_task.done():
+      self._fleet_360_task.cancel()
     for w in self._workers:
       if not w.done():
         w.cancel()
@@ -397,6 +495,11 @@ class WatchdogDaemon:
         "seen_cases_count": len(self.state.seen_case_ids),
         "seen_case_ids": list(self.state.seen_case_ids.keys()),
         "recent_results": self.state.recent_results[-10:],
+        "fleet_360_enabled": self.fleet_360_enabled,
+        "fleet_360_interval_seconds": self.fleet_360_interval_seconds,
+        "last_fleet_360_sweep_time": self.state.last_fleet_360_sweep_time,
+        "fleet_360_tracked_entities": len(self.state.fleet_360_emissions),
+        "fleet_360_recent_sweeps": self.state.fleet_360_sweeps[-5:],
     }
 
   async def _worker_loop(self, worker_id: int) -> None:
@@ -795,3 +898,158 @@ class WatchdogDaemon:
         await asyncio.sleep(self.interval_seconds)
       except asyncio.CancelledError:
         break
+
+  async def run_fleet_360_sweep_once(
+      self,
+      entity_types: Sequence[str] = ("USER", "ASSET"),
+      spike_threshold_z: Optional[float] = None,
+      spoke_inclusion_z: Optional[float] = None,
+      min_observed: Optional[int] = None,
+      max_outliers_per_sector: Optional[int] = None,
+      inter_query_delay_sec: Optional[float] = None,
+      ingest_events: Optional[bool] = None,
+      emit_all_spokes: Optional[bool] = None,
+      now_utc: Optional[datetime] = None,
+      lookback_days: int = 1,
+      mcp_session: Optional[Any] = None,
+  ) -> Dict[str, Any]:
+    """Executes a single fleetwide 360° behavioral risk radar sweep across requested entity types.
+
+    Guarded by an asyncio.Lock to prevent overlapping sweeps.
+    Applies intra-day deduplication via WatchdogState so entities are only re-emitted
+    on the same UTC bucket date if a new sector breaches >= 3.0σ or Composite D escalates by >= +2.0σ.
+    """
+    if self._fleet_360_lock.locked():
+      logger.warning("Fleet 360 radar sweep is already in progress. Skipping concurrent run.")
+      return {"status": "SKIPPED_CONCURRENT"}
+
+    async with self._fleet_360_lock:
+      return await self._do_fleet_360_sweep(
+          entity_types=entity_types,
+          spike_threshold_z=spike_threshold_z,
+          spoke_inclusion_z=spoke_inclusion_z,
+          min_observed=min_observed,
+          max_outliers_per_sector=max_outliers_per_sector,
+          inter_query_delay_sec=inter_query_delay_sec,
+          ingest_events=ingest_events,
+          emit_all_spokes=emit_all_spokes,
+          now_utc=now_utc,
+          lookback_days=lookback_days,
+          mcp_session=mcp_session,
+      )
+
+  async def _do_fleet_360_sweep(
+      self,
+      entity_types: Sequence[str] = ("USER", "ASSET"),
+      spike_threshold_z: Optional[float] = None,
+      spoke_inclusion_z: Optional[float] = None,
+      min_observed: Optional[int] = None,
+      max_outliers_per_sector: Optional[int] = None,
+      inter_query_delay_sec: Optional[float] = None,
+      ingest_events: Optional[bool] = None,
+      emit_all_spokes: Optional[bool] = None,
+      now_utc: Optional[datetime] = None,
+      lookback_days: int = 1,
+      mcp_session: Optional[Any] = None,
+  ) -> Dict[str, Any]:
+    sweep_ts = (now_utc or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    risk_engine: RiskMetricsEngine = (
+        getattr(self.engine, "risk_engine", None) or RiskMetricsEngine(self.tenant)
+    )
+
+    async def _run_with_session(session: Any) -> Dict[str, Any]:
+      reports_by_type: Dict[str, Any] = {}
+      total_outliers = 0
+      total_emitted = 0
+      total_suppressed = 0
+      total_events = 0
+
+      for et in entity_types:
+        et_norm = str(et).upper().strip()
+        rep = await risk_engine.run_fleet_360_sweep(
+            session=session,
+            entity_type=et_norm,
+            spike_threshold_z=spike_threshold_z,
+            spoke_inclusion_z=spoke_inclusion_z,
+            min_observed=min_observed,
+            max_outliers_per_sector=max_outliers_per_sector,
+            inter_query_delay_sec=inter_query_delay_sec,
+            ingest_events=ingest_events,
+            emit_all_spokes=emit_all_spokes,
+            now_utc=now_utc,
+            lookback_days=lookback_days,
+            should_emit_fn=self.state.should_emit_fleet_360,
+            record_emit_fn=self.state.record_fleet_360_emission,
+        )
+        reports_by_type[et_norm] = rep
+        total_outliers += int(rep.get("outliers_detected", 0))
+        total_emitted += int(rep.get("outliers_emitted", 0))
+        total_suppressed += int(rep.get("outliers_suppressed_dedup", 0))
+        total_events += int(rep.get("udm_events_generated", 0))
+
+      combined = {
+          "status": "SUCCESS",
+          "timestamp": sweep_ts,
+          "entity_types": [str(e).upper().strip() for e in entity_types],
+          "total_outliers_detected": total_outliers,
+          "total_outliers_emitted": total_emitted,
+          "total_outliers_suppressed_dedup": total_suppressed,
+          "total_udm_events_generated": total_events,
+          "sweeps_by_entity_type": reports_by_type,
+      }
+      self.state.record_fleet_360_sweep({
+          "timestamp": sweep_ts,
+          "entity_types": combined["entity_types"],
+          "total_outliers_detected": total_outliers,
+          "total_outliers_emitted": total_emitted,
+          "total_outliers_suppressed_dedup": total_suppressed,
+          "total_udm_events_generated": total_events,
+      })
+      return combined
+
+    if mcp_session is not None:
+      return await _run_with_session(mcp_session)
+
+    if not self.tenant.project_id or not self.tenant.customer_id:
+      logger.warning(
+          "Fleet 360 radar sweep paused: Missing required Chronicle configuration "
+          f"(project_id='{self.tenant.project_id}', customer_id='{self.tenant.customer_id}')."
+      )
+      return {"status": "SKIPPED_MISSING_CONFIG", "timestamp": sweep_ts}
+
+    headers = self.tenant.get_auth_headers()
+    custom_timeout = httpx.Timeout(30.0, read=120.0, write=120.0, pool=120.0)
+
+    async with httpx.AsyncClient(headers=headers, timeout=custom_timeout, follow_redirects=True):
+      def _create_mcp_context():
+        try:
+          return streamable_http_client(
+              self.tenant.mcp_url, headers=headers, timeout=60.0, sse_read_timeout=300.0
+          )
+        except TypeError:
+          return streamable_http_client(self.tenant.mcp_url, headers=headers)
+
+      mcp_context = _create_mcp_context()
+      async with mcp_context as streams, ClientSession(streams[0], streams[1]) as session:
+        await session.initialize()
+        return await _run_with_session(session)
+
+  async def _fleet_360_loop(self) -> None:
+    """Background 4-hour scheduler loop executing fleetwide Mode A 360° radar sweeps."""
+    logger.info(
+        f"Fleet 360 radar scheduler started (interval={self.fleet_360_interval_seconds}s)."
+    )
+    while self._is_running:
+      try:
+        await self.run_fleet_360_sweep_once()
+      except asyncio.CancelledError:
+        logger.info("Fleet 360 radar scheduler loop cancelled.")
+        break
+      except Exception as e:
+        logger.error(f"Error in fleet 360 radar sweep: {_unwrap_exception(e)}")
+
+      try:
+        await asyncio.sleep(self.fleet_360_interval_seconds)
+      except asyncio.CancelledError:
+        break
+

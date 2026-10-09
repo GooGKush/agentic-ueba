@@ -93,6 +93,33 @@ class TenantConfig(BaseModel):
   watchdog_queue_size: int = Field(
       default_factory=lambda: int(os.environ.get("WATCHDOG_QUEUE_SIZE", "100"))
   )
+  fleet_360_enabled: bool = Field(
+      default_factory=lambda: os.environ.get("FLEET_360_ENABLED", "false").lower() in ("true", "1", "yes")
+  )
+  fleet_360_interval_seconds: int = Field(
+      default_factory=lambda: int(os.environ.get("FLEET_360_INTERVAL_SECONDS", "14400"))
+  )
+  fleet_360_spike_threshold_z: float = Field(
+      default_factory=lambda: float(os.environ.get("FLEET_360_SPIKE_THRESHOLD_Z", "3.0"))
+  )
+  fleet_360_spoke_inclusion_z: float = Field(
+      default_factory=lambda: float(os.environ.get("FLEET_360_SPOKE_INCLUSION_Z", "2.0"))
+  )
+  fleet_360_min_observed: int = Field(
+      default_factory=lambda: int(os.environ.get("FLEET_360_MIN_OBSERVED", "5"))
+  )
+  fleet_360_max_outliers_per_sector: int = Field(
+      default_factory=lambda: int(os.environ.get("FLEET_360_MAX_OUTLIERS_PER_SECTOR", "250"))
+  )
+  fleet_360_inter_query_delay_sec: float = Field(
+      default_factory=lambda: float(os.environ.get("FLEET_360_INTER_QUERY_DELAY_SEC", "1.5"))
+  )
+  fleet_360_ingest_events: bool = Field(
+      default_factory=lambda: os.environ.get("FLEET_360_INGEST_EVENTS", "true").lower() in ("true", "1", "yes")
+  )
+  fleet_360_emit_all_spokes: bool = Field(
+      default_factory=lambda: os.environ.get("FLEET_360_EMIT_ALL_SPOKES", "true").lower() in ("true", "1", "yes")
+  )
 
   @property
   def mcp_url(self) -> str:

@@ -117,6 +117,31 @@ async def profile_360_risk(
 
 
 @mcp.tool()
+async def run_fleet_360_sweep(
+    entity_types: str = "USER,ASSET",
+    spike_threshold_z: float = 3.0,
+    spoke_inclusion_z: float = 2.0,
+    min_observed: int = 5,
+    max_outliers_per_sector: int = 250,
+    ingest_events: bool = True,
+    emit_all_spokes: bool = True,
+    lookback_days: int = 1,
+) -> Dict[str, Any]:
+  """Executes a deterministic Mode A fleetwide 360° behavioral risk radar sweep across all entities and emits Composite Summary + Per-Vector UDM events for any entity with a vector spike >= spike_threshold_z."""
+  types_list = [t.strip().upper() for t in entity_types.split(",") if t.strip()]
+  return await watchdog.run_fleet_360_sweep_once(
+      entity_types=types_list or ["USER", "ASSET"],
+      spike_threshold_z=spike_threshold_z,
+      spoke_inclusion_z=spoke_inclusion_z,
+      min_observed=min_observed,
+      max_outliers_per_sector=max_outliers_per_sector,
+      ingest_events=ingest_events,
+      emit_all_spokes=emit_all_spokes,
+      lookback_days=lookback_days,
+  )
+
+
+@mcp.tool()
 async def scan_open_cases(limit: int = 5) -> Dict[str, Any]:
   """Watchdog: Scans open SecOps cases, inspects alert telemetry, and executes autonomous hunts."""
   results = await engine.scan_and_triage_cases(limit=limit)
@@ -472,6 +497,42 @@ async def watchdog_reset_endpoint(request: Request) -> JSONResponse:
   """Resets seen cases in watchdog state to allow re-triaging."""
   watchdog.state.reset()
   return JSONResponse({"status": "RESET_SUCCESSFUL"}, status_code=200)
+
+
+@mcp.custom_route("/api/v1/radar/fleet-sweep", methods=["POST"])
+async def fleet_360_sweep_endpoint(request: Request) -> JSONResponse:
+  """REST endpoint to trigger a Mode A fleetwide 360° behavioral risk radar sweep."""
+  try:
+    body = await request.json() if await request.body() else {}
+    raw_types = body.get("entity_types", ["USER", "ASSET"])
+    if isinstance(raw_types, str):
+      entity_types = [t.strip().upper() for t in raw_types.split(",") if t.strip()]
+    else:
+      entity_types = [str(t).strip().upper() for t in raw_types if str(t).strip()]
+    res = await watchdog.run_fleet_360_sweep_once(
+        entity_types=entity_types or ["USER", "ASSET"],
+        spike_threshold_z=(
+            float(body["spike_threshold_z"]) if "spike_threshold_z" in body else None
+        ),
+        spoke_inclusion_z=(
+            float(body["spoke_inclusion_z"]) if "spoke_inclusion_z" in body else None
+        ),
+        min_observed=int(body["min_observed"]) if "min_observed" in body else None,
+        max_outliers_per_sector=(
+            int(body["max_outliers_per_sector"])
+            if "max_outliers_per_sector" in body
+            else None
+        ),
+        ingest_events=bool(body["ingest_events"]) if "ingest_events" in body else None,
+        emit_all_spokes=(
+            bool(body["emit_all_spokes"]) if "emit_all_spokes" in body else None
+        ),
+        lookback_days=int(body["lookback_days"]) if "lookback_days" in body else 1,
+    )
+    return JSONResponse(res, status_code=200)
+  except Exception as e:
+    logger.exception(f"Fleet 360 radar sweep failed: {e}")
+    return JSONResponse({"status": "ERROR", "error_message": str(e)}, status_code=500)
 
 
 # Build standard ASGI app supporting both MCP SSE and HTTP REST routes

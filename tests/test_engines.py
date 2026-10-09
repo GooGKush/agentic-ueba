@@ -1141,3 +1141,282 @@ def test_case_triage_tagging_taxonomy_and_watchdog_filtering(tmp_path):
   assert second_order_report["cases"][0]["case_id"] == "1001"
 
 
+def test_fleet_360_sector_queries_structure_and_gating():
+  eng = RiskMetricsEngine()
+  user_queries = eng.build_fleet_360_sector_queries(
+      entity_type="USER", min_z=2.0, min_obs=5
+  )
+  assert set(user_queries.keys()) == {"Auth", "Cloud", "Workspace", "Egress", "DNS", "Web"}
+  for sector, q in user_queries.items():
+    assert "condition:" in q, f"Missing root condition in {sector}"
+    assert "$z >= 2.00 and $observed >=" in q
+    assert "$user =" in q
+    assert "$baseline =" in q
+    assert "$dispersion =" in q
+
+  asset_queries = eng.build_fleet_360_sector_queries(
+      entity_type="ASSET", min_z=2.0, min_obs=5
+  )
+  assert set(asset_queries.keys()) == {"Auth", "Egress", "DNS", "Flows", "Alerts", "Web"}
+  for sector, q in asset_queries.items():
+    assert "$z >= 2.00 and $observed >=" in q
+    assert "principal.asset.hostname" in q or "target.asset.hostname" in q
+    assert "$host =" in q
+
+
+def test_mode_a_today_window_and_midnight_rollover_guard():
+  from datetime import datetime, timezone
+
+  # 1. Normal daytime UTC run (14:30Z) -> evaluates today's partial UTC bucket
+  start_iso, end_iso, bucket_date = RiskMetricsEngine._mode_a_today_window(
+      datetime(2026, 10, 8, 14, 30, 0, tzinfo=timezone.utc)
+  )
+  assert start_iso == "2026-10-08T00:00:00Z"
+  assert end_iso == "2026-10-08T14:30:00Z"
+  assert bucket_date == "2026-10-08"
+
+  # 2. Midnight rollover guard (00:12Z) -> evaluates yesterday's full 24h UTC bucket
+  start_roll, end_roll, bucket_roll = RiskMetricsEngine._mode_a_today_window(
+      datetime(2026, 10, 8, 0, 12, 0, tzinfo=timezone.utc)
+  )
+  assert start_roll == "2026-10-07T00:00:00Z"
+  assert end_roll == "2026-10-07T23:59:59Z"
+  assert bucket_roll == "2026-10-07"
+
+
+def test_build_360_outlier_event_bundle_schema_and_validation():
+  eng = RiskMetricsEngine()
+  eng.runner._ensure_skill_path()
+  from scripts import chronicle_ingest
+
+  sector_stats = {
+      "Auth": {"z": 2.2, "obs": 12.0, "avg": 3.0, "std": 2.0},
+      "Cloud": {"z": 0.0, "obs": 0.0, "avg": 0.0, "std": 0.0},
+      "Workspace": {"z": 4.8, "obs": 95.0, "avg": 8.0, "std": 6.0},
+      "Egress": {"z": 3.5, "obs": 50000000.0, "avg": 2000000.0, "std": 1500000.0},
+      "DNS": {"z": 0.0, "obs": 0.0, "avg": 0.0, "std": 0.0},
+      "Web": {"z": 0.0, "obs": 0.0, "avg": 0.0, "std": 0.0},
+  }
+  # D = sqrt(2.2^2 + 4.8^2 + 3.5^2) = sqrt(4.84 + 23.04 + 12.25) = sqrt(40.13) = 6.33
+  composite_d = eng.runner.compute_euclidean_distance(
+      {k: v["z"] for k, v in sector_stats.items()}
+  )
+  composite_cri = eng.runner.calculate_cri(composite_d)
+
+  bundle = eng.build_360_outlier_event_bundle(
+      entity_id="alex.mercer",
+      entity_type="USER",
+      sectors=sector_stats,
+      composite_d=composite_d,
+      composite_cri=composite_cri,
+      campaign_id="sweep-360-user-2026-10-08-160000",
+      start_iso="2026-10-08T00:00:00Z",
+      end_iso="2026-10-08T16:00:00Z",
+      spike_threshold_z=3.0,
+      emit_all_spokes=True,
+  )
+
+  # 1 Summary Event + 6 sector spokes (when emit_all_spokes=True)
+  assert len(bundle) == 7
+  summary_ev = bundle[0]
+  assert summary_ev["metadata"]["product_event_type"] == "BEHAVIORAL_RISK_RADAR_360"
+  assert summary_ev["principal"]["user"]["userid"] == "alex.mercer"
+  assert summary_ev["security_result"][0]["risk_score"] == composite_cri
+  assert isinstance(summary_ev["security_result"][0]["risk_score"], int)
+
+  det_fields = summary_ev["security_result"][0]["detection_fields"]
+  breached_vals = [df["value"] for df in det_fields if df["key"] == "breached_vector"]
+  assert breached_vals == ["WORKSPACE", "EGRESS"]
+  det_map = {df["key"]: df["value"] for df in det_fields if df["key"] != "breached_vector"}
+  assert det_map["cri_workspace"] == str(eng.runner.calculate_cri(4.8))
+  assert det_map["cri_egress"] == str(eng.runner.calculate_cri(3.5))
+  assert det_map["cri_auth"] == str(eng.runner.calculate_cri(2.2))
+
+  # Verify per-vector spoke events carry native int32 risk_score = vector CRI
+  spoke_events = bundle[1:]
+  assert all(
+      ev["metadata"]["product_event_type"] == "BEHAVIORAL_RISK_VECTOR_SPIKE"
+      for ev in spoke_events
+  )
+  spoke_by_sector = {ev["target"]["resource"]["name"]: ev for ev in spoke_events}
+  assert spoke_by_sector["VECTOR:WORKSPACE"]["security_result"][0]["risk_score"] == eng.runner.calculate_cri(4.8)
+  assert spoke_by_sector["VECTOR:EGRESS"]["security_result"][0]["risk_score"] == eng.runner.calculate_cri(3.5)
+  assert spoke_by_sector["VECTOR:AUTH"]["security_result"][0]["risk_score"] == eng.runner.calculate_cri(2.2)
+
+  # Validate all generated UDM events against Chronicle schema validator
+  validation_errors = chronicle_ingest.validate_events(bundle)
+  assert validation_errors == []
+
+
+@pytest.mark.anyio
+async def test_run_fleet_360_sweep_euclidean_aggregation_and_circuit_breaker(monkeypatch):
+  from datetime import datetime, timezone
+  from unittest.mock import AsyncMock
+  from src.config import TenantConfig
+
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  eng = RiskMetricsEngine(tenant)
+
+  # Simulate sector responses:
+  # - Workspace has 1 entity (alice) at Z=4.0
+  # - Auth has alice at Z=2.5 (secondary spoke) and bob at Z=2.6 (only < 3.0, should NOT trigger outlier emission)
+  # - DNS has 5 entities (exceeding max_outliers_per_sector=3 -> circuit breaker trips on DNS!)
+  async def fake_execute(session, query, start_iso, end_iso):
+    if "workspace_total_download_actions" in query:
+      return {
+          "stats": [
+              {"user": "alice", "z": 4.0, "observed": 60, "baseline": 5.0, "dispersion": 3.0}
+          ]
+      }
+    if "auth_attempts_fail" in query:
+      return {
+          "stats": [
+              {"user": "alice", "z": 2.5, "observed": 15, "baseline": 2.0, "dispersion": 2.0},
+              {"user": "bob", "z": 2.6, "observed": 12, "baseline": 2.0, "dispersion": 1.5},
+          ]
+      }
+    if "dns_queries_fail" in query:
+      return {
+          "stats": [
+              {"user": f"user_{i}", "z": 3.8, "observed": 50, "baseline": 2.0, "dispersion": 1.0}
+              for i in range(5)
+          ]
+      }
+    return {"stats": []}
+
+  monkeypatch.setattr(eng.runner, "execute_query_via_mcp", fake_execute)
+
+  ingested_batches = []
+  def fake_ingest(events):
+    ingested_batches.append(events)
+    return {"status": "SUCCESS", "events_ingested": len(events), "batches": 1}
+
+  monkeypatch.setattr(eng, "ingest_udm_events", fake_ingest)
+
+  res = await eng.run_fleet_360_sweep(
+      session=AsyncMock(),
+      entity_type="USER",
+      spike_threshold_z=3.0,
+      spoke_inclusion_z=2.0,
+      min_observed=5,
+      max_outliers_per_sector=3,
+      inter_query_delay_sec=0.0,
+      ingest_events=True,
+      emit_all_spokes=False,
+      now_utc=datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc),
+  )
+
+  # DNS should be tripped by circuit breaker (5 rows >= 3.0, limit is 3 -> 5 > 3)
+  assert "DNS" in res["suppressed_sectors"]
+  # Bob only had Z=2.6 (< 3.0 spike_threshold_z), so only Alice qualifies as a true outlier
+  assert res["outliers_detected"] == 1
+  assert res["outliers_emitted"] == 1
+  alice_rec = res["outliers"][0]
+  assert alice_rec["entity"] == "alice"
+  # Alice's Euclidean D combines Workspace (4.0) + Auth (2.5): sqrt(16 + 6.25) = sqrt(22.25) = 4.72
+  assert pytest.approx(alice_rec["composite_d"], 0.01) == math.sqrt(4.0**2 + 2.5**2)
+  assert alice_rec["breached_sectors"] == ["WORKSPACE"]
+  # With emit_all_spokes=False: 1 summary event + 2 active spokes (Workspace, Auth) = 3 UDM events
+  assert res["udm_events_generated"] == 3
+  assert len(ingested_batches) == 1
+  assert len(ingested_batches[0]) == 3
+
+
+@pytest.mark.anyio
+async def test_run_fleet_360_sweep_multiday_backfill_time_buckets(monkeypatch):
+  from datetime import datetime, timezone
+  from unittest.mock import AsyncMock
+  from src.config import TenantConfig
+
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  eng = RiskMetricsEngine(tenant)
+
+  # Simulate Chronicle columnar stats response with timestampVal in TIME_BUCKET across 2 days
+  async def fake_execute(session, query, start_iso, end_iso):
+    if "http_queries_total" in query:
+      return {
+          "stats": {
+              "results": [
+                  {
+                      "column": "user",
+                      "values": [
+                          {"value": {"stringVal": "admin@gus.joonix.net"}},
+                          {"value": {"stringVal": "admin@gus.joonix.net"}},
+                      ],
+                  },
+                  {
+                      "column": "TIME_BUCKET",
+                      "values": [
+                          {"value": {"timestampVal": "2026-10-03T00:00:00Z"}},
+                          {"value": {"timestampVal": "2026-10-05T00:00:00Z"}},
+                      ],
+                  },
+                  {
+                      "column": "z",
+                      "values": [
+                          {"value": {"doubleVal": 4.2}},
+                          {"value": {"doubleVal": 7.0}},
+                      ],
+                  },
+                  {
+                      "column": "observed",
+                      "values": [
+                          {"value": {"int64Val": "42"}},
+                          {"value": {"int64Val": "70"}},
+                      ],
+                  },
+                  {
+                      "column": "baseline",
+                      "values": [
+                          {"value": {"doubleVal": 10.0}},
+                          {"value": {"doubleVal": 10.0}},
+                      ],
+                  },
+                  {
+                      "column": "dispersion",
+                      "values": [
+                          {"value": {"doubleVal": 5.0}},
+                          {"value": {"doubleVal": 5.0}},
+                      ],
+                  },
+              ]
+          }
+      }
+    return {"stats": []}
+
+  monkeypatch.setattr(eng.runner, "execute_query_via_mcp", fake_execute)
+  monkeypatch.setattr(
+      eng,
+      "ingest_udm_events",
+      lambda events: {"status": "SUCCESS", "events_ingested": len(events), "batches": 1},
+  )
+
+  res = await eng.run_fleet_360_sweep(
+      session=AsyncMock(),
+      entity_type="USER",
+      spike_threshold_z=3.0,
+      spoke_inclusion_z=2.0,
+      min_observed=5,
+      inter_query_delay_sec=0.0,
+      ingest_events=True,
+      emit_all_spokes=True,
+      now_utc=datetime(2026, 10, 7, 23, 59, 0, tzinfo=timezone.utc),
+      lookback_days=7,
+  )
+
+  assert res["window"]["start"] == "2026-10-01T00:00:00Z"
+  assert res["window"]["end"] == "2026-10-07T23:59:00Z"
+  assert res["window"]["lookback_days"] == 7
+  assert res["outliers_detected"] == 2
+  assert res["outliers_emitted"] == 2
+  dates = [o["bucket_date"] for o in res["outliers"]]
+  assert dates == ["2026-10-05", "2026-10-03"]
+  # Verify UDM events are stamped with each historical day's timestamp
+  summary_timestamps = sorted([
+      ev["metadata"]["event_timestamp"]
+      for ev in res["udm_events"]
+      if ev["metadata"]["product_event_type"] == "BEHAVIORAL_RISK_RADAR_360"
+  ])
+  assert summary_timestamps == ["2026-10-03T23:59:00Z", "2026-10-05T23:59:00Z"]
+
+
