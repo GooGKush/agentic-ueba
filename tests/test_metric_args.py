@@ -30,6 +30,8 @@ def _render_all():
     await eng.run_cloud_crud_surge(None, "user.a")
 
   asyncio.run(main())
+  captured.extend(eng.build_fleet_360_sector_queries(entity_type="USER").values())
+  captured.extend(eng.build_fleet_360_sector_queries(entity_type="ASSET").values())
   captured.append(eng._render_rare_destination_ecg_query("dns_queries_total"))
   captured.append(eng._render_rare_destination_ecg_query("network_bytes_outbound"))
   captured.append(eng._render_fusion_rare_destination_query())

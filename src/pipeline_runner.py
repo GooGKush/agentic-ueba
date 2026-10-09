@@ -182,7 +182,7 @@ class PipelineRunner:
         vals = []
         for cell in col_entry.get("values", []):
           val_obj = cell.get("value", {}) if isinstance(cell, dict) else {}
-          for k in ("doubleVal", "int64Val", "stringVal", "boolVal", "uint64Val"):
+          for k in ("doubleVal", "int64Val", "stringVal", "boolVal", "uint64Val", "timestampVal"):
             if k in val_obj and val_obj[k] is not None:
               vals.append(val_obj[k])
               break

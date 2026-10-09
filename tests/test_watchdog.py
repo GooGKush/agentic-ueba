@@ -612,4 +612,131 @@ async def test_watchdog_connector_events_extraction_fallback(tmp_path, monkeypat
   assert call_args.entity_type == "IP"
 
 
+def test_watchdog_state_fleet_360_intraday_deduplication(tmp_path):
+  state_file = tmp_path / "fleet_dedup_state.json"
+  state = WatchdogState(state_file=state_file)
 
+  # 1. First time seeing user on 2026-10-08 -> emit
+  assert state.should_emit_fleet_360(
+      bucket_date="2026-10-08",
+      entity_type="USER",
+      entity_id="alice",
+      breached_sectors=["Workspace"],
+      composite_d=3.5,
+  ) is True
+
+  state.record_fleet_360_emission(
+      bucket_date="2026-10-08",
+      entity_type="USER",
+      entity_id="alice",
+      breached_sectors=["Workspace"],
+      composite_d=3.5,
+      composite_cri=61,
+  )
+
+  # 2. Next 4-hour sweep on same UTC date with same breached sector and small delta D (+0.3 < 2.0) -> suppress
+  assert state.should_emit_fleet_360(
+      bucket_date="2026-10-08",
+      entity_type="USER",
+      entity_id="alice",
+      breached_sectors=["Workspace"],
+      composite_d=3.8,
+  ) is False
+
+  # 3. Same UTC date, but a NEW sector ("Egress") breaches >= 3.0 sigma -> emit
+  assert state.should_emit_fleet_360(
+      bucket_date="2026-10-08",
+      entity_type="USER",
+      entity_id="alice",
+      breached_sectors=["Workspace", "Egress"],
+      composite_d=4.8,
+  ) is True
+
+  state.record_fleet_360_emission(
+      bucket_date="2026-10-08",
+      entity_type="USER",
+      entity_id="alice",
+      breached_sectors=["Workspace", "Egress"],
+      composite_d=4.8,
+      composite_cri=78,
+  )
+
+  # 4. Same UTC date and same sectors, but Composite D escalates by >= +2.0 sigma (4.8 -> 7.0) -> emit
+  assert state.should_emit_fleet_360(
+      bucket_date="2026-10-08",
+      entity_type="USER",
+      entity_id="alice",
+      breached_sectors=["Workspace", "Egress"],
+      composite_d=7.0,
+  ) is True
+
+  # 5. Next UTC day (2026-10-09) -> fresh bucket date, emit
+  assert state.should_emit_fleet_360(
+      bucket_date="2026-10-09",
+      entity_type="USER",
+      entity_id="alice",
+      breached_sectors=["Workspace"],
+      composite_d=3.4,
+  ) is True
+
+
+@pytest.mark.anyio
+async def test_watchdog_daemon_run_fleet_360_sweep_once_deduplicates_across_4h_runs(
+    tmp_path, monkeypatch
+):
+  from datetime import datetime, timezone
+  from src.risk_metrics_engine import RiskMetricsEngine
+
+  state_file = tmp_path / "daemon_fleet_state.json"
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  risk_eng = RiskMetricsEngine(tenant)
+
+  mock_hunter = MagicMock()
+  mock_hunter.risk_engine = risk_eng
+  daemon = WatchdogDaemon(engine=mock_hunter, tenant_config=tenant, state_file=state_file)
+
+  async def fake_execute(session, query, start_iso, end_iso):
+    if "workspace_total_download_actions" in query:
+      return {
+          "stats": [
+              {"entity": "insider.bob", "z": 3.6, "observed": 45, "baseline_avg": 4.0, "baseline_std": 2.0}
+          ]
+      }
+    return {"stats": []}
+
+  monkeypatch.setattr(risk_eng.runner, "execute_query_via_mcp", fake_execute)
+  monkeypatch.setattr(
+      risk_eng,
+      "ingest_udm_events",
+      lambda events: {"status": "SUCCESS", "events_ingested": len(events), "batches": 1},
+  )
+
+  mock_session = AsyncMock()
+  t1 = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
+  t2 = datetime(2026, 10, 8, 16, 0, 0, tzinfo=timezone.utc)
+
+  # Pass 1 at 12:00Z -> emits 1 outlier (1 summary + 6 vector spokes = 7 UDM events)
+  res1 = await daemon.run_fleet_360_sweep_once(
+      entity_types=("USER",),
+      inter_query_delay_sec=0.0,
+      now_utc=t1,
+      mcp_session=mock_session,
+  )
+  assert res1["status"] == "SUCCESS"
+  assert res1["total_outliers_detected"] == 1
+  assert res1["total_outliers_emitted"] == 1
+  assert res1["total_outliers_suppressed_dedup"] == 0
+  assert res1["total_udm_events_generated"] == 7
+
+  # Pass 2 at 16:00Z (4 hours later, same day, same vector spike) -> suppressed by intra-day deduplication
+  res2 = await daemon.run_fleet_360_sweep_once(
+      entity_types=("USER",),
+      inter_query_delay_sec=0.0,
+      now_utc=t2,
+      mcp_session=mock_session,
+  )
+  assert res2["status"] == "SUCCESS"
+  assert res2["total_outliers_detected"] == 1
+  assert res2["total_outliers_emitted"] == 0
+  assert res2["total_outliers_suppressed_dedup"] == 1
+  assert res2["total_udm_events_generated"] == 0

@@ -1262,3 +1262,1171 @@ order:
         "stats_rows": len(rows),
         "executed_query": query,
     }
+
+  @staticmethod
+  def derive_cri_severity(cri: int) -> str:
+    """Maps a Calibrated Risk Index [0-100] to the canonical UDM SecurityResult severity band."""
+    if cri >= 90:
+      return "CRITICAL"
+    if cri >= 70:
+      return "HIGH"
+    if cri >= 46:
+      return "MEDIUM"
+    if cri >= 26:
+      return "LOW"
+    return "INFORMATIONAL"
+
+  @staticmethod
+  def _mode_a_today_window(now_utc: Optional[datetime] = None) -> Tuple[str, str, str]:
+    """Computes Mode A evaluation window (today 00:00:00Z -> now_utc).
+
+    If invoked within the first 30 minutes after midnight UTC (00:00Z-00:29Z),
+    evaluates yesterday's completed 24h UTC bucket so late-night spikes are not
+    lost across the UTC date boundary.
+    """
+    now_dt = now_utc or datetime.now(timezone.utc)
+    today_midnight = datetime(now_dt.year, now_dt.month, now_dt.day, tzinfo=timezone.utc)
+    if now_dt.hour == 0 and now_dt.minute < 30:
+      start_dt = today_midnight - timedelta(days=1)
+      end_dt = today_midnight - timedelta(seconds=1)
+    else:
+      start_dt = today_midnight
+      end_dt = now_dt
+    return (
+        start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        start_dt.strftime("%Y-%m-%d"),
+    )
+
+  def build_fleet_360_sector_queries(
+      self,
+      entity_type: str = "USER",
+      min_z: float = 2.0,
+      min_obs: int = 5,
+  ) -> Dict[str, str]:
+    """Builds the 6 fleetwide decoupled 360° sector queries (Mode A: all entities).
+
+    Pushes `condition: $z >= min_z and $observed >= min_obs` into the root stage
+    to prune nominal fleet rows server-side and stay well below Chronicle's
+    10,000-row stats limit while preserving secondary elevated spokes for
+    Euclidean distance D calculation.
+    """
+    is_host = entity_type.upper() in ("ASSET", "HOST", "IP")
+    z_gate = f"{float(min_z):.2f}"
+    obs_gate = int(max(1, min_obs))
+
+    if is_host:
+      return {
+          "Auth": f"""// Fleetwide Sector 1: Asset Authentication
+stage auth_risk {{
+    metadata.event_type = "USER_LOGIN"
+    not security_result.action = "ALLOW"
+    principal.asset.hostname = $host
+    $host != ""
+  match:
+    $host by 1d
+  outcome:
+    $obs = count(metadata.id)
+    $avg = max(metrics.auth_attempts_fail(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.asset.hostname: principal.asset.hostname
+    ))
+    $std = max(metrics.auth_attempts_fail(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.asset.hostname: principal.asset.hostname
+    ))
+    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+}}
+
+$host = $auth_risk.host
+
+match:
+  $host by 1d
+
+outcome:
+  $z = max($auth_risk.z)
+  $observed = max($auth_risk.obs)
+  $baseline = max($auth_risk.avg)
+  $dispersion = max($auth_risk.std)
+
+condition:
+  $z >= {z_gate} and $observed >= {obs_gate}
+
+order:
+  $z desc""",
+          "Egress": f"""// Fleetwide Sector 2: Asset Network Outbound Volume
+stage egress_risk {{
+    network.sent_bytes > 0
+    network.sent_bytes < 1000000000000000
+    principal.asset.hostname = $host
+    $host != ""
+  match:
+    $host by 1d
+  outcome:
+    $obs = sum(network.sent_bytes)
+    $avg = max(metrics.network_bytes_outbound(
+        period: 1d, window: 30d, metric: value_sum, agg: avg,
+        principal.asset.hostname: principal.asset.hostname
+    ))
+    $std = max(metrics.network_bytes_outbound(
+        period: 1d, window: 30d, metric: value_sum, agg: stddev,
+        principal.asset.hostname: principal.asset.hostname
+    ))
+    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+}}
+
+$host = $egress_risk.host
+
+match:
+  $host by 1d
+
+outcome:
+  $z = max($egress_risk.z)
+  $observed = max($egress_risk.obs)
+  $baseline = max($egress_risk.avg)
+  $dispersion = max($egress_risk.std)
+
+condition:
+  $z >= {z_gate} and $observed >= {obs_gate}
+
+order:
+  $z desc""",
+          "DNS": f"""// Fleetwide Sector 3: Asset DNS Failures
+stage dns_risk {{
+    (network.dns.questions.name != "" or network.dns.answers.name != "" or network.dns.id != 0)
+    network.dns.response_code != 0
+    principal.asset.hostname = $host
+    $host != ""
+  match:
+    $host by 1d
+  outcome:
+    $obs = count(metadata.id)
+    $avg = max(metrics.dns_queries_fail(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.asset.hostname: principal.asset.hostname
+    ))
+    $std = max(metrics.dns_queries_fail(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.asset.hostname: principal.asset.hostname
+    ))
+    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+}}
+
+$host = $dns_risk.host
+
+match:
+  $host by 1d
+
+outcome:
+  $z = max($dns_risk.z)
+  $observed = max($dns_risk.obs)
+  $baseline = max($dns_risk.avg)
+  $dispersion = max($dns_risk.std)
+
+condition:
+  $z >= {z_gate} and $observed >= {obs_gate}
+
+order:
+  $z desc""",
+          "Flows": f"""// Fleetwide Sector 4: Asset Outbound Network Flows
+stage flows_risk {{
+    network.sent_bytes > 0
+    principal.asset.hostname = $host
+    $host != ""
+  match:
+    $host by 1d
+  outcome:
+    $obs = count(metadata.id)
+    $avg = max(metrics.network_flows_outbound(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.asset.hostname: principal.asset.hostname
+    ))
+    $std = max(metrics.network_flows_outbound(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.asset.hostname: principal.asset.hostname
+    ))
+    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+}}
+
+$host = $flows_risk.host
+
+match:
+  $host by 1d
+
+outcome:
+  $z = max($flows_risk.z)
+  $observed = max($flows_risk.obs)
+  $baseline = max($flows_risk.avg)
+  $dispersion = max($flows_risk.std)
+
+condition:
+  $z >= {z_gate} and $observed >= {obs_gate}
+
+order:
+  $z desc""",
+          "Alerts": f"""// Fleetwide Sector 5: Asset Security & EDR Alerts
+stage alerts_risk {{
+    (metadata.log_type = "CB_EDR" or metadata.log_type = "CS_EDR" or metadata.log_type = "MICROSOFT_GRAPH_ALERT" or metadata.log_type = "SENTINELONE_ALERTS")
+    principal.asset.hostname = $host
+    security_result.rule_name = $rule_name
+    $host != ""
+    $rule_name != ""
+  match:
+    $host, $rule_name by 1d
+  outcome:
+    $obs = count(metadata.id)
+    $avg = max(metrics.alert_event_name_count(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.asset.hostname: principal.asset.hostname,
+        security_result.rule_name: security_result.rule_name
+    ))
+    $std = max(metrics.alert_event_name_count(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.asset.hostname: principal.asset.hostname,
+        security_result.rule_name: security_result.rule_name
+    ))
+    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+}}
+
+$host = $alerts_risk.host
+
+match:
+  $host by 1d
+
+outcome:
+  $z = max($alerts_risk.z)
+  $observed = max($alerts_risk.obs)
+  $baseline = max($alerts_risk.avg)
+  $dispersion = max($alerts_risk.std)
+
+condition:
+  $z >= {z_gate} and $observed >= 1
+
+order:
+  $z desc""",
+          "Web": f"""// Fleetwide Sector 6: Asset Web & Proxy Activity
+stage web_risk {{
+    (network.http.method != "" or network.http.user_agent != "" or network.http.response_code != 0 or network.http.referral_url != "")
+    principal.asset.hostname = $host
+    $host != ""
+  match:
+    $host by 1d
+  outcome:
+    $obs = count(metadata.id)
+    $avg = max(metrics.http_queries_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.asset.hostname: principal.asset.hostname
+    ))
+    $std = max(metrics.http_queries_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.asset.hostname: principal.asset.hostname
+    ))
+    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+}}
+
+$host = $web_risk.host
+
+match:
+  $host by 1d
+
+outcome:
+  $z = max($web_risk.z)
+  $observed = max($web_risk.obs)
+  $baseline = max($web_risk.avg)
+  $dispersion = max($web_risk.std)
+
+condition:
+  $z >= {z_gate} and $observed >= {obs_gate}
+
+order:
+  $z desc""",
+      }
+
+    return {
+        "Auth": f"""// Fleetwide Sector 1: User IAM & Authentication
+stage auth_risk {{
+    metadata.event_type = "USER_LOGIN"
+    not security_result.action = "ALLOW"
+    target.user.userid = $user
+    $user != ""
+  match:
+    $user by 1d
+  outcome:
+    $obs = count(metadata.id)
+    $avg = max(metrics.auth_attempts_fail(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        target.user.userid: target.user.userid
+    ))
+    $std = max(metrics.auth_attempts_fail(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        target.user.userid: target.user.userid
+    ))
+    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+}}
+
+$user = $auth_risk.user
+
+match:
+  $user by 1d
+
+outcome:
+  $z = max($auth_risk.z)
+  $observed = max($auth_risk.obs)
+  $baseline = max($auth_risk.avg)
+  $dispersion = max($auth_risk.std)
+
+condition:
+  $z >= {z_gate} and $observed >= {obs_gate}
+
+order:
+  $z desc""",
+        "Cloud": f"""// Fleetwide Sector 2: User Cloud Infrastructure CRUD
+stage cloud_risk {{
+    (metadata.event_type = "RESOURCE_CREATION" or metadata.event_type = "USER_RESOURCE_CREATION")
+    principal.user.userid = $user
+    $vendor = metadata.vendor_name
+    $product = metadata.product_name
+    $user != ""
+  match:
+    $user, $vendor, $product by 1d
+  outcome:
+    $obs = count(metadata.id)
+    $avg = max(metrics.resource_creation_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.user.userid: principal.user.userid,
+        metadata.vendor_name: metadata.vendor_name,
+        metadata.product_name: metadata.product_name
+    ))
+    $std = max(metrics.resource_creation_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.user.userid: principal.user.userid,
+        metadata.vendor_name: metadata.vendor_name,
+        metadata.product_name: metadata.product_name
+    ))
+    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+}}
+
+$user = $cloud_risk.user
+
+match:
+  $user by 1d
+
+outcome:
+  $z = max($cloud_risk.z)
+  $observed = max($cloud_risk.obs)
+  $baseline = max($cloud_risk.avg)
+  $dispersion = max($cloud_risk.std)
+
+condition:
+  $z >= {z_gate} and $observed >= {obs_gate}
+
+order:
+  $z desc""",
+        "Workspace": f"""// Fleetwide Sector 3: User Workspace & Drive Data
+stage workspace_risk {{
+    metadata.vendor_name = "Google Workspace"
+    metadata.product_event_type = "download"
+    principal.user.userid = $user
+    $user != ""
+  match:
+    $user by 1d
+  outcome:
+    $obs = count(metadata.id)
+    $avg = max(metrics.workspace_total_download_actions(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.user.userid: principal.user.userid
+    ))
+    $std = max(metrics.workspace_total_download_actions(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.user.userid: principal.user.userid
+    ))
+    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+}}
+
+$user = $workspace_risk.user
+
+match:
+  $user by 1d
+
+outcome:
+  $z = max($workspace_risk.z)
+  $observed = max($workspace_risk.obs)
+  $baseline = max($workspace_risk.avg)
+  $dispersion = max($workspace_risk.std)
+
+condition:
+  $z >= {z_gate} and $observed >= {obs_gate}
+
+order:
+  $z desc""",
+        "Egress": f"""// Fleetwide Sector 4: User Network Egress Volume
+stage egress_risk {{
+    network.sent_bytes > 0
+    network.sent_bytes < 1000000000000000
+    principal.user.userid = $user
+    $user != ""
+  match:
+    $user by 1d
+  outcome:
+    $obs = sum(network.sent_bytes)
+    $avg = max(metrics.network_bytes_outbound(
+        period: 1d, window: 30d, metric: value_sum, agg: avg,
+        principal.user.userid: principal.user.userid
+    ))
+    $std = max(metrics.network_bytes_outbound(
+        period: 1d, window: 30d, metric: value_sum, agg: stddev,
+        principal.user.userid: principal.user.userid
+    ))
+    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+}}
+
+$user = $egress_risk.user
+
+match:
+  $user by 1d
+
+outcome:
+  $z = max($egress_risk.z)
+  $observed = max($egress_risk.obs)
+  $baseline = max($egress_risk.avg)
+  $dispersion = max($egress_risk.std)
+
+condition:
+  $z >= {z_gate} and $observed >= {obs_gate}
+
+order:
+  $z desc""",
+        "DNS": f"""// Fleetwide Sector 5: User DNS Failures
+stage dns_risk {{
+    (network.dns.questions.name != "" or network.dns.answers.name != "" or network.dns.id != 0)
+    network.dns.response_code != 0
+    principal.user.userid = $user
+    $user != ""
+  match:
+    $user by 1d
+  outcome:
+    $obs = count(metadata.id)
+    $avg = max(metrics.dns_queries_fail(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.user.userid: principal.user.userid
+    ))
+    $std = max(metrics.dns_queries_fail(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.user.userid: principal.user.userid
+    ))
+    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+}}
+
+$user = $dns_risk.user
+
+match:
+  $user by 1d
+
+outcome:
+  $z = max($dns_risk.z)
+  $observed = max($dns_risk.obs)
+  $baseline = max($dns_risk.avg)
+  $dispersion = max($dns_risk.std)
+
+condition:
+  $z >= {z_gate} and $observed >= {obs_gate}
+
+order:
+  $z desc""",
+        "Web": f"""// Fleetwide Sector 6: User Web & Proxy Activity
+stage web_risk {{
+    (network.http.method != "" or network.http.user_agent != "" or network.http.response_code != 0 or network.http.referral_url != "")
+    principal.user.userid = $user
+    $user != ""
+  match:
+    $user by 1d
+  outcome:
+    $obs = count(metadata.id)
+    $avg = max(metrics.http_queries_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.user.userid: principal.user.userid
+    ))
+    $std = max(metrics.http_queries_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.user.userid: principal.user.userid
+    ))
+    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+}}
+
+$user = $web_risk.user
+
+match:
+  $user by 1d
+
+outcome:
+  $z = max($web_risk.z)
+  $observed = max($web_risk.obs)
+  $baseline = max($web_risk.avg)
+  $dispersion = max($web_risk.std)
+
+condition:
+  $z >= {z_gate} and $observed >= {obs_gate}
+
+order:
+  $z desc""",
+    }
+
+  def build_360_summary_udm_event(
+      self,
+      entity_id: str,
+      entity_type: str,
+      sectors: Dict[str, Dict[str, float]],
+      composite_d: float,
+      cri: int,
+      campaign_id: str,
+      start_iso: str,
+      end_iso: str,
+      spike_threshold_z: float = 3.0,
+  ) -> Dict[str, Any]:
+    """Constructs the Euclidean Distance Composite Summary UDM event (BEHAVIORAL_RISK_RADAR_360)."""
+    is_asset = entity_type.upper() in ("ASSET", "HOST", "IP")
+    norm_type = "ASSET" if is_asset else "USER"
+    canonical_order = (
+        ["Auth", "Egress", "DNS", "Flows", "Alerts", "Web"]
+        if is_asset
+        else ["Auth", "Cloud", "Workspace", "Egress", "DNS", "Web"]
+    )
+    severity = self.derive_cri_severity(cri)
+
+    spoke_records = []
+    for sec in canonical_order:
+      s_data = sectors.get(sec, {"z": 0.0, "obs": 0.0, "avg": 0.0, "std": 0.0})
+      z_val = float(s_data.get("z", 0.0) or 0.0)
+      spoke_cri = self.runner.calculate_cri(z_val) if z_val > 0.0 else 0
+      spoke_records.append({
+          "sector": sec,
+          "key": sec.lower(),
+          "upper": sec.upper(),
+          "z": z_val,
+          "cri": spoke_cri,
+          "obs": float(s_data.get("obs", 0.0) or 0.0),
+          "avg": float(s_data.get("avg", 0.0) or 0.0),
+          "std": float(s_data.get("std", 0.0) or 0.0),
+      })
+
+    sorted_spokes = sorted(spoke_records, key=lambda r: r["z"], reverse=True)
+    primary = sorted_spokes[0]
+    breached = [r for r in sorted_spokes if r["z"] >= spike_threshold_z]
+    summary_ribbon = " | ".join(f"{r['upper']}:{r['cri']}" for r in sorted_spokes)
+
+    category_map = {
+        "AUTH": "AUTH_VIOLATION",
+        "EGRESS": "DATA_EXFILTRATION",
+        "WORKSPACE": "DATA_EXFILTRATION",
+        "CLOUD": "ACL_VIOLATION",
+        "DNS": "NETWORK_COMMAND_AND_CONTROL",
+        "WEB": "NETWORK_SUSPICIOUS",
+        "FLOWS": "NETWORK_SUSPICIOUS",
+        "ALERTS": "SOFTWARE_SUSPICIOUS",
+    }
+    primary_category = category_map.get(primary["upper"], "POLICY_VIOLATION")
+
+    detection_fields = [
+        {"key": "entity_id", "value": entity_id},
+        {"key": "entity_type", "value": norm_type},
+        {"key": "composite_d", "value": f"{composite_d:.2f}"},
+        {"key": "composite_cri", "value": str(cri)},
+        {"key": "primary_vector", "value": primary["upper"]},
+        {"key": "primary_vector_cri", "value": str(primary["cri"])},
+        {"key": "primary_vector_z", "value": f"{primary['z']:.2f}"},
+        {"key": "sectors_breached_count", "value": str(len(breached))},
+        {"key": "vector_cri_summary", "value": summary_ribbon},
+        {"key": "window_start", "value": start_iso},
+        {"key": "window_end", "value": end_iso},
+    ]
+
+    # Repeated "breached_vector" keys allow native YARA-L group-by unpacking in Dashboards
+    for b in breached:
+      detection_fields.append({"key": "breached_vector", "value": b["upper"]})
+
+    resource_labels = [
+        {"key": "Hunt Campaign ID", "value": campaign_id},
+        {"key": "Entity Type", "value": norm_type},
+        {"key": "Composite CRI", "value": str(cri)},
+        {"key": "Euclidean Threat Distance D", "value": f"{composite_d:.2f}"},
+        {"key": "Sectors Breached Count", "value": str(len(breached))},
+    ]
+
+    for r in spoke_records:
+      k = r["key"]
+      detection_fields.append({"key": f"cri_{k}", "value": str(r["cri"])})
+      detection_fields.append({"key": f"z_{k}", "value": f"{r['z']:.2f}"})
+      resource_labels.append({
+          "key": f"{k}_stats",
+          "value": f"CRI:{r['cri']} | Z:+{r['z']:.2f}σ | Obs:{r['obs']:.0f} | 30d:{r['avg']:.1f}±{r['std']:.1f}",
+      })
+
+    principal_block = (
+        {"hostname": entity_id, "asset": {"hostname": entity_id}}
+        if is_asset
+        else {"user": {"userid": entity_id}}
+    )
+
+    return {
+        "metadata": {
+            "event_timestamp": end_iso,
+            "ingested_timestamp": end_iso,
+            "product_name": "SecOps Risk Metrics Hunter",
+            "vendor_name": "Google SecOps",
+            "event_type": "GENERIC_EVENT",
+            "product_event_type": "BEHAVIORAL_RISK_RADAR_360",
+            "description": (
+                f"360° Composite Outlier [{norm_type}]: {entity_id} "
+                f"Composite CRI={cri} (D={composite_d:.2f}σ) | "
+                f"Peak: {primary['upper']} (CRI:{primary['cri']}, +{primary['z']:.2f}σ)"
+            ),
+            "ingestion_labels": [
+                {"key": "hunt_campaign_id", "value": campaign_id},
+                {"key": "record_scope", "value": "ENTITY_COMPOSITE_SUMMARY"},
+                {"key": "sweep_mode", "value": "MODE_A_4H_FLEET"},
+                {"key": "source_skill", "value": "secops-risk-metrics-multistage"},
+            ],
+        },
+        "observer": {
+            "hostname": "agentic-ueba-watchdog",
+            "application": "Google SecOps Multi-Stage Risk Analytics",
+        },
+        "principal": principal_block,
+        "target": {
+            "resource": {
+                "name": "BEHAVIORAL_RISK_RADAR_360",
+                "attribute": {"labels": resource_labels},
+            }
+        },
+        "security_result": [
+            {
+                "rule_id": "RADAR_360_COMPOSITE",
+                "rule_name": "360 Behavioral Risk Radar — Composite Euclidean Distance",
+                "threat_name": "Statistical Outlier: Multi-Sector Behavioral Risk Surge",
+                "category": [primary_category],
+                "action": ["UNKNOWN_ACTION"],
+                "risk_score": cri,
+                "severity": severity,
+                "summary": (
+                    f"{norm_type} {entity_id} breached {len(breached)}/6 risk sectors "
+                    f"(Composite CRI={cri}, D={composite_d:.2f}σ; Peak={primary['upper']} CRI:{primary['cri']})."
+                ),
+                "detection_fields": detection_fields,
+            }
+        ],
+    }
+
+  def build_360_vector_udm_event(
+      self,
+      entity_id: str,
+      entity_type: str,
+      sector_name: str,
+      metric_table: str,
+      z_score: float,
+      vector_cri: int,
+      observed: float,
+      baseline_mean: float,
+      baseline_stddev: float,
+      composite_d: float,
+      composite_cri: int,
+      campaign_id: str,
+      start_iso: str,
+      end_iso: str,
+      spike_threshold_z: float = 3.0,
+  ) -> Dict[str, Any]:
+    """Constructs a Per-Vector Breakdown UDM event (BEHAVIORAL_RISK_VECTOR_SPIKE).
+
+    Places `vector_cri` directly into `security_result.risk_score` (int32) so
+    Chronicle Dashboards can compute native `avg()` and `max()` CRI trends per vector.
+    """
+    is_asset = entity_type.upper() in ("ASSET", "HOST", "IP")
+    norm_type = "ASSET" if is_asset else "USER"
+    sector_upper = sector_name.upper()
+    is_breached = z_score >= spike_threshold_z
+    severity = self.derive_cri_severity(vector_cri)
+
+    category_map = {
+        "AUTH": "AUTH_VIOLATION",
+        "EGRESS": "DATA_EXFILTRATION",
+        "WORKSPACE": "DATA_EXFILTRATION",
+        "CLOUD": "ACL_VIOLATION",
+        "DNS": "NETWORK_COMMAND_AND_CONTROL",
+        "WEB": "NETWORK_SUSPICIOUS",
+        "FLOWS": "NETWORK_SUSPICIOUS",
+        "ALERTS": "SOFTWARE_SUSPICIOUS",
+    }
+    sec_category = category_map.get(sector_upper, "POLICY_VIOLATION")
+
+    principal_block = (
+        {"hostname": entity_id, "asset": {"hostname": entity_id}}
+        if is_asset
+        else {"user": {"userid": entity_id}}
+    )
+
+    event: Dict[str, Any] = {
+        "metadata": {
+            "event_timestamp": end_iso,
+            "ingested_timestamp": end_iso,
+            "product_name": "SecOps Risk Metrics Hunter",
+            "vendor_name": "Google SecOps",
+            "event_type": "GENERIC_EVENT",
+            "product_event_type": "BEHAVIORAL_RISK_VECTOR_SPIKE",
+            "description": (
+                f"360° Vector Breakdown [{norm_type} / {sector_upper}]: {entity_id} "
+                f"Vector CRI={vector_cri} (Z=+{z_score:.2f}σ) | Composite CRI={composite_cri} (D={composite_d:.2f}σ)"
+            ),
+            "ingestion_labels": [
+                {"key": "hunt_campaign_id", "value": campaign_id},
+                {"key": "record_scope", "value": "VECTOR_BREAKDOWN"},
+                {"key": "vector_name", "value": sector_upper},
+                {"key": "source_skill", "value": "secops-risk-metrics-multistage"},
+            ],
+        },
+        "observer": {
+            "hostname": "agentic-ueba-watchdog",
+            "application": "Google SecOps Multi-Stage Risk Analytics",
+        },
+        "principal": principal_block,
+        "target": {
+            "resource": {
+                "name": f"VECTOR:{sector_upper}",
+                "attribute": {
+                    "labels": [
+                        {"key": "Hunt Campaign ID", "value": campaign_id},
+                        {"key": "Entity Type", "value": norm_type},
+                        {"key": "Vector", "value": sector_upper},
+                        {"key": "Metric Table", "value": metric_table},
+                        {"key": "Vector CRI", "value": str(vector_cri)},
+                        {"key": "Vector Z-Score", "value": f"{z_score:.2f}"},
+                        {"key": "Observed Value", "value": f"{observed:.0f}"},
+                        {"key": "Baseline 30d Mean", "value": f"{baseline_mean:.1f}"},
+                        {"key": "Baseline 30d StdDev", "value": f"{baseline_stddev:.1f}"},
+                        {"key": "Parent Composite CRI", "value": str(composite_cri)},
+                        {"key": "Parent Euclidean D", "value": f"{composite_d:.2f}"},
+                    ]
+                },
+            }
+        },
+        "security_result": [
+            {
+                "rule_id": f"RADAR_360_VECTOR_{sector_upper}",
+                "rule_name": f"VECTOR:{sector_upper}",
+                "threat_name": f"360 Vector Outlier: {sector_upper}",
+                "category": [sec_category],
+                "action": ["UNKNOWN_ACTION"],
+                "risk_score": vector_cri,
+                "severity": severity,
+                "summary": (
+                    f"{norm_type} {entity_id} {sector_upper} vector CRI={vector_cri} "
+                    f"(+{z_score:.2f}σ; Observed={observed:.0f} vs 30d={baseline_mean:.1f}±{baseline_stddev:.1f})."
+                ),
+                "detection_fields": [
+                    {"key": "entity_id", "value": entity_id},
+                    {"key": "entity_type", "value": norm_type},
+                    {"key": "vector", "value": sector_upper},
+                    {"key": "metric_table", "value": metric_table},
+                    {"key": "is_breached", "value": "true" if is_breached else "false"},
+                    {"key": "vector_cri", "value": str(vector_cri)},
+                    {"key": "vector_z", "value": f"{z_score:.2f}"},
+                    {"key": "observed", "value": f"{observed:.0f}"},
+                    {"key": "baseline_mean", "value": f"{baseline_mean:.1f}"},
+                    {"key": "baseline_stddev", "value": f"{baseline_stddev:.1f}"},
+                    {"key": "composite_cri", "value": str(composite_cri)},
+                    {"key": "composite_d", "value": f"{composite_d:.2f}"},
+                    {"key": "window_start", "value": start_iso},
+                    {"key": "window_end", "value": end_iso},
+                ],
+            }
+        ],
+    }
+
+    if sector_upper == "EGRESS" and observed > 0:
+      event["network"] = {"sent_bytes": int(observed)}
+
+    return event
+
+  def build_360_outlier_event_bundle(
+      self,
+      entity_id: str,
+      entity_type: str,
+      sectors: Dict[str, Dict[str, float]],
+      composite_d: float,
+      composite_cri: int,
+      campaign_id: str,
+      start_iso: str,
+      end_iso: str,
+      spike_threshold_z: float = 3.0,
+      emit_all_spokes: bool = True,
+  ) -> List[Dict[str, Any]]:
+    """Builds the correlated Dual-Event UDM bundle for an outlier entity.
+
+    Returns:
+      1 Composite Summary event (`BEHAVIORAL_RISK_RADAR_360`) +
+      N Per-Vector Breakdown events (`BEHAVIORAL_RISK_VECTOR_SPIKE`).
+    """
+    events: List[Dict[str, Any]] = []
+    summary_ev = self.build_360_summary_udm_event(
+        entity_id=entity_id,
+        entity_type=entity_type,
+        sectors=sectors,
+        composite_d=composite_d,
+        cri=composite_cri,
+        campaign_id=campaign_id,
+        start_iso=start_iso,
+        end_iso=end_iso,
+        spike_threshold_z=spike_threshold_z,
+    )
+    events.append(summary_ev)
+
+    is_asset = entity_type.upper() in ("ASSET", "HOST", "IP")
+    sector_map = self.ASSET_SECTOR_METRICS if is_asset else self.USER_SECTOR_METRICS
+
+    for sec_name, metric_name in sector_map.items():
+      s_data = sectors.get(sec_name, {"z": 0.0, "obs": 0.0, "avg": 0.0, "std": 0.0})
+      z_val = float(s_data.get("z", 0.0) or 0.0)
+      if not emit_all_spokes and z_val <= 0.0:
+        continue
+      vec_cri = self.runner.calculate_cri(z_val) if z_val > 0.0 else 0
+      vec_ev = self.build_360_vector_udm_event(
+          entity_id=entity_id,
+          entity_type=entity_type,
+          sector_name=sec_name,
+          metric_table=f"metrics.{metric_name}",
+          z_score=z_val,
+          vector_cri=vec_cri,
+          observed=float(s_data.get("obs", 0.0) or 0.0),
+          baseline_mean=float(s_data.get("avg", 0.0) or 0.0),
+          baseline_stddev=float(s_data.get("std", 0.0) or 0.0),
+          composite_d=composite_d,
+          composite_cri=composite_cri,
+          campaign_id=campaign_id,
+          start_iso=start_iso,
+          end_iso=end_iso,
+          spike_threshold_z=spike_threshold_z,
+      )
+      events.append(vec_ev)
+
+    return events
+
+  def ingest_udm_events(
+      self,
+      udm_events: Sequence[Dict[str, Any]],
+      batch_size: int = 200,
+      access_token: Optional[str] = None,
+  ) -> Dict[str, Any]:
+    """Validates and ingests UDM events in batches via Chronicle IngestionService.ImportEvents."""
+    if not udm_events:
+      return {"status": "NO_EVENTS", "events_ingested": 0, "batches": 0}
+
+    self.runner._ensure_skill_path()
+    from scripts import chronicle_ingest
+
+    validation_errors = chronicle_ingest.validate_events(udm_events)
+    if validation_errors:
+      raise ValueError(f"UDM validation failed: {validation_errors}")
+
+    token = access_token
+    if not token:
+      try:
+        auth_headers = self.runner.tenant.get_auth_headers()
+        auth_val = auth_headers.get("Authorization", "")
+        if auth_val.startswith("Bearer "):
+          token = auth_val[len("Bearer "):].strip()
+      except Exception:
+        token = None
+
+    total_ingested = 0
+    batches = 0
+    for idx in range(0, len(udm_events), batch_size):
+      chunk = udm_events[idx : idx + batch_size]
+      chronicle_ingest.import_events(
+          udm_events=chunk,
+          project_id=self.runner.tenant.project_id,
+          region=self.runner.tenant.region,
+          customer_id=self.runner.tenant.customer_id,
+          access_token=token,
+      )
+      total_ingested += len(chunk)
+      batches += 1
+
+    return {
+        "status": "SUCCESS",
+        "events_ingested": total_ingested,
+        "batches": batches,
+    }
+
+  async def run_fleet_360_sweep(
+      self,
+      session: ClientSession,
+      entity_type: str = "USER",
+      spike_threshold_z: Optional[float] = None,
+      spoke_inclusion_z: Optional[float] = None,
+      min_observed: Optional[int] = None,
+      max_outliers_per_sector: Optional[int] = None,
+      inter_query_delay_sec: Optional[float] = None,
+      ingest_events: Optional[bool] = None,
+      emit_all_spokes: Optional[bool] = None,
+      should_emit_fn: Optional[Any] = None,
+      record_emit_fn: Optional[Any] = None,
+      now_utc: Optional[datetime] = None,
+      lookback_days: int = 1,
+  ) -> Dict[str, Any]:
+    """Executes the 6 decoupled 360° sector reports across ALL entities (Mode A: today vs 30d).
+
+    - Evaluates all entities in 6 sequential fleetwide queries (O(1) API calls).
+    - Supports multi-day historical backfills via `lookback_days` using Chronicle's `by 1d` TIME_BUCKET.
+    - Computes Euclidean Distance D = sqrt(sum max(0, Z_i)^2) and Composite CRI.
+    - For any entity with >= 1 vector above `spike_threshold_z` (3.0σ), emits a
+      correlated Dual-Event UDM bundle (Composite Summary + Per-Vector Breakdown).
+    """
+    t_cfg = self.runner.tenant
+    spike_threshold_z = (
+        float(spike_threshold_z)
+        if spike_threshold_z is not None
+        else float(getattr(t_cfg, "fleet_360_spike_threshold_z", 3.0))
+    )
+    spoke_inclusion_z = (
+        float(spoke_inclusion_z)
+        if spoke_inclusion_z is not None
+        else float(getattr(t_cfg, "fleet_360_spoke_inclusion_z", 2.0))
+    )
+    min_observed = (
+        int(min_observed)
+        if min_observed is not None
+        else int(getattr(t_cfg, "fleet_360_min_observed", 5))
+    )
+    max_outliers_per_sector = (
+        int(max_outliers_per_sector)
+        if max_outliers_per_sector is not None
+        else int(getattr(t_cfg, "fleet_360_max_outliers_per_sector", 250))
+    )
+    inter_query_delay_sec = (
+        float(inter_query_delay_sec)
+        if inter_query_delay_sec is not None
+        else float(getattr(t_cfg, "fleet_360_inter_query_delay_sec", 1.5))
+    )
+    ingest_events = (
+        bool(ingest_events)
+        if ingest_events is not None
+        else bool(getattr(t_cfg, "fleet_360_ingest_events", True))
+    )
+    emit_all_spokes = (
+        bool(emit_all_spokes)
+        if emit_all_spokes is not None
+        else bool(getattr(t_cfg, "fleet_360_emit_all_spokes", True))
+    )
+
+    is_multi_day = bool(lookback_days and int(lookback_days) > 1)
+    if is_multi_day:
+      now_dt = now_utc or datetime.now(timezone.utc)
+      end_midnight = datetime(now_dt.year, now_dt.month, now_dt.day, tzinfo=timezone.utc)
+      start_dt = end_midnight - timedelta(days=int(lookback_days) - 1)
+      start_iso = start_dt.strftime("%Y-%m-%dT00:00:00Z")
+      end_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+      bucket_date = end_midnight.strftime("%Y-%m-%d")
+    else:
+      start_iso, end_iso, bucket_date = self._mode_a_today_window(now_utc)
+
+    is_asset = entity_type.upper() in ("ASSET", "HOST", "IP")
+    norm_type = "ASSET" if is_asset else "USER"
+
+    fleet_queries = self.build_fleet_360_sector_queries(
+        entity_type=norm_type,
+        min_z=spoke_inclusion_z,
+        min_obs=min_observed,
+    )
+
+    entity_vectors: Dict[Tuple[str, str], Dict[str, Dict[str, float]]] = {}
+    sector_row_counts: Dict[str, int] = {}
+    circuit_breaker_tripped: List[str] = []
+    queries_executed = 0
+
+    def _extract_num(row: Dict[str, Any], keys: Sequence[str]) -> float:
+      for k in keys:
+        if k in row and row[k] is not None:
+          try:
+            return float(row[k])
+          except (TypeError, ValueError):
+            pass
+      return 0.0
+
+    sector_items = list(fleet_queries.items())
+    for idx, (sector_name, q_str) in enumerate(sector_items):
+      try:
+        resp = await self.runner.execute_query_via_mcp(session, q_str, start_iso, end_iso)
+        queries_executed += 1
+        rows = self.runner.parse_stats_response(resp)
+        sector_row_counts[sector_name] = len(rows)
+
+        high_spike_rows = [
+            r for r in rows
+            if _extract_num(r, ("z", "z_score", "$z")) >= spike_threshold_z
+        ]
+        if max_outliers_per_sector > 0 and len(high_spike_rows) > max_outliers_per_sector:
+          logger.warning(
+              f"Macro-rollout circuit breaker tripped for {norm_type} sector {sector_name}: "
+              f"{len(high_spike_rows)} entities >= {spike_threshold_z}σ (cap={max_outliers_per_sector})."
+          )
+          circuit_breaker_tripped.append(sector_name)
+          continue
+
+        for row in rows:
+          ent_id = str(
+              row.get("user")
+              or row.get("$user")
+              or row.get("host")
+              or row.get("$host")
+              or row.get("asset")
+              or row.get("$asset")
+              or row.get("entity")
+              or row.get("$entity")
+              or ""
+          ).strip().lower()
+          if not ent_id:
+            continue
+          raw_tb = str(
+              row.get("TIME_BUCKET")
+              or row.get("time_bucket")
+              or row.get("bucket_date")
+              or ""
+          ).strip()
+          row_day = (
+              raw_tb[:10]
+              if len(raw_tb) >= 10 and raw_tb[4] == "-" and raw_tb[7] == "-"
+              else bucket_date
+          )
+          z_val = _extract_num(row, ("z", "z_score", "$z"))
+          obs_val = _extract_num(row, ("observed", "obs", "$observed", "$obs"))
+          avg_val = _extract_num(row, ("baseline", "avg", "baseline_avg", "$baseline", "$avg"))
+          std_val = _extract_num(row, ("dispersion", "std", "baseline_std", "$dispersion", "$std"))
+          entity_vectors.setdefault((row_day, ent_id), {})[sector_name] = {
+              "z": z_val,
+              "obs": obs_val,
+              "avg": avg_val,
+              "std": std_val,
+          }
+      except Exception as err:
+        logger.warning(f"Fleet 360 query failed on {norm_type} sector {sector_name}: {err}")
+        sector_row_counts[sector_name] = 0
+
+      if inter_query_delay_sec > 0 and idx < len(sector_items) - 1:
+        await asyncio.sleep(inter_query_delay_sec)
+
+    stamp_dt = now_utc or datetime.now(timezone.utc)
+    campaign_id = f"sweep-360-{norm_type.lower()}-{bucket_date}-{stamp_dt.strftime('%H%M%S')}"
+    udm_events_to_ingest: List[Dict[str, Any]] = []
+    outliers: List[Dict[str, Any]] = []
+    suppressed_duplicates = 0
+    total_detected = 0
+
+    for (day_bucket, ent_id), sec_map in sorted(entity_vectors.items()):
+      max_spoke_z = max((v["z"] for v in sec_map.values()), default=0.0)
+      if max_spoke_z < spike_threshold_z:
+        continue
+
+      total_detected += 1
+      z_scores = {s: v["z"] for s, v in sec_map.items()}
+      composite_d = self.runner.compute_euclidean_distance(z_scores)
+      composite_cri = self.runner.calculate_cri(composite_d)
+      breached_sectors = sorted(
+          [s for s, v in sec_map.items() if v["z"] >= spike_threshold_z],
+          key=lambda s: sec_map[s]["z"],
+          reverse=True,
+      )
+      primary_sector = breached_sectors[0] if breached_sectors else max(sec_map, key=lambda s: sec_map[s]["z"])
+
+      if should_emit_fn is not None:
+        if not should_emit_fn(day_bucket, norm_type, ent_id, breached_sectors, composite_d):
+          suppressed_duplicates += 1
+          continue
+
+      if is_multi_day:
+        day_start_iso = f"{day_bucket}T00:00:00Z"
+        day_end_iso = f"{day_bucket}T23:59:00Z"
+      else:
+        day_start_iso = start_iso
+        day_end_iso = end_iso
+      day_campaign_id = f"sweep-360-{norm_type.lower()}-{day_bucket}-{stamp_dt.strftime('%H%M%S')}"
+
+      bundle = self.build_360_outlier_event_bundle(
+          entity_id=ent_id,
+          entity_type=norm_type,
+          sectors=sec_map,
+          composite_d=composite_d,
+          composite_cri=composite_cri,
+          campaign_id=day_campaign_id,
+          start_iso=day_start_iso,
+          end_iso=day_end_iso,
+          spike_threshold_z=spike_threshold_z,
+          emit_all_spokes=emit_all_spokes,
+      )
+      udm_events_to_ingest.extend(bundle)
+
+      if record_emit_fn is not None:
+        record_emit_fn(day_bucket, norm_type, ent_id, breached_sectors, composite_d, composite_cri)
+
+      vector_cri_map = {
+          s: (self.runner.calculate_cri(v["z"]) if v["z"] > 0 else 0)
+          for s, v in sec_map.items()
+      }
+      outliers.append({
+          "bucket_date": day_bucket,
+          "entity": ent_id,
+          "entity_type": norm_type,
+          "composite_d": round(composite_d, 2),
+          "composite_cri": composite_cri,
+          "severity": self.derive_cri_severity(composite_cri),
+          "primary_vector": primary_sector.upper(),
+          "max_spoke_z": round(max_spoke_z, 2),
+          "breached_sectors": [s.upper() for s in breached_sectors],
+          "sector_z_scores": {s: round(v["z"], 2) for s, v in sec_map.items()},
+          "sector_cri_scores": vector_cri_map,
+          "udm_events_count": len(bundle),
+      })
+
+    outliers.sort(key=lambda x: (x["composite_d"], x.get("bucket_date", "")), reverse=True)
+
+    ingestion_result: Dict[str, Any] = {
+        "status": "SKIPPED" if not ingest_events else "NO_EVENTS",
+        "events_ingested": 0,
+        "batches": 0,
+    }
+    if ingest_events and udm_events_to_ingest:
+      try:
+        ingestion_result = self.ingest_udm_events(udm_events_to_ingest)
+      except Exception as ing_err:
+        logger.error(f"Fleet 360 UDM ingestion failed: {ing_err}")
+        ingestion_result = {
+            "status": "ERROR",
+            "error": str(ing_err),
+            "events_ingested": 0,
+            "batches": 0,
+        }
+
+    return {
+        "status": "SUCCESS",
+        "campaign_id": campaign_id,
+        "entity_type": norm_type,
+        "window": {
+            "start": start_iso,
+            "end": end_iso,
+            "bucket_date": bucket_date,
+            "lookback_days": int(lookback_days or 1),
+        },
+        "queries_executed": queries_executed,
+        "sector_row_counts": sector_row_counts,
+        "circuit_breaker_tripped_sectors": circuit_breaker_tripped,
+        "suppressed_sectors": circuit_breaker_tripped,
+        "entities_above_inclusion_floor": len(entity_vectors),
+        "outliers_detected": total_detected,
+        "outliers_emitted": len(outliers),
+        "outliers_flagged": len(outliers),
+        "outliers_suppressed_dedup": suppressed_duplicates,
+        "suppressed_intraday_duplicates": suppressed_duplicates,
+        "udm_events_generated": len(udm_events_to_ingest),
+        "ingestion": ingestion_result,
+        "outliers": outliers,
+        "udm_events": udm_events_to_ingest,
+    }
+
+
