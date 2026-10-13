@@ -109,6 +109,7 @@ create_case_comment / SOAR Rule Trigger]
   * Computes **Calibrated Risk Index (CRI)**:
     $$	ext{CRI}(Z) = 	ext{round}\left(rac{100}{1 + \exp(-0.6 \cdot (Z - 3.0))}ight)$$
   * Filters for findings with $	ext{CRI} \ge 46$ ($Z \ge 3.0\sigma$).
+  * **Query-side gate (skill v1.8.6+)**: every `secops-risk-metrics-multistage` template and router query carries a root `condition:`. Gate values come from `PipelineRunner.GATE_DEFAULTS` (σ ≥ 3.0, fold change ≥ 2.0, fusion D² ≥ 9.0 i.e. D ≥ 3.0, MAD modified Z ≥ 3.5). They match the engine's own outlier rules, so no entity the engine would flag is dropped by the query. Consequence: nominal entities return no rows, and the engine reports them with score 0.0 instead of their sub-threshold value.
 * **Output**: Produces the typed **Clean Hand-Off (CH)** JSON payload.
 
 ---

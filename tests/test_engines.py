@@ -1499,3 +1499,64 @@ def test_build_360_outlier_udm_event_matches_skill_handoff_schema():
   assert ev["security_result"][0]["risk_score"] == doc["security_result"][0]["risk_score"]
   assert ev["security_result"][0]["severity"] == doc["security_result"][0]["severity"]
   assert ev["security_result"][0]["summary"] == doc["security_result"][0]["summary"]
+
+
+# --- Skill v1.8.6 root significance gate compatibility -------------------------------------------
+
+def _root_gate(query: str):
+  import re
+  m = re.search(r"^condition:[ \t]*\n(.*?)\n[ \t]*\n[ \t]*order:", query, re.M | re.S)
+  return " ".join(m.group(1).split()) if m else None
+
+
+def _unfilled(query: str):
+  import re
+  code = "\n".join(ln for ln in query.splitlines() if not ln.lstrip().startswith("//"))
+  return sorted(set(re.findall(r"\{\{(\w+)\}\}", code)))
+
+
+def test_template_paths_fill_skill_gate_placeholders():
+  """Every template the engine fills by hand must resolve the skill's gate placeholders.
+
+  Unfilled `{{anomaly_threshold}}` / `{{fusion_threshold_sq}}` would reach Chronicle verbatim and
+  fail compilation (render_template only logs a warning).
+  """
+  engine = RiskMetricsEngine()
+  runner = engine.runner
+  gates = PipelineRunner.GATE_DEFAULTS
+  cases = {
+      "rare_destination_ecg": (engine._render_rare_destination_ecg_query("dns_queries_total"),
+                               f"$z_sector >= {gates['anomaly_threshold']}"),
+      "fusion_rare_destination": (engine._render_fusion_rare_destination_query(),
+                                  f"$d_sq >= {gates['fusion_threshold_sq']}"),
+  }
+  for tpl, metric, dim, gate_var in (
+      ("circadian_von_mises_2stage.yl2", "auth_attempts_total", "target.user.userid", "$circadian_threat_score"),
+      ("macd_momentum_velocity_2stage.yl2", "network_bytes_outbound", "principal.user.userid", "$fast_z"),
+  ):
+    q = runner.render_template(runner.find_template(engine.SKILL_NAME, tpl), {
+        "event_filter": "metadata.event_type = \"USER_LOGIN\"", "event_type": "USER_LOGIN", "entity_field": dim,
+        "value_filter": "", "observed_aggregation": "count(metadata.id)", "target_metric_name": metric,
+        "metric_type_val": "event_count_sum", "dimension_key": dim, "extra_dimensions": "",
+    })
+    cases[tpl] = (q, f"{gate_var} >= {gates['anomaly_threshold']}")
+  for name, (query, expected_gate) in cases.items():
+    assert _unfilled(query) == [], name
+    assert _root_gate(query) == expected_gate, name
+
+
+def test_router_paths_use_engine_outlier_gates():
+  """Router-built queries carry gates no stricter than the engine's own outlier rules."""
+  engine = RiskMetricsEngine()
+  router = engine.runner.get_template_router()
+  EntityType, _, StatisticalModel, _ = engine.runner.get_validator_enums()
+  spec_a, spec_b = engine.resolve_compatible_fusion_specs(["auth_attempts_fail", "network_bytes_outbound"], "USER")
+  fusion = router.build_sector_fusion_query(
+      spec_a, spec_b, fusion_threshold_sq=PipelineRunner.GATE_DEFAULTS["fusion_threshold_sq"])
+  # run_sector_fusion flags composite_d >= 3.0, so the query must keep every D >= 3.0 row.
+  assert _root_gate(fusion) == "$composite_threat_norm_sq >= 9.0"
+  zq = router.build_query(target_metric="network_bytes_outbound", entity_type=EntityType.ASSET,
+                          statistical_model=StatisticalModel.STANDARD_Z_SCORE,
+                          anomaly_threshold=PipelineRunner.GATE_DEFAULTS["anomaly_threshold"])
+  assert _root_gate(zq) == "$personal_z >= 3.0"
+  assert _unfilled(fusion) == [] and _unfilled(zq) == []

@@ -588,6 +588,7 @@ order:
         sector_b=spec_b,
         four_stage=four_stage,
         hypothesis_goal=hypothesis_goal or f"Cross-Vector Fusion ({spec_a.metric} + {spec_b.metric}) for {entity}",
+        fusion_threshold_sq=self.runner.GATE_DEFAULTS["fusion_threshold_sq"],
     )
     rendered = self.runner.scope_query_to_entity(rendered, entity)
 
@@ -883,6 +884,7 @@ order:
       )
     elif model_upper in pipeline_map and not mc.is_composite_only(target_metric):
       pipe_arch = pipeline_map[model_upper]
+      gates = self.runner.GATE_DEFAULTS
       rendered = router.build_pipeline_query(
           pipeline_type=pipe_arch,
           target_metric=target_metric,
@@ -895,15 +897,22 @@ order:
           service_account=entity if pipe_arch == PipelineArchitecture.CLOUD_REPOSITORY_SCOPE_DUAL_BRANCH else None,
           target_metrics=list(fusion_metrics) if fusion_metrics else None,
           identifier_field=identifier_field,
+          anomaly_threshold=gates["anomaly_threshold"],
+          fold_change_threshold=gates["fold_change_threshold"],
+          fusion_threshold_sq=gates["fusion_threshold_sq"],
       )
     else:
       stat_enum = stat_model_map.get(model_upper, StatisticalModel.LONGITUDINAL_CUSUM)
+      gates = self.runner.GATE_DEFAULTS
       rendered = router.build_query(
           target_metric=target_metric,
           entity_type=ent_enum,
           statistical_model=stat_enum,
           hypothesis_goal=hypothesis_goal or f"{stat_enum.value} on {target_metric} for {entity}",
           identifier_field=identifier_field,
+          anomaly_threshold=gates["anomaly_threshold"],
+          fold_change_threshold=gates["fold_change_threshold"],
+          robust_threshold=gates["robust_threshold"],
       )
 
     rendered = self.runner.scope_query_to_entity(rendered, entity)
