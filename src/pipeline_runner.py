@@ -27,6 +27,19 @@ logger = logging.getLogger("PipelineRunner")
 class PipelineRunner:
   """Renders and executes multi-stage YARA-L 2.0 query templates."""
 
+  # Root significance gate values passed into secops-risk-metrics-multistage templates and router
+  # (skill v1.8.6+ ships each model's gate as a root `condition:`). They mirror this system's own
+  # outlier rules so the query never drops an entity the engine would flag:
+  #   sigma scores >= 3.0 (ARCHITECTURE.md Statistical Gate, CRI >= 46/50), fusion D >= 3.0
+  #   (run_sector_fusion `composite_d >= 3.0`, so D^2 >= 9.0; the skill default is 12.25),
+  #   fold change >= 2.0 and MAD modified Z >= 3.5 (skill defaults).
+  GATE_DEFAULTS: Dict[str, Any] = {
+      "anomaly_threshold": 3.0,
+      "fold_change_threshold": 2.0,
+      "fusion_threshold_sq": 9.0,
+      "robust_threshold": 3.5,
+  }
+
   def __init__(self, tenant_config: Optional[TenantConfig] = None):
     self.tenant = tenant_config or TenantConfig()
     self.skills_root = get_skills_root()
@@ -51,6 +64,11 @@ class PipelineRunner:
     """Renders a .yl2 template by substituting {{placeholder}} variables."""
     raw_text = template_path.read_text(encoding="utf-8")
     merged_params = dict(params)
+    # Skill v1.8.6 root significance gate: auto-populate the gate placeholders with this system's
+    # outlier rules unless the caller passes its own value.
+    for gate_key, gate_val in self.GATE_DEFAULTS.items():
+      if f"{{{{{gate_key}}}}}" in raw_text and gate_key not in merged_params:
+        merged_params[gate_key] = gate_val
     # v1.8.1 Entity Graph freshness filter: auto-populate {{today_date}} (YYYY-MM-DD in UTC)
     if "{{today_date}}" in raw_text and "today_date" not in merged_params:
       from datetime import datetime, timezone
