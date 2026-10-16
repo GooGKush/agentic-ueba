@@ -190,6 +190,181 @@ class StrategyDecider:
     return "Egress"
 
   @classmethod
+  def analyze_360_insights(
+      cls,
+      radar_result: Optional[Dict[str, Any]],
+      ctx: Optional[Dict[str, Any]] = None,
+      entity_type: str = "USER",
+  ) -> Dict[str, Any]:
+    """Synthesizes deeper UEBA insights from a Tier 1 360° Behavioral Radar report and case context.
+
+    Identifies:
+    1. Multi-sector MITRE ATT&CK Kill-Chain Archetypes (v1.9.1) across active & sub-threshold spokes.
+    2. Dormant / Sparse Baseline Awakenings (observed > 0 on a 30d baseline mean < 1.0 -> TWO_PART_HURDLE).
+    3. Variance-Masked Sub-Threshold Drift (1.25 <= Z < 3.0 with high historical stddev -> 4-stage MAD).
+    4. Cross-Entity Kill-Chain Bridge opportunities (companion USER <-> ASSET/IP in case telemetry).
+    5. Explicit warrant assessment (`secondary_warranted` and `warrant_reasons`) for secondary UEBA hunts.
+    """
+    radar_result = radar_result or {}
+    ctx = ctx or {}
+    sector_z = radar_result.get("sector_z_scores", {})
+    sector_obs = radar_result.get("sector_observed_counts", {})
+    sector_avg = radar_result.get("sector_baseline_avg", {})
+    sector_std = radar_result.get("sector_baseline_std", {})
+    outlier_sectors = list(radar_result.get("outlier_sectors", []))
+    if not outlier_sectors and sector_z:
+      outlier_sectors = [s for s, z in sorted(sector_z.items(), key=lambda x: x[1], reverse=True) if abs(float(z)) >= 2.0]
+
+    subthreshold_sectors = list(radar_result.get("subthreshold_sectors", []))
+    if not subthreshold_sectors and sector_z:
+      subthreshold_sectors = [
+          s for s, z in sorted(sector_z.items(), key=lambda x: x[1], reverse=True) if 1.25 <= float(z) < 2.0
+      ]
+
+    dormant_awakening_sectors = list(radar_result.get("dormant_awakening_sectors", []))
+    if not dormant_awakening_sectors and sector_z and sector_avg:
+      dormant_awakening_sectors = [
+          s
+          for s, z in sorted(sector_z.items(), key=lambda x: x[1], reverse=True)
+          if sector_obs.get(s, 0) > 0 and float(sector_avg.get(s, 0.0)) < 1.0 and float(z) >= 1.5
+      ]
+
+    variance_masked_sectors = list(radar_result.get("variance_masked_sectors", []))
+    if not variance_masked_sectors and sector_z and sector_std:
+      variance_masked_sectors = [
+          s
+          for s, z in sorted(sector_z.items(), key=lambda x: x[1], reverse=True)
+          if 1.25 <= float(z) < 3.0 and float(sector_std.get(s, 0.0)) >= max(float(sector_avg.get(s, 0.0)) * 1.5, 5.0)
+      ]
+
+    elevated = set(outlier_sectors) | set(subthreshold_sectors)
+    matched_archetypes: List[Dict[str, Any]] = []
+    if "Cloud" in elevated and "Workspace" in elevated:
+      matched_archetypes.append({
+          "archetype": "CLOUD_DISCOVERY_TO_COLLECTION",
+          "tactics": ["TA0007 Discovery", "TA0009 Collection"],
+          "sectors": ["Cloud", "Workspace"],
+          "fusion_metrics": ["resource_read_total", "workspace_total_download_actions"],
+      })
+    if "Alerts" in elevated and "Egress" in elevated:
+      matched_archetypes.append({
+          "archetype": "DEFENSE_EVASION_ALERT_TO_EXFILTRATION",
+          "tactics": ["TA0005 Defense Evasion", "TA0010 Exfiltration"],
+          "sectors": ["Alerts", "Egress"],
+          "fusion_metrics": ["alert_event_name_count", "network_bytes_outbound"],
+      })
+    if "Auth" in elevated and "Web" in elevated:
+      matched_archetypes.append({
+          "archetype": (
+              "C2_BEACON_TO_RARE_DESTINATION_EXFIL"
+              if str(entity_type).upper() in ("ASSET", "HOST", "IP")
+              else "INITIAL_ACCESS_TO_DISCOVERY"
+          ),
+          "tactics": ["TA0001 Initial Access", "TA0007 Discovery"],
+          "sectors": ["Auth", "Web"],
+          "fusion_metrics": ["auth_attempts_success", "http_queries_fail"],
+      })
+    if "Auth" in elevated and ("Flows" in elevated or "Egress" in elevated):
+      matched_archetypes.append({
+          "archetype": "CREDENTIAL_ACCESS_TO_LATERAL_MOVEMENT",
+          "tactics": ["TA0006 Credential Access", "TA0008 Lateral Movement"],
+          "sectors": ["Auth", "Flows" if "Flows" in elevated else "Egress"],
+          "fusion_metrics": ["auth_attempts_fail", "network_flows_total"],
+      })
+    if "Workspace" in elevated and "Egress" in elevated:
+      matched_archetypes.append({
+          "archetype": "WORKSPACE_HOARDING_TO_EGRESS",
+          "tactics": ["TA0009 Collection", "TA0010 Exfiltration"],
+          "sectors": ["Workspace", "Egress"],
+          "fusion_metrics": ["workspace_total_download_actions", "network_bytes_outbound"],
+      })
+
+    # Companion entities for cross-entity kill-chain bridging
+    primary_ent = str(ctx.get("primary_entity") or radar_result.get("entity") or "").lower()
+    ent_up = str(entity_type or ctx.get("entity_type") or "USER").upper()
+    companion_entities: List[Dict[str, str]] = []
+    if ent_up in ("USER", "USER_ID", "EMAIL", "SERVICE_ACCOUNT"):
+      for h in ctx.get("extracted_hosts", []):
+        if h and h.lower() != primary_ent:
+          companion_entities.append({
+              "entity": h,
+              "entity_type": "ASSET",
+              "bridge_path": (
+                  "USER_WORKSPACE_HOARDING_TO_HOST_EGRESS"
+                  if "Workspace" in elevated
+                  else "USER_CREDENTIAL_TO_HOST_EXECUTION"
+              ),
+          })
+      for ip in ctx.get("extracted_ips", []):
+        if ip and ip.lower() != primary_ent:
+          companion_entities.append({
+              "entity": ip,
+              "entity_type": "IP",
+              "bridge_path": "USER_CREDENTIAL_TO_HOST_EXECUTION",
+          })
+    else:
+      for u in ctx.get("extracted_users", []):
+        if u and u.lower() != primary_ent:
+          companion_entities.append({
+              "entity": u,
+              "entity_type": "USER",
+              "bridge_path": "HOST_EXECUTION_TO_CLOUD_SA_ACCESS",
+          })
+
+    warrant_reasons: List[str] = []
+    top_z = max((float(v) for v in sector_z.values()), default=0.0)
+    composite_d = float(radar_result.get("composite_d", 0.0))
+    cri = float(radar_result.get("calibrated_risk_index", 0.0))
+
+    if outlier_sectors:
+      warrant_reasons.append(f"Primary 360° sector breach in {', '.join(outlier_sectors)} (peak Z = {top_z:+.2f}σ).")
+    if len(subthreshold_sectors) >= 2 and composite_d >= 2.0:
+      warrant_reasons.append(
+          f"Multi-spoke sub-threshold convergence across {', '.join(subthreshold_sectors)} (joint Euclidean D = {composite_d:.2f}σ)."
+      )
+    if variance_masked_sectors:
+      warrant_reasons.append(
+          f"Potential historical variance masking in {', '.join(variance_masked_sectors)} (high 30d stddev may suppress classical Z; 4-Stage Non-Parametric MAD warranted)."
+      )
+    if dormant_awakening_sectors:
+      warrant_reasons.append(
+          f"Dormant baseline awakening in {', '.join(dormant_awakening_sectors)} (30d baseline mean < 1.0; Two-Part Hurdle / sparse-history math warranted)."
+      )
+    if matched_archetypes:
+      arch_names = [a["archetype"] for a in matched_archetypes]
+      warrant_reasons.append(f"Multi-sector MITRE ATT&CK kill-chain topology matched: {', '.join(arch_names)}.")
+
+    secondary_warranted = bool(
+        radar_result.get("is_outlier")
+        or top_z >= 2.0
+        or cri >= 40.0
+        or (len(subthreshold_sectors) >= 2 and composite_d >= 2.0)
+        or len(variance_masked_sectors) >= 1
+        or len(dormant_awakening_sectors) >= 1
+    )
+
+    recommended_focus_sector = radar_result.get("top_sector") or "Auth"
+    if not outlier_sectors:
+      if variance_masked_sectors:
+        recommended_focus_sector = variance_masked_sectors[0]
+      elif dormant_awakening_sectors:
+        recommended_focus_sector = dormant_awakening_sectors[0]
+      elif subthreshold_sectors:
+        recommended_focus_sector = subthreshold_sectors[0]
+
+    return {
+        "active_sectors": outlier_sectors,
+        "subthreshold_sectors": subthreshold_sectors,
+        "dormant_awakening_sectors": dormant_awakening_sectors,
+        "variance_masked_sectors": variance_masked_sectors,
+        "matched_killchain_archetypes": matched_archetypes,
+        "companion_entities": companion_entities,
+        "secondary_warranted": secondary_warranted,
+        "warrant_reasons": warrant_reasons,
+        "recommended_focus_sector": recommended_focus_sector,
+    }
+
+  @classmethod
   def score_hypothesis_confidence(
       cls,
       model_name: str,
@@ -203,11 +378,12 @@ class StrategyDecider:
       executed_signatures: Optional[Set[str]] = None,
       empty_families: Optional[Set[str]] = None,
       llm_proposed_confidence: Optional[float] = None,
+      target_entity_override: Optional[str] = None,
   ) -> Tuple[float, str, str]:
     """Computes an evidence-anchored confidence score [0.00 - 1.00], band, and breakdown string."""
     ctx = ctx or {}
     fusion_list = list(fusion_metrics or [])
-    sig = cls.build_signature(model_name, target_metric, fusion_list)
+    sig = cls.build_signature(model_name, target_metric, fusion_list, target_entity_override)
 
     if executed_signatures and sig in executed_signatures:
       return 0.0, "SUPPRESSED", "VETO (0.00): Hypothesis signature already executed in this investigation."
@@ -222,6 +398,9 @@ class StrategyDecider:
     sector_z = (radar_result or {}).get("sector_z_scores", {})
     sector_obs = (radar_result or {}).get("sector_observed_counts", {})
     outlier_sectors = (radar_result or {}).get("outlier_sectors", [])
+    subthreshold_sectors = (radar_result or {}).get("subthreshold_sectors", [])
+    variance_masked = (radar_result or {}).get("variance_masked_sectors", [])
+    dormant_awakening = (radar_result or {}).get("dormant_awakening_sectors", [])
 
     # 1. Tier 1 360° Spoke Magnitude Signal (+0.00 to +0.45)
     raw_z = sector_z.get(primary_family, sector_z.get(outlier_vector or "", None))
@@ -237,11 +416,29 @@ class StrategyDecider:
     elif target_z >= 1.5:
       score += 0.20
       reasons.append(f"Tier1_{primary_family}_Z={target_z:+.2f}σ(+0.20)")
+    elif target_z >= 1.25:
+      score += 0.15
+      reasons.append(f"Tier1_{primary_family}_SubThresholdZ={target_z:+.2f}σ(+0.15)")
 
     # Multi-Vector Fusion bonus when 2+ sectors are elevated in Tier 1
-    if len(fusion_list) >= 2 and len(outlier_sectors) >= 2:
+    if len(fusion_list) >= 2 and (len(outlier_sectors) >= 2 or len(outlier_sectors) + len(subthreshold_sectors) >= 2):
       score += 0.20
-      reasons.append(f"MultiSectorOutliers({','.join(outlier_sectors[:2])})(+0.20)")
+      elev_names = (list(outlier_sectors) + list(subthreshold_sectors))[:2]
+      reasons.append(f"MultiSectorOutliers({','.join(elev_names)})(+0.20)")
+
+    # Variance-Masked 4-Stage MAD bonus & Dormancy Awakening Two-Part Hurdle bonus
+    m_up = (model_name or "").upper()
+    if m_up == "MAD" and (primary_family in variance_masked or (outlier_vector and outlier_vector in variance_masked)):
+      score += 0.25
+      reasons.append(f"VarianceMaskedBaseline({primary_family})(+0.25)")
+    if m_up in ("TWO_PART_HURDLE", "BAYESIAN_GAMMA", "POISSON") and (
+        primary_family in dormant_awakening or (outlier_vector and outlier_vector in dormant_awakening)
+    ):
+      score += 0.25
+      reasons.append(f"DormantBaselineAwakening({primary_family})(+0.25)")
+    if target_entity_override:
+      score += 0.20
+      reasons.append(f"CrossEntityBridge({target_entity_override})(+0.20)")
 
     # 2. Case / Alert UDM Touchpoint Alignment (+0.00 to +0.35)
     fam_spec = cls.FAMILY_SIGNALS.get(primary_family, {})
@@ -262,10 +459,13 @@ class StrategyDecider:
       score += 0.22
       reasons.append(f"AlertSignal({primary_family})(+0.22)")
 
-    # 3. Epistemic Pivot Signal (+0.15 when prior Tier 2A refuted H1 on an active outlier sector)
-    if is_pivot and prior_refuted and (target_z >= 2.0 or len(outlier_sectors) >= 1):
+    # 3. Epistemic Pivot Signal (+0.15 when prior Tier 2A refuted H1 OR confirmed an outlier warranting 2nd-order progression)
+    if is_pivot and (target_z >= 2.0 or len(outlier_sectors) >= 1 or variance_masked or dormant_awakening):
       score += 0.15
-      reasons.append("EpistemicRefutationPivot(+0.15)")
+      if prior_refuted:
+        reasons.append("EpistemicRefutationPivot(+0.15)")
+      else:
+        reasons.append("ConfirmedOutlierProgressionPivot(+0.15)")
 
     # Blend modestly with LLM proposed confidence if provided, bounded by evidence
     if llm_proposed_confidence is not None:
@@ -273,7 +473,7 @@ class StrategyDecider:
       score = blended
 
     # 4. Zero-Telemetry Dampener: If Tier 1 ran and observed 0 events in that spoke AND no UDM match
-    if radar_result and primary_family in sector_obs:
+    if radar_result and primary_family in sector_obs and not target_entity_override:
       if sector_obs.get(primary_family, 0) == 0 and not (udm_events & fam_spec.get("udm_events", set())) and target_z < 1.0:
         if primary_family != "Endpoint":  # Endpoint isn't always a User 360 spoke
           score = min(score, 0.35)
@@ -420,11 +620,24 @@ class StrategyDecider:
         outlier_vector=tier2a_directive.outlier_vector,
         radar_result=radar_result,
     )
+    radar_insights = ctx.get("radar_insights") or cls.analyze_360_insights(radar_result, ctx, entity_type)
+
+    # Classify Tier 2A post-data outcome shape & MITRE progression (v1.9.1)
+    stats_rows = int(tier2a_result.get("stats_rows", 0) or 0)
+    active_sec = tier2a_directive.outlier_vector or (outlier_sectors[0] if outlier_sectors else "")
+    if t2a_outlier:
+      outcome_class = "FLEET_WAVE" if stats_rows >= 10 else "ACUTE_OUTLIER"
+    elif active_sec in radar_insights.get("dormant_awakening_sectors", []):
+      outcome_class = "SPARSE_BASELINE"
+    else:
+      outcome_class = "CLEAN_OR_SUBTHRESHOLD"
+    tier2a_directive.post_data_outcome_class = outcome_class
+    tier2a_directive.radar_insights = radar_insights
 
     candidates: List[CandidateHypothesis] = []
 
-    # CASE A: Tier 2A confirmed an outlier OR 2+ sectors in Tier 1 are anomalous -> Propose Cross-Vector / Roll-Up Fusion!
-    if len(outlier_sectors) >= 2 and "FUSION" not in t2a_model:
+    # CASE A: 2+ sectors in Tier 1 are anomalous -> Propose Cross-Vector / Roll-Up Fusion!
+    if len(outlier_sectors) >= 2 and "FUSION" not in t2a_model and "KILLCHAIN" not in t2a_model:
       sec_a, sec_b = outlier_sectors[0], outlier_sectors[1]
       m_a = sector_metrics.get(sec_a, "workspace_total_download_actions")
       m_b = sector_metrics.get(sec_b, "network_bytes_outbound")
@@ -464,12 +677,266 @@ class StrategyDecider:
           )
       )
 
-    # CASE B: Tier 2A REFUTED H1 (is_outlier == False), but an active sector anomaly or UDM signal remains unexplained!
-    if not t2a_outlier:
-      active_sec = tier2a_directive.outlier_vector or (outlier_sectors[0] if outlier_sectors else "")
-      active_z = abs(float(sector_z.get(active_sec, 0.0)))
+    # CASE A2: Matched MITRE ATT&CK Kill-Chain Archetype across active + sub-threshold sectors
+    matched_archs = radar_insights.get("matched_killchain_archetypes", [])
+    if matched_archs and len(outlier_sectors) < 2 and "KILLCHAIN" not in t2a_model and "FUSION" not in t2a_model:
+      top_arch = matched_archs[0]
+      arch_id = top_arch["archetype"]
+      f_metrics = top_arch["fusion_metrics"]
+      if arch_id != "WORKSPACE_HOARDING_TO_EGRESS":
+        pivot_why = (
+            f"360° Radar topology matched MITRE ATT&CK kill-chain `{arch_id}` ({' -> '.join(top_arch['tactics'])}) "
+            f"across `{', '.join(top_arch['sectors'])}`. Executing multi-stage kill-chain fusion on `{f_metrics[0]}` + `{f_metrics[1]}`."
+        )
+        score, band, breakdown = cls.score_hypothesis_confidence(
+            model_name=f"KILLCHAIN_{arch_id}",
+            target_metric=f_metrics[0],
+            fusion_metrics=f_metrics,
+            outlier_vector=active_sec,
+            ctx=ctx,
+            radar_result=radar_result,
+            is_pivot=True,
+            prior_refuted=not t2a_outlier,
+            executed_signatures=executed_signatures,
+            empty_families=empty_families,
+        )
+        candidates.append(
+            CandidateHypothesis(
+                hypothesis_title=f"MITRE ATT&CK Kill-Chain Progression: `{arch_id}`",
+                selected_skill="secops-risk-metrics-multistage",
+                model_name=f"KILLCHAIN_{arch_id}",
+                directive_query="killchain_archetype",
+                target_metric=f_metrics[0],
+                fusion_metrics=f_metrics,
+                killchain_archetype=arch_id,
+                hypothesis_h0=f"Sub-threshold activity across {', '.join(top_arch['sectors'])} is uncorrelated background noise.",
+                hypothesis_h1=f"Entity `{target_entity}` is progressing along MITRE ATT&CK kill-chain `{arch_id}`.",
+                evidentiary_defense=pivot_why,
+                confidence_score=score,
+                confidence_band=band,
+                confidence_breakdown=breakdown,
+                pivot_reason=pivot_why,
+            )
+        )
 
-      # B1: If C2_BEACONING_JITTER refuted periodic beaconing on an Egress spike -> Pivot to MACD_MOMENTUM_VELOCITY or ELEPHANT_FLOW
+    # CASE B: Tier 2A CONFIRMED an outlier (ACUTE_OUTLIER) -> Perform Second-Order Verification / Kill-Chain Progression!
+    if t2a_outlier:
+      # B-Conf-1: Confirmed Workspace Download Surge -> Pivot to Workspace Exfiltration Triad (Downloads + Changes + Emails vs Peer Cohort)
+      if active_sec == "Workspace" and t2a_model != "PART_OF_THE_WHOLE_TRIAD_MULTILEVEL":
+        pivot_why = (
+            f"Tier 2A (`{t2a_model}`) confirmed an acute Workspace anomaly on `{target_entity}`. "
+            "Pivoting to `PART_OF_THE_WHOLE_TRIAD_MULTILEVEL` verifies whether the user is simultaneously staging document modifications "
+            "(`workspace_total_change_actions`) and outbound emails (`workspace_emails_sent`) relative to their enterprise peer cohort."
+        )
+        score, band, breakdown = cls.score_hypothesis_confidence(
+            model_name="PART_OF_THE_WHOLE_TRIAD_MULTILEVEL",
+            target_metric="workspace_total_download_actions",
+            fusion_metrics=[
+                "workspace_total_download_actions",
+                "workspace_total_change_actions",
+                "workspace_emails_sent",
+            ],
+            outlier_vector="Workspace",
+            ctx=ctx,
+            radar_result=radar_result,
+            is_pivot=True,
+            prior_refuted=False,
+            executed_signatures=executed_signatures,
+            empty_families=empty_families,
+        )
+        candidates.append(
+            CandidateHypothesis(
+                hypothesis_title="Workspace Exfiltration Triad vs Peer Cohort (Download + Change + Email)",
+                selected_skill="secops-risk-metrics-multistage",
+                model_name="PART_OF_THE_WHOLE_TRIAD_MULTILEVEL",
+                directive_query="workspace_triad",
+                target_metric="workspace_total_download_actions",
+                fusion_metrics=[
+                    "workspace_total_download_actions",
+                    "workspace_total_change_actions",
+                    "workspace_emails_sent",
+                ],
+                hypothesis_h0="Confirmed download spike is an isolated administrative backup shared by the team cohort.",
+                hypothesis_h1=f"User `{target_entity}` exhibits a coupled Workspace exfiltration triad departing from peer cohort norms.",
+                evidentiary_defense=pivot_why,
+                confidence_score=score,
+                confidence_band=band,
+                confidence_breakdown=breakdown,
+                pivot_reason=pivot_why,
+            )
+        )
+
+      # B-Conf-2: Confirmed Cloud CRUD Surge -> Pivot to Cloud Repository Scope & Caller IP Attribution
+      elif active_sec == "Cloud" and t2a_model != "CLOUD_REPOSITORY_SCOPE":
+        pivot_why = (
+            f"Tier 2A (`{t2a_model}`) confirmed a Cloud CRUD surge on `{target_entity}`. "
+            "Pivoting to `CLOUD_REPOSITORY_SCOPE` attributes the exact target cloud resource (`target.resource.name`) and origin caller IP (`principal.ip`)."
+        )
+        score, band, breakdown = cls.score_hypothesis_confidence(
+            model_name="CLOUD_REPOSITORY_SCOPE",
+            target_metric="resource_read_total",
+            outlier_vector="Cloud",
+            ctx=ctx,
+            radar_result=radar_result,
+            is_pivot=True,
+            prior_refuted=False,
+            executed_signatures=executed_signatures,
+            empty_families=empty_families,
+        )
+        candidates.append(
+            CandidateHypothesis(
+                hypothesis_title="Cloud Repository Scope & Caller IP Attribution (`cloud_repository_scope_dual_branch`)",
+                selected_skill="secops-risk-metrics-multistage",
+                model_name="CLOUD_REPOSITORY_SCOPE",
+                directive_query="cloud_repo_scope",
+                target_metric="resource_read_total",
+                outcome_mode="total",
+                hypothesis_h0="Cloud CRUD surge targets standard CI/CD deployment buckets from known corporate IPs.",
+                hypothesis_h1=f"Identity `{target_entity}` is accessing sensitive cloud repositories from an anomalous caller IP.",
+                evidentiary_defense=pivot_why,
+                confidence_score=score,
+                confidence_band=band,
+                confidence_breakdown=breakdown,
+                pivot_reason=pivot_why,
+            )
+        )
+
+      # B-Conf-3: Confirmed Egress / DNS / Web Outlier -> Pivot to Rare Destination Entity Context Graph Verification
+      elif active_sec in ("Egress", "DNS", "Web") and "RARE_DESTINATION" not in t2a_model and "DOMAIN_PREVALENCE" not in t2a_model:
+        ecg_model = (
+            "HYBRID_METRIC_DERIVED_DOMAIN_PREVALENCE_2STAGE"
+            if active_sec == "Web"
+            else "RARE_DESTINATION_ECG_3STAGE"
+        )
+        ecg_metric = (
+            "http_queries_total"
+            if active_sec == "Web"
+            else ("dns_queries_total" if active_sec == "DNS" else "network_bytes_outbound")
+        )
+        pivot_why = (
+            f"Tier 2A (`{t2a_model}`) confirmed an outlier in `{active_sec}`. "
+            f"Pivoting to `{ecg_model}` enriches the confirmed behavioral surge with Entity Context Graph `DERIVED_CONTEXT` "
+            "to verify whether the destination domains/IPs have ultra-low enterprise fleet prevalence (`day_max <= 3`)."
+        )
+        score, band, breakdown = cls.score_hypothesis_confidence(
+            model_name=ecg_model,
+            target_metric=ecg_metric,
+            outlier_vector=active_sec,
+            ctx=ctx,
+            radar_result=radar_result,
+            is_pivot=True,
+            prior_refuted=False,
+            executed_signatures=executed_signatures,
+            empty_families=empty_families,
+        )
+        candidates.append(
+            CandidateHypothesis(
+                hypothesis_title=f"Rare Destination Entity Graph Verification (`{ecg_model}`)",
+                selected_skill="secops-risk-metrics-multistage",
+                model_name=ecg_model,
+                directive_query="dynamic_metric",
+                target_metric=ecg_metric,
+                hypothesis_h0="Confirmed network/DNS/web surge communicates with established high-prevalence enterprise infrastructure.",
+                hypothesis_h1=f"Confirmed `{active_sec}` outlier on `{target_entity}` is contacting rare external C2/exfiltration destinations (`day_max <= 3`).",
+                evidentiary_defense=pivot_why,
+                confidence_score=score,
+                confidence_band=band,
+                confidence_breakdown=breakdown,
+                pivot_reason=pivot_why,
+            )
+        )
+
+      # B-Conf-4: Confirmed Auth Outlier -> Pivot to Brute-Force-to-Compromise Dual-Sector Fusion (auth_attempts_fail + auth_attempts_success)
+      elif active_sec == "Auth" and "FUSION" not in t2a_model:
+        pivot_why = (
+            f"Tier 2A (`{t2a_model}`) confirmed an authentication anomaly on `{target_entity}`. "
+            "Pivoting to `DUAL_SECTOR_FUSION_3STAGE` across `auth_attempts_fail` and `auth_attempts_success` verifies "
+            "whether the credential attack culminated in a successful authentication breach (MITRE T1110 -> T1078)."
+        )
+        score, band, breakdown = cls.score_hypothesis_confidence(
+            model_name="DUAL_SECTOR_FUSION_3STAGE",
+            target_metric="auth_attempts_fail",
+            fusion_metrics=["auth_attempts_fail", "auth_attempts_success"],
+            outlier_vector="Auth",
+            ctx=ctx,
+            radar_result=radar_result,
+            is_pivot=True,
+            prior_refuted=False,
+            executed_signatures=executed_signatures,
+            empty_families=empty_families,
+        )
+        candidates.append(
+            CandidateHypothesis(
+                hypothesis_title="Credential Attack Breach Verification (`auth_attempts_fail` × `auth_attempts_success`)",
+                selected_skill="secops-risk-metrics-multistage",
+                model_name="DUAL_SECTOR_FUSION_3STAGE",
+                directive_query="sector_fusion",
+                target_metric="auth_attempts_fail",
+                fusion_metrics=["auth_attempts_fail", "auth_attempts_success"],
+                hypothesis_h0="Authentication failures were blocked by IAM controls without any successful login breach.",
+                hypothesis_h1=f"Credential attack on `{target_entity}` was followed by an anomalous surge in successful logins (`auth_attempts_success`).",
+                evidentiary_defense=pivot_why,
+                confidence_score=score,
+                confidence_band=band,
+                confidence_breakdown=breakdown,
+                pivot_reason=pivot_why,
+            )
+        )
+
+      # B-Conf-5: Confirmed Alerts / Endpoint Outlier -> Pivot to MITRE Kill-Chain Execution/Alert-to-Exfiltration
+      elif active_sec in ("Alerts", "Endpoint", "Flows") and "KILLCHAIN" not in t2a_model:
+        kc_arch = (
+            "DEFENSE_EVASION_ALERT_TO_EXFILTRATION"
+            if active_sec == "Alerts"
+            else "EXECUTION_TO_EXFILTRATION"
+        )
+        kc_metrics = (
+            ["alert_event_name_count", "network_bytes_outbound"]
+            if active_sec == "Alerts"
+            else ["file_executions_total", "network_bytes_outbound"]
+        )
+        pivot_why = (
+            f"Tier 2A (`{t2a_model}`) confirmed an endpoint/alert anomaly on `{target_entity}`. "
+            f"Pivoting to MITRE Kill-Chain `{kc_arch}` tests whether the endpoint execution/alert surge triggered outbound data exfiltration."
+        )
+        score, band, breakdown = cls.score_hypothesis_confidence(
+            model_name=f"KILLCHAIN_{kc_arch}",
+            target_metric=kc_metrics[0],
+            fusion_metrics=kc_metrics,
+            outlier_vector=active_sec,
+            ctx=ctx,
+            radar_result=radar_result,
+            is_pivot=True,
+            prior_refuted=False,
+            executed_signatures=executed_signatures,
+            empty_families=empty_families,
+        )
+        candidates.append(
+            CandidateHypothesis(
+                hypothesis_title=f"MITRE Kill-Chain Progression: `{kc_arch}`",
+                selected_skill="secops-risk-metrics-multistage",
+                model_name=f"KILLCHAIN_{kc_arch}",
+                directive_query="killchain_archetype",
+                target_metric=kc_metrics[0],
+                fusion_metrics=kc_metrics,
+                killchain_archetype=kc_arch,
+                hypothesis_h0="Confirmed endpoint/alert activity remained local with no outbound network exfiltration.",
+                hypothesis_h1=f"Endpoint anomaly on `{target_entity}` progressed to outbound data exfiltration (`network_bytes_outbound`).",
+                evidentiary_defense=pivot_why,
+                confidence_score=score,
+                confidence_band=band,
+                confidence_breakdown=breakdown,
+                pivot_reason=pivot_why,
+            )
+        )
+
+    # CASE C: Tier 2A REFUTED H1 (is_outlier == False), but an active sector anomaly, variance-masked drift, or UDM signal remains unexplained!
+    if not t2a_outlier:
+      active_z = abs(float(sector_z.get(active_sec, 0.0)))
+      variance_masked = radar_insights.get("variance_masked_sectors", [])
+      dormant_awakening = radar_insights.get("dormant_awakening_sectors", [])
+
+      # C1: If C2_BEACONING_JITTER refuted periodic beaconing on an Egress spike -> Pivot to MACD_MOMENTUM_VELOCITY or ELEPHANT_FLOW
       if t2a_model == "C2_BEACONING_JITTER" and (active_z >= 2.0 or "Egress" in outlier_sectors):
         pivot_why = (
             f"Tier 2A (`C2_BEACONING_JITTER`) returned high timing jitter (`NOMINAL`), refuting periodic robotic C2 polling. "
@@ -505,7 +972,7 @@ class StrategyDecider:
             )
         )
 
-      # B2: If POISSON_BURST_CLUSTERING refuted credential spray on an Auth spike -> Pivot to CIRCADIAN_VON_MISES on auth_attempts_total
+      # C2: If POISSON_BURST_CLUSTERING refuted credential spray on an Auth spike -> Pivot to CIRCADIAN_VON_MISES on auth_attempts_total
       if t2a_model == "POISSON_BURST_CLUSTERING" and (active_z >= 2.0 or "Auth" in outlier_sectors):
         pivot_why = (
             f"Tier 2A (`POISSON_BURST_CLUSTERING`) found no high-frequency Fano burst dispersion, ruling out automated brute-force spraying. "
@@ -540,7 +1007,7 @@ class StrategyDecider:
             )
         )
 
-      # B3: If another anomalous sector exists in Tier 1 that wasn't the primary vector of Tier 2A
+      # C3: If another anomalous sector exists in Tier 1 that wasn't the primary vector of Tier 2A
       for sec in outlier_sectors:
         if sec != active_sec:
           sec_metric = sector_metrics.get(sec, "http_queries_total")
@@ -578,6 +1045,165 @@ class StrategyDecider:
               )
           )
 
+      # C4: If CLOUD_CRUD_SURGE on total volume was refuted -> Pivot to CLOUD_REPOSITORY_SCOPE (outcome_mode="fail") for Access-Denied Recon
+      if t2a_model == "CLOUD_CRUD_SURGE" or (active_sec == "Cloud" and t2a_model != "CLOUD_REPOSITORY_SCOPE"):
+        pivot_why = (
+            f"Tier 2A (`{t2a_model}`) did not find a total-volume CRUD breach on `{target_entity}`. "
+            "Pivoting to `CLOUD_REPOSITORY_SCOPE` in `fail` mode (`resource_*_fail`) tests whether the identity triggered "
+            "Access-Denied reconnaissance spikes against restricted cloud repositories that were diluted in total CRUD counts."
+        )
+        score, band, breakdown = cls.score_hypothesis_confidence(
+            model_name="CLOUD_REPOSITORY_SCOPE",
+            target_metric="resource_read_fail",
+            outlier_vector="Cloud",
+            ctx=ctx,
+            radar_result=radar_result,
+            is_pivot=True,
+            prior_refuted=True,
+            executed_signatures=executed_signatures,
+            empty_families=empty_families,
+        )
+        candidates.append(
+            CandidateHypothesis(
+                hypothesis_title="Cloud Access-Denied Reconnaissance (`CLOUD_REPOSITORY_SCOPE` fail mode)",
+                selected_skill="secops-risk-metrics-multistage",
+                model_name="CLOUD_REPOSITORY_SCOPE",
+                directive_query="cloud_repo_scope",
+                target_metric="resource_read_fail",
+                outcome_mode="fail",
+                hypothesis_h0="Cloud access failures reflect benign misconfigured IAM bindings.",
+                hypothesis_h1=f"Identity `{target_entity}` is enumerating restricted cloud repositories, generating anomalous `resource_*_fail` spikes.",
+                evidentiary_defense=pivot_why,
+                confidence_score=score,
+                confidence_band=band,
+                confidence_breakdown=breakdown,
+                pivot_reason=pivot_why,
+            )
+        )
+
+      # C5: Parametric Model Refuted on Variance-Masked or Elevated Sector -> Pivot to True 4-Stage Non-Parametric MAD!
+      if t2a_model in ("MACD_MOMENTUM_VELOCITY", "LONGITUDINAL_CUSUM_DRIFT", "STANDARD_Z_SCORE", "CIRCADIAN_VON_MISES") and (
+          active_sec in variance_masked or active_z >= 2.0
+      ):
+        mad_metric = t2a_metric or sector_metrics.get(active_sec, "network_bytes_outbound")
+        pivot_why = (
+            f"Parametric Tier 2A model (`{t2a_model}`) returned sub-threshold results on `{mad_metric}`. "
+            "When historical bursts pollute the 30-day standard deviation (`stddev`), parametric Z-scores are compressed. "
+            f"Pivoting to 4-Stage Non-Parametric `MAD` (`mad_robust_z_4stage.yl2`) scores `{mad_metric}` against the 30-day median and MAD scale (`$modified_z`) to unmask variance-suppressed outliers."
+        )
+        score, band, breakdown = cls.score_hypothesis_confidence(
+            model_name="MAD",
+            target_metric=mad_metric,
+            outlier_vector=active_sec,
+            ctx=ctx,
+            radar_result=radar_result,
+            is_pivot=True,
+            prior_refuted=True,
+            executed_signatures=executed_signatures,
+            empty_families=empty_families,
+        )
+        candidates.append(
+            CandidateHypothesis(
+                hypothesis_title=f"Variance-Resistant 4-Stage Non-Parametric MAD (`{mad_metric}`)",
+                selected_skill="secops-risk-metrics-multistage",
+                model_name="MAD",
+                directive_query="dynamic_metric",
+                target_metric=mad_metric,
+                hypothesis_h0=f"Observed `{mad_metric}` volume is within normal median absolute deviation bounds (`$modified_z < 3.5`).",
+                hypothesis_h1=f"Prior 30-day bursts inflated parametric `stddev` on `{mad_metric}`, masking a true median-anchored outlier (`$modified_z >= 3.5`).",
+                evidentiary_defense=pivot_why,
+                confidence_score=score,
+                confidence_band=band,
+                confidence_breakdown=breakdown,
+                pivot_reason=pivot_why,
+            )
+        )
+
+      # C6: Dormant / Sparse Baseline Sector -> Pivot to TWO_PART_HURDLE
+      if active_sec in dormant_awakening and t2a_model != "TWO_PART_HURDLE":
+        hurdle_metric = t2a_metric or sector_metrics.get(active_sec, "resource_creation_total")
+        pivot_why = (
+            f"360° Radar indicates `{active_sec}` (`{hurdle_metric}`) has a near-zero 30-day baseline mean (`SPARSE_BASELINE`). "
+            "Pivoting to `TWO_PART_HURDLE` evaluates the Bernoulli probability of dormancy awakening ($P(\\text{active}) < 0.10$) alongside conditional intensity."
+        )
+        score, band, breakdown = cls.score_hypothesis_confidence(
+            model_name="TWO_PART_HURDLE",
+            target_metric=hurdle_metric,
+            outlier_vector=active_sec,
+            ctx=ctx,
+            radar_result=radar_result,
+            is_pivot=True,
+            prior_refuted=True,
+            executed_signatures=executed_signatures,
+            empty_families=empty_families,
+        )
+        candidates.append(
+            CandidateHypothesis(
+                hypothesis_title=f"Dormancy Awakening Two-Part Hurdle (`{hurdle_metric}`)",
+                selected_skill="secops-risk-metrics-multistage",
+                model_name="TWO_PART_HURDLE",
+                directive_query="dynamic_metric",
+                target_metric=hurdle_metric,
+                hypothesis_h0=f"Sparse activity in `{hurdle_metric}` reflects normal periodic maintenance.",
+                hypothesis_h1=f"Dormant baseline break on `{target_entity}` in `{hurdle_metric}` violates historical activation probability.",
+                evidentiary_defense=pivot_why,
+                confidence_score=score,
+                confidence_band=band,
+                confidence_breakdown=breakdown,
+                pivot_reason=pivot_why,
+            )
+        )
+
+    # CASE D: Cross-Entity Kill-Chain Bridge when companion entities (USER <-> ASSET/IP) exist in Case Telemetry
+    for comp in radar_insights.get("companion_entities", [])[:1]:
+      comp_ent = comp["entity"]
+      comp_type = comp["entity_type"]
+      bridge_path = comp["bridge_path"]
+      if comp_type in ("ASSET", "HOST", "IP"):
+        bridge_model = "ZIPFIAN_PROCESS_RARITY"
+        bridge_skill = "secops-statistical-hunter"
+        bridge_query = "zipfian_rarity"
+        bridge_metric = "file_executions_total"
+      else:
+        bridge_model = "CLOUD_REPOSITORY_SCOPE"
+        bridge_skill = "secops-risk-metrics-multistage"
+        bridge_query = "cloud_repo_scope"
+        bridge_metric = "resource_read_total"
+      pivot_why = (
+          f"Case telemetry links primary {entity_type} `{target_entity}` to companion {comp_type} `{comp_ent}` (`{bridge_path}`). "
+          f"Bridging the UEBA investigation across the entity boundary to `{comp_ent}` tests for multi-stage lateral/execution progression."
+      )
+      score, band, breakdown = cls.score_hypothesis_confidence(
+          model_name=bridge_model,
+          target_metric=bridge_metric,
+          outlier_vector=active_sec,
+          ctx=ctx,
+          radar_result=radar_result,
+          is_pivot=True,
+          prior_refuted=not t2a_outlier,
+          executed_signatures=executed_signatures,
+          empty_families=empty_families,
+          target_entity_override=comp_ent,
+      )
+      candidates.append(
+          CandidateHypothesis(
+              hypothesis_title=f"Cross-Entity Kill-Chain Bridge (`{bridge_path}` -> `{comp_ent}`)",
+              selected_skill=bridge_skill,
+              model_name=bridge_model,
+              directive_query=bridge_query,
+              target_entity=comp_ent,
+              entity_type=comp_type,
+              target_metric=bridge_metric,
+              hypothesis_h0=f"Companion {comp_type} `{comp_ent}` exhibits only routine baseline operations.",
+              hypothesis_h1=f"Attack chain bridged from `{target_entity}` to companion {comp_type} `{comp_ent}` via `{bridge_path}`.",
+              evidentiary_defense=pivot_why,
+              confidence_score=score,
+              confidence_band=band,
+              confidence_breakdown=breakdown,
+              pivot_reason=pivot_why,
+          )
+      )
+
     if not candidates:
       return None
 
@@ -596,14 +1222,18 @@ class StrategyDecider:
       return None
 
     remaining = [c for c in candidates[1:] if c.confidence_band != "SUPPRESSED"]
+    piv_entity = top.target_entity or target_entity
+    piv_entity_type = top.entity_type or entity_type
     return StrategyDirective(
         selected_skill=top.selected_skill,
         model_name=top.model_name,
         directive_query=top.directive_query,
-        target_entity=target_entity,
-        entity_type=entity_type,
+        target_entity=piv_entity,
+        entity_type=piv_entity_type,
         target_metric=top.target_metric,
         fusion_metrics=list(top.fusion_metrics),
+        killchain_archetype=top.killchain_archetype,
+        outcome_mode=top.outcome_mode,
         identifier_field=top.identifier_field,
         threat_summary=top.hypothesis_title,
         hypothesis_h0=top.hypothesis_h0,
@@ -614,12 +1244,14 @@ class StrategyDecider:
         confidence_band=top.confidence_band,
         confidence_breakdown=top.confidence_breakdown,
         pivot_reason=top.pivot_reason,
-        flight_card_title=f"Tier 2B Autonomous Pivot — {top.hypothesis_title}: `{target_entity}`",
+        flight_card_title=f"Tier 2B Autonomous Pivot — {top.hypothesis_title}: `{piv_entity}`",
         investigation_tier="TIER_2B_PIVOT",
         outlier_vector=tier2a_directive.outlier_vector,
+        radar_insights=radar_insights,
+        post_data_outcome_class=outcome_class,
         candidate_hypotheses=remaining,
         recommended_avenues=[cls.format_hypothesis_for_avenue(c) for c in remaining] or [
-            f"Correlate `{target_entity}` pivot findings with endpoint EDR and identity session logs.",
+            f"Correlate `{piv_entity}` pivot findings with endpoint EDR and identity session logs.",
         ],
     )
 
@@ -689,6 +1321,20 @@ class StrategyDecider:
       if ip:
         extracted_ips.add(str(ip))
 
+    for a in alerts:
+      for ent in a.get("entities", []) or []:
+        if isinstance(ent, dict):
+          etype = str(ent.get("type") or ent.get("entityType") or "").upper()
+          val = str(ent.get("value") or ent.get("identifier") or ent.get("name") or "").strip()
+          if not val:
+            continue
+          if etype in ("USER", "USER_ID", "EMAIL"):
+            extracted_users.add(val.lower())
+          elif etype in ("ASSET", "HOST", "HOSTNAME", "MACHINE"):
+            extracted_hosts.add(val.lower())
+          elif etype in ("IP", "IP_ADDRESS"):
+            extracted_ips.add(val)
+
     target_entity = default_entity
     entity_type = default_entity_type
     if not target_entity:
@@ -705,7 +1351,7 @@ class StrategyDecider:
         target_entity = "unknown_entity"
         entity_type = "USER"
 
-    return {
+    base_ctx = {
         "case_id": case_id,
         "case_title": case_title,
         "case_description": case_desc,
@@ -716,12 +1362,22 @@ class StrategyDecider:
         "target_applications": list(target_apps),
         "threat_associations": list(threat_associations),
         "outcome_metrics": outcome_metrics,
+        "extracted_users": sorted(extracted_users),
+        "extracted_hosts": sorted(extracted_hosts),
+        "extracted_ips": sorted(extracted_ips),
         "primary_entity": target_entity,
         "entity_type": entity_type,
         "investigation_tier": tier,
         "outlier_vector": outlier_vector,
         "radar_result": radar_result,
     }
+    if radar_result:
+      base_ctx["radar_insights"] = cls.analyze_360_insights(
+          radar_result=radar_result,
+          ctx=base_ctx,
+          entity_type=entity_type,
+      )
+    return base_ctx
 
   @classmethod
   async def decide_agentic(
@@ -1038,6 +1694,20 @@ Output valid JSON matching this schema:
     directive.candidate_hypotheses = valid_cands
     if valid_cands:
       directive.recommended_avenues = [cls.format_hypothesis_for_avenue(c) for c in valid_cands]
+    if radar_result and not directive.radar_insights:
+      directive.radar_insights = ctx.get("radar_insights") or cls.analyze_360_insights(
+          radar_result=radar_result,
+          ctx=ctx,
+          entity_type=directive.entity_type,
+      )
+    if directive.target_metric and not directive.killchain_progression:
+      try:
+        from src.pipeline_runner import PipelineRunner
+        fmt_cls = PipelineRunner().get_triage_formatter()
+        if fmt_cls:
+          directive.killchain_progression = fmt_cls.get_mitre_progression(directive.target_metric)
+      except Exception:
+        pass
     return directive
 
   @classmethod
@@ -1047,7 +1717,7 @@ Output valid JSON matching this schema:
       executed_signatures: Optional[Set[str]] = None,
       empty_families: Optional[Set[str]] = None,
   ) -> StrategyDirective:
-    """Robust, regex-safe, UDM-aware and v1.8.0 38-metric-aware heuristic reasoner with hypothesis defense."""
+    """Robust, regex-safe, UDM-aware and v1.9.1 38-metric-aware heuristic reasoner with hypothesis defense."""
     text_corpus = (
         f"{ctx.get('case_title', '')} "
         f"{ctx.get('case_description', '')} "
@@ -1064,8 +1734,15 @@ Output valid JSON matching this schema:
 
     outlier_vector = ctx.get("outlier_vector")
     radar_result = ctx.get("radar_result") or {}
+    radar_insights = ctx.get("radar_insights") or (
+        cls.analyze_360_insights(radar_result, ctx, entity_type) if radar_result else {}
+    )
     outlier_sectors = radar_result.get("outlier_sectors", [])
+    variance_masked_sectors = radar_result.get("variance_masked_sectors", []) or radar_insights.get("variance_masked_sectors", [])
+    dormant_awakening_sectors = radar_result.get("dormant_awakening_sectors", []) or radar_insights.get("dormant_awakening_sectors", [])
     sector_z = radar_result.get("sector_z_scores", {})
+    sector_avg = radar_result.get("sector_baseline_avg", {})
+    sector_std = radar_result.get("sector_baseline_std", {})
     is_host = str(entity_type).upper() in ("ASSET", "HOST", "IP")
     sector_metrics = radar_result.get(
         "sector_metrics",
@@ -1107,6 +1784,88 @@ Output valid JSON matching this schema:
     # --- Outlier Vector Priority Dispatch for Tier 2 Secondary Sweeps ---
     if outlier_vector:
       z_val = sector_z.get(outlier_vector, 2.5)
+      m_for_vec = sector_metrics.get(outlier_vector, "network_bytes_outbound")
+
+      # Sub-Threshold Variance-Masked Drift -> 4-Stage Non-Parametric MAD
+      if outlier_vector in variance_masked_sectors and outlier_vector not in outlier_sectors:
+        std_val = sector_std.get(outlier_vector, 10.0)
+        avg_val = sector_avg.get(outlier_vector, 1.0)
+        defense = (
+            f"Tier 1 360° Radar flagged a variance-masked sub-threshold anomaly in `{outlier_vector}` "
+            f"(`{m_for_vec}`, Z = {z_val:+.2f}σ, μ = {avg_val:.2f}, σ = {std_val:.2f}). "
+            "Because historical standard deviation is inflated by heavy-tailed variance, executing 4-Stage Non-Parametric "
+            "`MAD` (`mad_robust_z_4stage.yl2` over 30d) tests median-based robust deviation ($Z_{mod} = 0.6745 |x - \\text{median}| / \\text{MAD}$)."
+        )
+        cands = [
+            CandidateHypothesis(
+                hypothesis_title=f"Longitudinal CUSUM Drift on `{m_for_vec}`",
+                selected_skill="secops-risk-metrics-multistage",
+                model_name="LONGITUDINAL_CUSUM_DRIFT",
+                directive_query="dynamic_metric",
+                target_metric=m_for_vec,
+                hypothesis_h0=f"Sub-threshold `{m_for_vec}` volume reflects stationary background noise.",
+                hypothesis_h1=f"Multi-day cumulative drift in `{m_for_vec}` is accumulating under the parametric Z-score threshold.",
+                evidentiary_defense=f"Complements 4-stage `MAD` with cumulative sum tracking across `{m_for_vec}`.",
+                confidence_score=0.78,
+            ),
+        ]
+        directive = StrategyDirective(
+            selected_skill="secops-risk-metrics-multistage",
+            model_name="MAD",
+            directive_query="dynamic_metric",
+            target_entity=target_entity,
+            entity_type=entity_type,
+            target_metric=m_for_vec,
+            investigation_tier=tier,
+            outlier_vector=outlier_vector,
+            threat_summary=f"Secondary Deep Dive: Variance-masked sub-threshold drift in `{outlier_vector}` (`{m_for_vec}`, Z = {z_val:+.2f}σ, σ = {std_val:.2f}) on `{target_entity}`.",
+            hypothesis_h0=f"Elevated `{m_for_vec}` volume is within normal heavy-tailed operational variance.",
+            hypothesis_h1=f"True outlier in `{m_for_vec}` masked by inflated parametric standard deviation ($Z_{{mod}} \\ge 3.5$).",
+            selection_rationale=defense,
+            evidentiary_defense=defense,
+            flight_card_title=f"Tier 2 Non-Parametric 4-Stage MAD (`{m_for_vec}`): `{target_entity}`",
+        )
+        return cls._finalize_directive_with_confidence(directive, ctx, cands, executed_signatures, empty_families)
+
+      # Sub-Threshold Dormant Baseline Awakening -> TWO_PART_HURDLE
+      if outlier_vector in dormant_awakening_sectors and outlier_vector not in outlier_sectors:
+        avg_val = sector_avg.get(outlier_vector, 0.05)
+        defense = (
+            f"Tier 1 360° Radar detected a dormant baseline awakening in `{outlier_vector}` "
+            f"(`{m_for_vec}`, Z = {z_val:+.2f}σ, historical μ = {avg_val:.2f}). "
+            "Applying `TWO_PART_HURDLE` (`two_part_hurdle_2stage.yl2`) explicitly evaluates zero-inflated dormancy awakening "
+            "combined with post-hurdle volume intensity."
+        )
+        cands = [
+            CandidateHypothesis(
+                hypothesis_title=f"4-Stage Non-Parametric MAD on `{m_for_vec}`",
+                selected_skill="secops-risk-metrics-multistage",
+                model_name="MAD",
+                directive_query="dynamic_metric",
+                target_metric=m_for_vec,
+                hypothesis_h0=f"Activity in `{m_for_vec}` conforms to median historical behavior.",
+                hypothesis_h1=f"Post-awakening activity in `{m_for_vec}` exceeds robust median absolute deviation thresholds.",
+                evidentiary_defense=f"Provides non-parametric corroboration for dormant baseline awakening on `{m_for_vec}`.",
+                confidence_score=0.76,
+            ),
+        ]
+        directive = StrategyDirective(
+            selected_skill="secops-risk-metrics-multistage",
+            model_name="TWO_PART_HURDLE",
+            directive_query="dynamic_metric",
+            target_entity=target_entity,
+            entity_type=entity_type,
+            target_metric=m_for_vec,
+            investigation_tier=tier,
+            outlier_vector=outlier_vector,
+            threat_summary=f"Secondary Deep Dive: Dormant baseline awakening in `{outlier_vector}` (`{m_for_vec}`, μ = {avg_val:.2f}) on `{target_entity}`.",
+            hypothesis_h0=f"Sporadic `{m_for_vec}` activity represents benign infrequent usage.",
+            hypothesis_h1=f"Zero-inflated dormant vector `{m_for_vec}` awakened with anomalous intensity (`TWO_PART_HURDLE`).",
+            selection_rationale=defense,
+            evidentiary_defense=defense,
+            flight_card_title=f"Tier 2 Dormant Baseline Hurdle (`{m_for_vec}`): `{target_entity}`",
+        )
+        return cls._finalize_directive_with_confidence(directive, ctx, cands, executed_signatures, empty_families)
 
       if outlier_vector == "Workspace":
         ws_metric = "workspace_total_change_actions" if "change" in text_corpus else "workspace_total_download_actions"
@@ -1138,6 +1897,22 @@ Output valid JSON matching this schema:
                 hypothesis_h1=f"User `{target_entity}` is an isolated fleet-wide outlier in `{ws_metric}` ($Z_{{enterprise}} \\ge 3.0\\sigma$).",
                 evidentiary_defense=f"Distinguishes isolated insider hoarding of `{ws_metric}` from legitimate department-wide document distribution.",
                 confidence_score=0.72,
+            ),
+            CandidateHypothesis(
+                hypothesis_title="Workspace Insider Triad Multilevel Decomposition (Downloads + Changes + Emails)",
+                selected_skill="secops-risk-metrics-multistage",
+                model_name="PART_OF_THE_WHOLE_TRIAD_MULTILEVEL",
+                directive_query="workspace_triad",
+                target_metric="workspace_total_download_actions",
+                fusion_metrics=[
+                    "workspace_total_download_actions",
+                    "workspace_total_change_actions",
+                    "workspace_emails_sent_total",
+                ],
+                hypothesis_h0="Workspace activity is confined to a single routine productivity channel.",
+                hypothesis_h1="Coordinated insider hoarding across Workspace downloads, permission modifications, and external email forwarding.",
+                evidentiary_defense=f"Decomposes the Workspace Z = {z_val:+.2f}σ signal across all 3 Workspace insider vectors against enterprise peers.",
+                confidence_score=0.79,
             ),
         ]
         directive = StrategyDirective(
@@ -1175,6 +1950,18 @@ Output valid JSON matching this schema:
                 hypothesis_h1=f"Host/User `{target_entity}` is sending `http_queries_total` traffic to rare domains seen on <= 3 fleet hosts.",
                 evidentiary_defense=f"Combines `http_queries_total` 30-day baseline Z-score (Z = {z_val:+.2f}σ) with Entity Graph `DERIVED_CONTEXT` domain prevalence (`timestamp.get_date`).",
                 confidence_score=0.78,
+            ),
+            CandidateHypothesis(
+                hypothesis_title="HTTP Error Ratio Surge (`http_queries_fail` / `http_queries_total`)",
+                selected_skill="secops-risk-metrics-multistage",
+                model_name="FAILURE_RATIO_SURGE",
+                directive_query="failure_ratio_surge",
+                target_metric="http_queries_fail",
+                fusion_metrics=["http_queries_fail", "http_queries_total"],
+                hypothesis_h0="HTTP requests maintain a normal success-to-failure ratio.",
+                hypothesis_h1="Elevated HTTP failure ratio indicating web directory brute-forcing, vulnerability scanning, or dead C2 endpoints.",
+                evidentiary_defense=f"Evaluates 3-stage `FAILURE_RATIO_SURGE` across `http_queries_fail` and `http_queries_total` for `{target_entity}`.",
+                confidence_score=0.76,
             ),
         ]
         directive = StrategyDirective(
@@ -1333,6 +2120,18 @@ Output valid JSON matching this schema:
                 evidentiary_defense=f"Rolls up composite `resource_creation_total` (Z = {z_val:+.2f}σ) and fuses with identity authentication baseline.",
                 confidence_score=0.71,
             ),
+            CandidateHypothesis(
+                hypothesis_title="Cloud Repository Scope & Permission Recon (`CLOUD_REPOSITORY_SCOPE`)",
+                selected_skill="secops-risk-metrics-multistage",
+                model_name="CLOUD_REPOSITORY_SCOPE",
+                directive_query="cloud_repo_scope",
+                target_metric="resource_read_total",
+                outcome_mode="fail" if ("fail" in text_corpus or "denied" in text_corpus) else "total",
+                hypothesis_h0="Cloud resource reads align with normal service account scope.",
+                hypothesis_h1="Identity is enumerating cloud buckets/repositories outside its historical behavioral scope.",
+                evidentiary_defense=f"Evaluates `build_cloud_repository_scope_query` on `{target_entity}` following the Cloud Z = {z_val:+.2f}σ signal.",
+                confidence_score=0.77,
+            ),
         ]
         directive = StrategyDirective(
             selected_skill="secops-risk-metrics-multistage",
@@ -1442,6 +2241,19 @@ Output valid JSON matching this schema:
                 hypothesis_h1=f"Anomalous `{target_m}` activity on `{target_entity}` coincides with outbound data exfiltration (`network_bytes_outbound`).",
                 evidentiary_defense=f"Fuses `{target_m}` (Z = {z_val:+.2f}σ) with `network_bytes_outbound` using v1.8.0 roll-up fusion.",
                 confidence_score=0.77,
+            ),
+            CandidateHypothesis(
+                hypothesis_title="MITRE ATT&CK Kill-Chain: Defense Evasion Alert to Exfiltration",
+                selected_skill="secops-risk-metrics-multistage",
+                model_name="KILLCHAIN_DEFENSE_EVASION_ALERT_TO_EXFILTRATION",
+                directive_query="killchain_archetype",
+                target_metric="alert_event_name_count",
+                fusion_metrics=["alert_event_name_count", "network_bytes_outbound"],
+                killchain_archetype="DEFENSE_EVASION_ALERT_TO_EXFILTRATION",
+                hypothesis_h0="Security alerts on host are uncoupled from outbound network bytes.",
+                hypothesis_h1="Security/EDR alert surge (`alert_event_name_count`) is coupled with active outbound data exfiltration (`network_bytes_outbound`).",
+                evidentiary_defense=f"Executes `DEFENSE_EVASION_ALERT_TO_EXFILTRATION` kill-chain archetype on `{target_entity}`.",
+                confidence_score=0.79,
             ),
         ]
         directive = StrategyDirective(

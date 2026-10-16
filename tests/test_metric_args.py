@@ -28,6 +28,33 @@ def _render_all():
     await eng.run_360_behavioral_radar(None, "user.a", entity_type="USER")
     await eng.run_360_behavioral_radar(None, "host-a", entity_type="HOST")
     await eng.run_cloud_crud_surge(None, "user.a")
+    await eng.run_workspace_triad(None, "user.a")
+    await eng.run_alert_surge(None, "host-a", entity_type="ASSET")
+    await eng.run_alert_surge(None, "user.a", entity_type="USER")
+    await eng.run_failure_ratio_surge(None, "user.a", fail_metric="http_queries_fail")
+    await eng.run_failure_ratio_surge(None, "user.a", fail_metric="auth_attempts_fail")
+    for mode in ("fail", "success", "total"):
+      await eng.run_cloud_repository_scope(None, "user.a", outcome_mode=mode)
+    for kc in (
+        "CREDENTIAL_ACCESS_TO_EXECUTION",
+        "INITIAL_ACCESS_TO_DISCOVERY",
+        "EXECUTION_TO_C2_DNS",
+        "EXECUTION_TO_EXFILTRATION",
+        "CREDENTIAL_ACCESS_TO_LATERAL_MOVEMENT",
+        "CLOUD_DISCOVERY_TO_COLLECTION",
+        "DEFENSE_EVASION_ALERT_TO_EXFILTRATION",
+        "C2_BEACON_TO_RARE_DESTINATION_EXFIL",
+    ):
+      await eng.run_killchain_archetype(None, "user.a", archetype=kc)
+    for m_name, m_metric in (
+        ("MAD", "network_bytes_outbound"),
+        ("TWO_PART_HURDLE", "workspace_total_download_actions"),
+        ("RELATIVE_DEVIATION", "http_queries_total"),
+        ("HTTP_ERROR_RATIO_SURGE_2STAGE", "http_queries_fail"),
+        ("HTTP_TARGET_SURGE_2STAGE", "http_queries_total"),
+        ("HYBRID_METRIC_HTTP_UA_PREVALENCE_2STAGE", "http_queries_total"),
+    ):
+      await eng.run_dynamic_metric_pipeline(None, "user.a", target_metric=m_metric, model_name=m_name)
 
   asyncio.run(main())
   captured.extend(eng.build_fleet_360_sector_queries(entity_type="USER").values())

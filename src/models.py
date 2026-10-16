@@ -39,6 +39,14 @@ class CandidateHypothesis(BaseModel):
   selected_skill: str = "secops-risk-metrics-multistage"
   model_name: str
   directive_query: str
+  target_entity: Optional[str] = Field(
+      default=None,
+      description="Optional entity override for cross-entity kill-chain bridges (e.g. pivoting from USER to companion ASSET/IP).",
+  )
+  entity_type: Optional[str] = Field(
+      default=None,
+      description="Optional entity type override for cross-entity bridges ('USER', 'ASSET', 'IP').",
+  )
   target_metric: Optional[str] = Field(
       default=None,
       description="Selected metric from the 38-metric catalog (e.g. 'workspace_total_download_actions', 'http_queries_fail', 'dns_queries_fail', 'file_executions_total', 'resource_written_total')",
@@ -46,6 +54,14 @@ class CandidateHypothesis(BaseModel):
   fusion_metrics: List[str] = Field(
       default_factory=list,
       description="2 compatible metrics for Cross-Vector / Roll-Up Fusion, or 3 sibling metrics for Triad Multilevel",
+  )
+  killchain_archetype: Optional[str] = Field(
+      default=None,
+      description="MITRE ATT&CK kill-chain archetype ID when applicable (e.g., 'T1078_VALID_ACCOUNTS_CLOUD')",
+  )
+  outcome_mode: Optional[str] = Field(
+      default=None,
+      description="Optional outcome mode for dual-branch/ratio queries ('fail', 'success', 'total')",
   )
   identifier_field: Optional[str] = Field(
       default=None,
@@ -75,6 +91,14 @@ class StrategyDirective(BaseModel):
       default_factory=list,
       description="2 compatible metrics for Cross-Vector / Roll-Up Fusion, or 3 sibling metrics for Triad Multilevel",
   )
+  killchain_archetype: Optional[str] = Field(
+      default=None,
+      description="Matched MITRE ATT&CK kill-chain archetype ID when applicable",
+  )
+  outcome_mode: Optional[str] = Field(
+      default=None,
+      description="Optional outcome mode ('fail', 'success', 'total') for Cloud Repository or Failure-Ratio hunts",
+  )
   identifier_field: Optional[str] = Field(
       default=None,
       description="UDM dimension field, e.g. 'principal.user.userid', 'target.user.userid', 'principal.asset.hostname'",
@@ -91,6 +115,18 @@ class StrategyDirective(BaseModel):
   flight_card_title: str = ""
   investigation_tier: str = "TIER_1_BASELINE"  # "TIER_1_BASELINE" | "TIER_2_DEEP_DIVE" | "TIER_2B_PIVOT"
   outlier_vector: Optional[str] = None
+  radar_insights: Dict[str, Any] = Field(
+      default_factory=dict,
+      description="Structured 360° telemetry insights (baseline sparsity, variance masking, kill-chain topology, cross-entity bridges) synthesized from the Tier 1 360° radar",
+  )
+  post_data_outcome_class: Optional[str] = Field(
+      default=None,
+      description="Post-data outcome classification (ACUTE_OUTLIER, CLEAN_OR_SUBTHRESHOLD, FLEET_WAVE, SPARSE_BASELINE)",
+  )
+  killchain_progression: Dict[str, Any] = Field(
+      default_factory=dict,
+      description="MITRE ATT&CK upstream precursor, current stage, and downstream next stage",
+  )
   recommended_avenues: List[str] = Field(default_factory=list)
   candidate_hypotheses: List[CandidateHypothesis] = Field(default_factory=list)
 

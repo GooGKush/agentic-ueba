@@ -112,17 +112,20 @@ class AutonomousHunterEngine:
     comment = re.sub(r"```(?:json_triage|json)\s*\{.*?\}\s*```\s*", "", comment, flags=re.DOTALL)
     return CaseWallCardFormatter.to_soar_html(comment.strip())
 
-  def generate_behavioral_radar(self, username: str, telemetry_data: Dict[str, float]) -> str:
-    """Computes 360-degree behavioral risk metrics and returns raw SVG string."""
+  def generate_behavioral_radar(
+      self,
+      username: str,
+      telemetry_data: Dict[str, float],
+      entity_type: str = "USER",
+  ) -> str:
+    """Computes 6-spoke hexagonal 360-degree behavioral risk metrics and returns raw SVG string."""
     try:
       cx, cy = 250, 250
       scale = 50.0
-
-      auth_z = float(telemetry_data.get("Auth", 0.0))
-      cloud_z = float(telemetry_data.get("Cloud", 0.0))
-      workspace_z = float(telemetry_data.get("Workspace", 0.0))
-      egress_z = float(telemetry_data.get("Egress", 0.0))
-      dns_z = float(telemetry_data.get("DNS", 0.0))
+      is_host = (
+          str(entity_type).upper() in ("ASSET", "HOST", "IP")
+          or (("Flows" in telemetry_data or "Alerts" in telemetry_data) and "Workspace" not in telemetry_data)
+      )
 
       def get_point(z, angle_deg):
         r = min(max(z, 0.0), 4.5) * scale
@@ -131,25 +134,36 @@ class AutonomousHunterEngine:
         y = cy + r * math.sin(angle_rad)
         return x, y
 
-      p_auth = get_point(auth_z, 0)
-      p_cloud = get_point(cloud_z, 72)
-      p_workspace = get_point(workspace_z, 144)
-      p_egress = get_point(egress_z, 216)
-      p_dns = get_point(dns_z, 288)
+      angles = [0, 60, 120, 180, 240, 300]
+      if is_host:
+        spokes = [
+            ("🔑 Host Auth", float(telemetry_data.get("Auth", 0.0))),
+            ("🌐 Network Egress", float(telemetry_data.get("Egress", 0.0))),
+            ("📡 DNS Queries", float(telemetry_data.get("DNS", 0.0))),
+            ("🔀 Outbound Flows", float(telemetry_data.get("Flows", 0.0))),
+            ("🚨 Security Alerts", float(telemetry_data.get("Alerts", 0.0))),
+            ("🕸️ Web & Proxy", float(telemetry_data.get("Web", 0.0))),
+        ]
+        entity_badge = "ASSET"
+      else:
+        spokes = [
+            ("🔑 Authentication", float(telemetry_data.get("Auth", 0.0))),
+            ("☁️ Cloud CRUD", float(telemetry_data.get("Cloud", 0.0))),
+            ("📁 Workspace Exfil", float(telemetry_data.get("Workspace", 0.0))),
+            ("🌐 Network Egress", float(telemetry_data.get("Egress", 0.0))),
+            ("📡 DNS Queries", float(telemetry_data.get("DNS", 0.0))),
+            ("🕸️ Web & Proxy", float(telemetry_data.get("Web", 0.0))),
+        ]
+        entity_badge = "USER"
 
-      polygon_points = (
-          f"{p_auth[0]},{p_auth[1]} {p_cloud[0]},{p_cloud[1]} "
-          f"{p_workspace[0]},{p_workspace[1]} {p_egress[0]},{p_egress[1]} "
-          f"{p_dns[0]},{p_dns[1]}"
-      )
+      spoke_points = [get_point(z_val, ang) for (_, z_val), ang in zip(spokes, angles)]
+      polygon_points = " ".join(f"{x},{y}" for x, y in spoke_points)
 
       def get_ring(z):
-        pts = [get_point(z, a) for a in [0, 72, 144, 216, 288]]
+        pts = [get_point(z, a) for a in angles]
         return " ".join([f"{x},{y}" for x, y in pts])
 
-      composite_d = math.sqrt(
-          sum(max(0.0, z)**2 for z in [auth_z, cloud_z, workspace_z, egress_z, dns_z])
-      )
+      composite_d = math.sqrt(sum(max(0.0, z_val) ** 2 for _, z_val in spokes))
 
       svg_output = f"""<svg viewBox="0 0 500 500" width="100%" height="450" xmlns="http://www.w3.org/2000/svg" style="background: #0e1117; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; border-radius: 8px;">
   <defs>
@@ -158,22 +172,24 @@ class AutonomousHunterEngine:
       <stop offset="100%" stop-color="#00b0ff" stop-opacity="0.1"/>
     </radialGradient>
   </defs>
-  <text x="250" y="30" text-anchor="middle" fill="#f0f6fc" font-size="15" font-weight="600" letter-spacing="1">360° BEHAVIORAL RISK RADAR — USER: {username.upper()}</text>
-  <text x="250" y="48" text-anchor="middle" fill="#8b949e" font-size="11">Composite Threat Distance: D = {composite_d:.2f}σ | Baseline: 30-Day Pre-Computed</text>
+  <text x="250" y="30" text-anchor="middle" fill="#f0f6fc" font-size="15" font-weight="600" letter-spacing="1">360° BEHAVIORAL RISK RADAR — {entity_badge}: {username.upper()}</text>
+  <text x="250" y="48" text-anchor="middle" fill="#8b949e" font-size="11">Composite Threat Distance: D = {composite_d:.2f}σ | Baseline: 30-Day Pre-Computed (6-Spoke Hex)</text>
   <polygon points="{get_ring(1.0)}" fill="none" stroke="#21262d" stroke-width="1" stroke-dasharray="3 3"/>
   <polygon points="{get_ring(2.0)}" fill="none" stroke="#30363d" stroke-width="1" stroke-dasharray="4 4"/>
   <polygon points="{get_ring(3.0)}" fill="rgba(255, 75, 75, 0.03)" stroke="#ff4b4b" stroke-width="1.5" stroke-dasharray="6 4"/>
   <text x="253" y="98" fill="#ff7b72" font-size="10" font-weight="bold">3.0σ (Anomaly Threshold)</text>
   <line x1="250" y1="250" x2="{get_point(3.0, 0)[0]}" y2="{get_point(3.0, 0)[1]}" stroke="#30363d" stroke-width="1.2"/>
-  <line x1="250" y1="250" x2="{get_point(3.0, 72)[0]}" y2="{get_point(3.0, 72)[1]}" stroke="#30363d" stroke-width="1.2"/>
-  <line x1="250" y1="250" x2="{get_point(3.0, 144)[0]}" y2="{get_point(3.0, 144)[1]}" stroke="#30363d" stroke-width="1.2"/>
-  <line x1="250" y1="250" x2="{get_point(3.0, 216)[0]}" y2="{get_point(3.0, 216)[1]}" stroke="#30363d" stroke-width="1.2"/>
-  <line x1="250" y1="250" x2="{get_point(3.0, 288)[0]}" y2="{get_point(3.0, 288)[1]}" stroke="#30363d" stroke-width="1.2"/>
-  <text x="250" y="70" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="600">🔑 Authentication (Z = {auth_z:+.2f}σ)</text>
-  <text x="415" y="195" text-anchor="start" fill="#c9d1d9" font-size="11" font-weight="600">☁️ Cloud CRUD (Z = {cloud_z:+.2f}σ)</text>
-  <text x="360" y="395" text-anchor="start" fill="#c9d1d9" font-size="11" font-weight="600">📁 Workspace Exfil (Z = {workspace_z:+.2f}σ)</text>
-  <text x="140" y="395" text-anchor="end" fill="#c9d1d9" font-size="11" font-weight="600">🌐 Network Egress (Z = {egress_z:+.2f}σ)</text>
-  <text x="85" y="195" text-anchor="end" fill="#c9d1d9" font-size="11" font-weight="600">📡 DNS Queries (Z = {dns_z:+.2f}σ)</text>
+  <line x1="250" y1="250" x2="{get_point(3.0, 60)[0]}" y2="{get_point(3.0, 60)[1]}" stroke="#30363d" stroke-width="1.2"/>
+  <line x1="250" y1="250" x2="{get_point(3.0, 120)[0]}" y2="{get_point(3.0, 120)[1]}" stroke="#30363d" stroke-width="1.2"/>
+  <line x1="250" y1="250" x2="{get_point(3.0, 180)[0]}" y2="{get_point(3.0, 180)[1]}" stroke="#30363d" stroke-width="1.2"/>
+  <line x1="250" y1="250" x2="{get_point(3.0, 240)[0]}" y2="{get_point(3.0, 240)[1]}" stroke="#30363d" stroke-width="1.2"/>
+  <line x1="250" y1="250" x2="{get_point(3.0, 300)[0]}" y2="{get_point(3.0, 300)[1]}" stroke="#30363d" stroke-width="1.2"/>
+  <text x="250" y="70" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[0][0]} (Z = {spokes[0][1]:+.2f}σ)</text>
+  <text x="395" y="165" text-anchor="start" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[1][0]} (Z = {spokes[1][1]:+.2f}σ)</text>
+  <text x="395" y="340" text-anchor="start" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[2][0]} (Z = {spokes[2][1]:+.2f}σ)</text>
+  <text x="250" y="425" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[3][0]} (Z = {spokes[3][1]:+.2f}σ)</text>
+  <text x="105" y="340" text-anchor="end" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[4][0]} (Z = {spokes[4][1]:+.2f}σ)</text>
+  <text x="105" y="165" text-anchor="end" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[5][0]} (Z = {spokes[5][1]:+.2f}σ)</text>
   <polygon points="{polygon_points}" fill="url(#radarGlow)" stroke="#00e5ff" stroke-width="2"/>
 </svg>""".strip()
       return svg_output
@@ -202,6 +218,29 @@ class AutonomousHunterEngine:
     # Default to 30-day risk metrics baselining
     return "secops-risk-metrics-multistage"
 
+  @staticmethod
+  def _annotate_directive_post_data(directive: Any, sec_res: Dict[str, Any]) -> None:
+    """Attaches post-execution outcome classification and MITRE ATT&CK progression to directive."""
+    if not directive or not isinstance(sec_res, dict):
+      return
+    rows = int(sec_res.get("stats_rows", 0))
+    is_outlier = bool(sec_res.get("is_outlier", False))
+    if rows == 0 or not is_outlier:
+      outcome_class = "CLEAN_OR_SUBTHRESHOLD"
+    elif rows >= 10:
+      outcome_class = "FLEET_WAVE"
+    else:
+      outcome_class = "ACUTE_OUTLIER"
+    try:
+      directive.post_data_outcome_class = outcome_class
+      if getattr(directive, "target_metric", None) and not getattr(directive, "killchain_progression", None):
+        from src.pipeline_runner import PipelineRunner
+        fmt_cls = PipelineRunner().get_triage_formatter()
+        if fmt_cls:
+          directive.killchain_progression = fmt_cls.get_mitre_progression(directive.target_metric)
+    except Exception:
+      pass
+
   async def _execute_secondary_directive(
       self,
       session: ClientSession,
@@ -214,6 +253,198 @@ class AutonomousHunterEngine:
     target_metric = getattr(directive, "target_metric", None)
     fusion_metrics = getattr(directive, "fusion_metrics", None) or []
     ident_field = getattr(directive, "identifier_field", None)
+    exec_entity = getattr(directive, "target_entity", None) or req.target_entity
+    exec_entity_type = getattr(directive, "entity_type", None) or req.entity_type
+
+    if "killchain_archetype" in sec_query or "killchain" in sec_query:
+      archetype_name = getattr(directive, "killchain_archetype", None) or directive.model_name
+      sec_res = await RiskMetricsEngine(tenant).run_killchain_archetype(
+          session=session,
+          entity=exec_entity,
+          archetype=archetype_name,
+          entity_type=exec_entity_type,
+          lookback_days=req.lookback_days,
+      )
+      self._annotate_directive_post_data(directive, sec_res)
+      sec_cri = sec_res["calibrated_risk_index"]
+      sec_outlier = sec_res["is_outlier"]
+      sec_rows = [
+          {
+              "metric": f"**MITRE Kill-Chain Archetype (`{sec_res['archetype']}`)**",
+              "observed": f"`{sec_res['composite_threat_score']:.2f}σ`",
+              "threshold": "$\\ge 3.00\\sigma$",
+              "assessment": "⚠️ Multi-Stage Kill-Chain Progression" if sec_outlier else "✅ Uncorrelated Kill-Chain Stages",
+          },
+          {
+              "metric": "**Correlated Telemetry Vectors**",
+              "observed": " + ".join(f"`{m}`" for m in sec_res.get("fusion_metrics", [])),
+              "threshold": f"Template: `{sec_res.get('template_name', 'dual_sector_fusion_3stage.yl2')}`",
+              "assessment": "Cross-Tactic Behavioral Convergence",
+          },
+      ]
+      sec_report = CaseWallCardFormatter.format_card(
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
+          model_name=directive.model_name,
+          calibrated_risk_index=float(sec_cri),
+          is_outlier=sec_outlier,
+          case_id=req.case_id,
+          rows_count=sec_res.get("stats_rows", 0),
+          directive=directive,
+          metrics_table_rows=sec_rows,
+      )
+      return sec_res, sec_report
+
+    if "workspace_triad" in sec_query:
+      sec_res = await RiskMetricsEngine(tenant).run_workspace_triad(
+          session=session,
+          entity=exec_entity,
+          lookback_days=req.lookback_days,
+      )
+      self._annotate_directive_post_data(directive, sec_res)
+      sec_cri = sec_res["calibrated_risk_index"]
+      sec_outlier = sec_res["is_outlier"]
+      sec_rows = [
+          {
+              "metric": "**Workspace Triad Composite ($Z_{triad}$)**",
+              "observed": f"`{sec_res['composite_z_score']:+.2f}σ`",
+              "threshold": "$\\ge 3.00\\sigma$",
+              "assessment": "⚠️ Coordinated Insider Triad Outlier" if sec_outlier else "✅ Within Peer Cohort Triad",
+          },
+          {
+              "metric": "**Evaluated Workspace Vectors**",
+              "observed": "`downloads` + `changes` + `emails`",
+              "threshold": "Template: `part_of_the_whole_triad_3stage.yl2`",
+              "assessment": f"Observed Volume = `{sec_res.get('observed_value', 0.0):.1f}`",
+          },
+      ]
+      sec_report = CaseWallCardFormatter.format_card(
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
+          model_name=directive.model_name,
+          calibrated_risk_index=float(sec_cri),
+          is_outlier=sec_outlier,
+          case_id=req.case_id,
+          rows_count=sec_res.get("stats_rows", 0),
+          directive=directive,
+          metrics_table_rows=sec_rows,
+      )
+      return sec_res, sec_report
+
+    if "cloud_repo_scope" in sec_query:
+      mode = getattr(directive, "outcome_mode", None) or "total"
+      sec_res = await RiskMetricsEngine(tenant).run_cloud_repository_scope(
+          session=session,
+          entity=exec_entity,
+          outcome_mode=mode,
+          lookback_days=req.lookback_days,
+      )
+      self._annotate_directive_post_data(directive, sec_res)
+      sec_cri = sec_res["calibrated_risk_index"]
+      sec_outlier = sec_res["is_outlier"]
+      sec_rows = [
+          {
+              "metric": f"**Cloud Repository Scope (`mode={mode}`)**",
+              "observed": f"`{sec_res['top_z_score']:+.2f}σ` (Fold = `{sec_res.get('fold_change', 0.0):.2f}x`)",
+              "threshold": "$\\ge 3.00\\sigma$",
+              "assessment": "⚠️ Out-of-Scope Repository Enumeration" if sec_outlier else "✅ Nominal Cloud Scope",
+          },
+          {
+              "metric": "**Evaluated Metric Family**",
+              "observed": f"`{sec_res.get('metric', 'resource_read_total')}`",
+              "threshold": f"Observed: `{sec_res.get('observed_events', 0.0):.1f}`",
+              "assessment": "Cloud Resource Read / Permission Scope",
+          },
+      ]
+      sec_report = CaseWallCardFormatter.format_card(
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
+          model_name=directive.model_name,
+          calibrated_risk_index=float(sec_cri),
+          is_outlier=sec_outlier,
+          case_id=req.case_id,
+          rows_count=sec_res.get("stats_rows", 0),
+          directive=directive,
+          metrics_table_rows=sec_rows,
+      )
+      return sec_res, sec_report
+
+    if "failure_ratio_surge" in sec_query:
+      fail_m = target_metric or "http_queries_fail"
+      sec_res = await RiskMetricsEngine(tenant).run_failure_ratio_surge(
+          session=session,
+          entity=exec_entity,
+          fail_metric=fail_m,
+          entity_type=exec_entity_type,
+          identifier_field=ident_field,
+          lookback_days=req.lookback_days,
+      )
+      self._annotate_directive_post_data(directive, sec_res)
+      sec_cri = sec_res["calibrated_risk_index"]
+      sec_outlier = sec_res["is_outlier"]
+      sec_rows = [
+          {
+              "metric": f"**Failure Ratio Surge (`{fail_m}`)**",
+              "observed": f"`{sec_res['top_z_score']:+.2f}σ` (Fail Ratio = `{sec_res.get('failure_ratio', 0.0):.2%}`)",
+              "threshold": "$\\ge 3.00\\sigma$",
+              "assessment": "⚠️ Acute Error / Access Denied Surge" if sec_outlier else "✅ Nominal Error Ratio",
+          },
+          {
+              "metric": "**Paired Total Metric**",
+              "observed": f"`{sec_res.get('total_metric', 'http_queries_total')}`",
+              "threshold": "Template: `failure_ratio_surge_3stage.yl2`",
+              "assessment": "3-Stage Ratio Baseline Evaluation",
+          },
+      ]
+      sec_report = CaseWallCardFormatter.format_card(
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
+          model_name=directive.model_name,
+          calibrated_risk_index=float(sec_cri),
+          is_outlier=sec_outlier,
+          case_id=req.case_id,
+          rows_count=sec_res.get("stats_rows", 0),
+          directive=directive,
+          metrics_table_rows=sec_rows,
+      )
+      return sec_res, sec_report
+
+    if "alert_surge" in sec_query:
+      sec_res = await RiskMetricsEngine(tenant).run_alert_surge(
+          session=session,
+          entity=exec_entity,
+          entity_type=exec_entity_type,
+          lookback_days=req.lookback_days,
+      )
+      self._annotate_directive_post_data(directive, sec_res)
+      sec_cri = sec_res["calibrated_risk_index"]
+      sec_outlier = sec_res["is_outlier"]
+      sec_rows = [
+          {
+              "metric": "**Security Alert Surge (`alert_event_name_count`)**",
+              "observed": f"`{sec_res['top_z_score']:+.2f}σ` (`{sec_res.get('observed_alerts', 0.0):.0f}` alerts)",
+              "threshold": "$\\ge 3.00\\sigma$",
+              "assessment": "⚠️ Multi-Rule Alert Accumulation" if sec_outlier else "✅ Baseline Alert Volume",
+          },
+          {
+              "metric": "**Attribution Scope**",
+              "observed": f"`{exec_entity_type}` (`{exec_entity}`)",
+              "threshold": "30-Day Pre-Computed Alert Baseline",
+              "assessment": "Host/User Alert Density",
+          },
+      ]
+      sec_report = CaseWallCardFormatter.format_card(
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
+          model_name=directive.model_name,
+          calibrated_risk_index=float(sec_cri),
+          is_outlier=sec_outlier,
+          case_id=req.case_id,
+          rows_count=sec_res.get("stats_rows", 0),
+          directive=directive,
+          metrics_table_rows=sec_rows,
+      )
+      return sec_res, sec_report
 
     if "sector_fusion" in sec_query or "fusion" in sec_query:
       metrics_pair = fusion_metrics if len(fusion_metrics) >= 2 else [
@@ -222,11 +453,12 @@ class AutonomousHunterEngine:
       ]
       sec_res = await RiskMetricsEngine(tenant).run_sector_fusion(
           session=session,
-          entity=req.target_entity,
+          entity=exec_entity,
           fusion_metrics=metrics_pair,
           identifier_field=ident_field or "principal.user.userid",
           lookback_days=req.lookback_days,
       )
+      self._annotate_directive_post_data(directive, sec_res)
       sec_cri = sec_res["calibrated_risk_index"]
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
@@ -244,8 +476,8 @@ class AutonomousHunterEngine:
           },
       ]
       sec_report = CaseWallCardFormatter.format_card(
-          target_entity=req.target_entity,
-          entity_type=req.entity_type,
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
           model_name=directive.model_name,
           calibrated_risk_index=float(sec_cri),
           is_outlier=sec_outlier,
@@ -260,10 +492,11 @@ class AutonomousHunterEngine:
       m_name = target_metric or "network_bytes_outbound"
       sec_res = await RiskMetricsEngine(tenant).run_macd_momentum_velocity(
           session=session,
-          entity=req.target_entity,
+          entity=exec_entity,
           metric_name=m_name,
           lookback_days=req.lookback_days,
       )
+      self._annotate_directive_post_data(directive, sec_res)
       sec_cri = sec_res["calibrated_risk_index"]
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
@@ -281,8 +514,8 @@ class AutonomousHunterEngine:
           },
       ]
       sec_report = CaseWallCardFormatter.format_card(
-          target_entity=req.target_entity,
-          entity_type=req.entity_type,
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
           model_name=directive.model_name,
           calibrated_risk_index=float(sec_cri),
           is_outlier=sec_outlier,
@@ -297,10 +530,11 @@ class AutonomousHunterEngine:
       m_name = target_metric or "auth_attempts_total"
       sec_res = await RiskMetricsEngine(tenant).run_circadian_von_mises(
           session=session,
-          entity=req.target_entity,
+          entity=exec_entity,
           metric_name=m_name,
           lookback_days=req.lookback_days,
       )
+      self._annotate_directive_post_data(directive, sec_res)
       sec_cri = sec_res["calibrated_risk_index"]
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
@@ -318,8 +552,8 @@ class AutonomousHunterEngine:
           },
       ]
       sec_report = CaseWallCardFormatter.format_card(
-          target_entity=req.target_entity,
-          entity_type=req.entity_type,
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
           model_name=directive.model_name,
           calibrated_risk_index=float(sec_cri),
           is_outlier=sec_outlier,
@@ -333,9 +567,10 @@ class AutonomousHunterEngine:
     if "cloud_crud" in sec_query:
       sec_res = await RiskMetricsEngine(tenant).run_cloud_crud_surge(
           session=session,
-          username=req.target_entity,
+          username=exec_entity,
           lookback_days=req.lookback_days,
       )
+      self._annotate_directive_post_data(directive, sec_res)
       sec_cri = sec_res["calibrated_risk_index"]
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
@@ -353,8 +588,8 @@ class AutonomousHunterEngine:
           },
       ]
       sec_report = CaseWallCardFormatter.format_card(
-          target_entity=req.target_entity,
-          entity_type=req.entity_type,
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
           model_name=directive.model_name,
           calibrated_risk_index=float(sec_cri),
           is_outlier=sec_outlier,
@@ -370,14 +605,15 @@ class AutonomousHunterEngine:
       stat_model = getattr(directive, "model_name", None) or ("LONGITUDINAL_CUSUM_DRIFT" if "cusum" in sec_query else "STANDARD_Z_SCORE")
       sec_res = await RiskMetricsEngine(tenant).run_dynamic_metric_pipeline(
           session=session,
-          entity=req.target_entity,
-          entity_type=req.entity_type,
+          entity=exec_entity,
+          entity_type=exec_entity_type,
           target_metric=m_name,
           model_name=stat_model,
           identifier_field=ident_field,
           fusion_metrics=fusion_metrics,
           lookback_days=req.lookback_days,
       )
+      self._annotate_directive_post_data(directive, sec_res)
       sec_cri = sec_res["calibrated_risk_index"]
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
@@ -395,8 +631,8 @@ class AutonomousHunterEngine:
           },
       ]
       sec_report = CaseWallCardFormatter.format_card(
-          target_entity=req.target_entity,
-          entity_type=req.entity_type,
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
           model_name=directive.model_name,
           calibrated_risk_index=float(sec_cri),
           is_outlier=sec_outlier,
@@ -411,9 +647,10 @@ class AutonomousHunterEngine:
     if "c2_jitter" in sec_query:
       sec_res = await StatsHunterEngine(tenant).run_c2_beaconing_jitter(
           session=session,
-          src_ip=req.target_entity,
+          src_ip=exec_entity,
           lookback_days=req.lookback_days,
       )
+      self._annotate_directive_post_data(directive, sec_res)
       sec_cri = sec_res["calibrated_risk_index"]
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
@@ -431,8 +668,8 @@ class AutonomousHunterEngine:
           },
       ]
       sec_report = CaseWallCardFormatter.format_card(
-          target_entity=req.target_entity,
-          entity_type=req.entity_type,
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
           model_name=directive.model_name,
           calibrated_risk_index=float(sec_cri),
           is_outlier=sec_outlier,
@@ -446,9 +683,10 @@ class AutonomousHunterEngine:
     if "poisson_burst" in sec_query:
       sec_res = await StatsHunterEngine(tenant).run_poisson_burst_spray(
           session=session,
-          entity=req.target_entity,
+          entity=exec_entity,
           lookback_days=req.lookback_days,
       )
+      self._annotate_directive_post_data(directive, sec_res)
       sec_cri = sec_res["calibrated_risk_index"]
       sec_outlier = sec_res["is_outlier"]
       fano = float(sec_res.get("top_fano", 1.0))
@@ -467,8 +705,8 @@ class AutonomousHunterEngine:
           },
       ]
       sec_report = CaseWallCardFormatter.format_card(
-          target_entity=req.target_entity,
-          entity_type=req.entity_type,
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
           model_name=directive.model_name,
           calibrated_risk_index=float(sec_cri),
           is_outlier=sec_outlier,
@@ -482,9 +720,10 @@ class AutonomousHunterEngine:
     if "shannon_entropy" in sec_query or "entropy" in sec_query:
       sec_res = await StatsHunterEngine(tenant).run_shannon_character_entropy(
           session=session,
-          entity=req.target_entity,
+          entity=exec_entity,
           lookback_days=req.lookback_days,
       )
+      self._annotate_directive_post_data(directive, sec_res)
       sec_cri = sec_res["calibrated_risk_index"]
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
@@ -502,8 +741,8 @@ class AutonomousHunterEngine:
           },
       ]
       sec_report = CaseWallCardFormatter.format_card(
-          target_entity=req.target_entity,
-          entity_type=req.entity_type,
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
           model_name=directive.model_name,
           calibrated_risk_index=float(sec_cri),
           is_outlier=sec_outlier,
@@ -517,9 +756,10 @@ class AutonomousHunterEngine:
     if "markov" in sec_query or "transition" in sec_query:
       sec_res = await StatsHunterEngine(tenant).run_markov_transition_rarity(
           session=session,
-          host=req.target_entity,
+          host=exec_entity,
           lookback_days=req.lookback_days,
       )
+      self._annotate_directive_post_data(directive, sec_res)
       sec_cri = sec_res["calibrated_risk_index"]
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
@@ -537,8 +777,8 @@ class AutonomousHunterEngine:
           },
       ]
       sec_report = CaseWallCardFormatter.format_card(
-          target_entity=req.target_entity,
-          entity_type=req.entity_type,
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
           model_name=directive.model_name,
           calibrated_risk_index=float(sec_cri),
           is_outlier=sec_outlier,
@@ -552,9 +792,10 @@ class AutonomousHunterEngine:
     if "zipf" in sec_query:
       sec_res = await StatsHunterEngine(tenant).run_zipfian_process_rarity(
           session=session,
-          host=req.target_entity,
+          host=exec_entity,
           lookback_days=req.lookback_days,
       )
+      self._annotate_directive_post_data(directive, sec_res)
       sec_cri = sec_res["calibrated_risk_index"]
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
@@ -572,8 +813,8 @@ class AutonomousHunterEngine:
           },
       ]
       sec_report = CaseWallCardFormatter.format_card(
-          target_entity=req.target_entity,
-          entity_type=req.entity_type,
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
           model_name=directive.model_name,
           calibrated_risk_index=float(sec_cri),
           is_outlier=sec_outlier,
@@ -587,9 +828,10 @@ class AutonomousHunterEngine:
     if "ewma" in sec_query or "burst_velocity" in sec_query:
       sec_res = await StatsHunterEngine(tenant).run_ewma_burst_velocity(
           session=session,
-          entity=req.target_entity,
+          entity=exec_entity,
           lookback_days=req.lookback_days,
       )
+      self._annotate_directive_post_data(directive, sec_res)
       sec_cri = sec_res["calibrated_risk_index"]
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
@@ -607,8 +849,8 @@ class AutonomousHunterEngine:
           },
       ]
       sec_report = CaseWallCardFormatter.format_card(
-          target_entity=req.target_entity,
-          entity_type=req.entity_type,
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
           model_name=directive.model_name,
           calibrated_risk_index=float(sec_cri),
           is_outlier=sec_outlier,
@@ -707,10 +949,26 @@ class AutonomousHunterEngine:
             radar_svg = self.generate_behavioral_radar(
                 req.target_entity,
                 radar_result["sector_z_scores"],
+                entity_type=req.entity_type,
             )
             cri = radar_result["calibrated_risk_index"]
             verdict = radar_result["verdict"]
             top_sector = radar_result["top_sector"]
+
+            alert_list = req.alerts or [{"name": req.alert_name or "", "description": req.alert_description or ""}]
+            conn_list = req.connector_events or []
+            radar_insights = StrategyDecider.analyze_360_insights(
+                radar_result=radar_result,
+                ctx={
+                    "case_title": req.alert_name or "",
+                    "case_description": req.alert_description or "",
+                    "alerts": [a.get("name") or a.get("displayName", "") for a in alert_list],
+                    "primary_entity": req.target_entity,
+                },
+                entity_type=req.entity_type,
+            )
+            if req.directive:
+              req.directive.radar_insights = radar_insights
 
             # --- Tier 2 Secondary Sweep Evaluation & Hypothesis Defense ---
             is_tier1 = not req.directive or getattr(req.directive, "investigation_tier", "TIER_1_BASELINE") == "TIER_1_BASELINE"
@@ -725,21 +983,21 @@ class AutonomousHunterEngine:
             )
             needs_secondary = is_tier1 and (
                 radar_result["is_outlier"]
+                or bool(radar_insights.get("secondary_warranted", False))
                 or top_z >= 2.0
                 or float(cri) >= 40.0
                 or kinetic_trigger
             )
 
             tier2_directive = None
-            alert_list = req.alerts or [{"name": req.alert_name or "", "description": req.alert_description or ""}]
-            conn_list = req.connector_events or []
+            focus_sector = radar_insights.get("recommended_focus_sector") or top_sector
 
             if needs_secondary:
               try:
                 tier2_directive = await StrategyDecider.decide_tier2_deep_dive(
                     target_entity=req.target_entity,
                     entity_type=req.entity_type,
-                    outlier_vector=top_sector,
+                    outlier_vector=focus_sector,
                     case_info={"id": req.case_id, "title": req.alert_name or ""},
                     alerts=alert_list,
                     connector_events=conn_list,
@@ -759,12 +1017,26 @@ class AutonomousHunterEngine:
             )
 
             sector_metrics_map = radar_result.get("sector_metrics", {})
+            vm_sectors = set(radar_insights.get("variance_masked_sectors", []) or [])
+            da_sectors = set(radar_insights.get("dormant_awakening_sectors", []) or [])
             sector_rows = [
                 {
                     "metric": f"**{s_name} Sector** (`{sector_metrics_map.get(s_name, 'metrics')}`)",
                     "observed": f"Z = {z_val:+.2f} ({radar_result['sector_observed_counts'].get(s_name, 0)} events)",
                     "threshold": "|Z| <= 2.0σ",
-                    "assessment": "⚠️ Significant Behavioral Drift" if abs(z_val) > 2.0 else "✅ Nominal Baseline",
+                    "assessment": (
+                        "⚠️ Significant Behavioral Drift"
+                        if abs(z_val) > 2.0
+                        else (
+                            "🔎 Sub-Threshold Drift (Variance-Masked)"
+                            if s_name in vm_sectors
+                            else (
+                                "🔎 Dormant Baseline Awakening"
+                                if s_name in da_sectors
+                                else "✅ Nominal Baseline"
+                            )
+                        )
+                    ),
                 }
                 for s_name, z_val in radar_result["sector_z_scores"].items()
             ]
