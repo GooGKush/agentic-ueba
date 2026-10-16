@@ -124,11 +124,36 @@ class PipelineRunner:
     )
     return EntityType, PipelineArchitecture, StatisticalModel, PreFlightValidator
 
+  def get_killchain_archetypes(self) -> Tuple[Any, Dict[Any, Dict[str, Any]]]:
+    """Returns (KillChainArchetype, KILLCHAIN_CATALOG) from secops-risk-metrics-multistage v1.9.1+."""
+    self._ensure_skill_path()
+    from scripts.preflight_validator import KillChainArchetype
+    from scripts.template_router import MultiStageTemplateRouter
+    return KillChainArchetype, MultiStageTemplateRouter.KILLCHAIN_CATALOG
+
+  def get_chained_hunt_router(self) -> Any:
+    """Returns the ChainedHuntRouter class from secops-risk-metrics-multistage v1.9.1+."""
+    self._ensure_skill_path()
+    from scripts.template_router import ChainedHuntRouter
+    return ChainedHuntRouter
+
+  def get_triage_formatter(self) -> Any:
+    """Returns the CommonMarkTriageFormatter class from secops-risk-metrics-multistage v1.9.1+."""
+    self._ensure_skill_path()
+    from scripts.triage_formatter import CommonMarkTriageFormatter
+    return CommonMarkTriageFormatter
+
   @staticmethod
-  def scope_query_to_entity(query: str, target_entity: Optional[str]) -> str:
+  def scope_query_to_entity(
+      query: str,
+      target_entity: Optional[str],
+      entity_type: Optional[str] = None,
+  ) -> str:
     """Scopes non-fleet Stage 1 / Sector stages to a specific target entity if provided."""
     if not target_entity or target_entity.lower() in ("fleet", "unknown", "unknown_entity", "target_entity", "*"):
       return query
+
+    ent_upper = (entity_type or "").upper()
 
     def _scope_stage(match: re.Match) -> str:
       stage_name = match.group(1)
@@ -136,11 +161,23 @@ class PipelineRunner:
       # Preserve fleet-wide normalization and Entity Graph stages intact
       if any(w in stage_name.lower() for w in ("fleet", "enterprise", "cohort", "peer", "global", "rare_dest", "graph")):
         return match.group(0)
-      scoped_body = re.sub(
-          r'(\$(?:entity|user|host|asset)\s*)!=\s*""',
-          f'\\1= "{target_entity}"',
-          stage_body,
-      )
+      # If both $user and $host appear in the same stage (e.g. user-attributed alert surge),
+      # only bind the variable matching entity_type (or $user by default).
+      has_user = bool(re.search(r'\$user\s*!=\s*""', stage_body))
+      has_host = bool(re.search(r'\$(?:host|asset)\s*!=\s*""', stage_body))
+      if has_user and has_host:
+        if ent_upper in ("ASSET", "HOST", "IP", "HOSTNAME", "DEVICE"):
+          target_pattern = r'(\$(?:host|asset)\s*)!=\s*""'
+        else:
+          target_pattern = r'(\$user\s*)!=\s*""'
+        scoped_body = re.sub(target_pattern, f'\\1= "{target_entity}"', stage_body, count=1)
+      else:
+        scoped_body = re.sub(
+            r'(\$(?:entity|user|host|asset|sa)\s*)!=\s*""',
+            f'\\1= "{target_entity}"',
+            stage_body,
+            count=1,
+        )
       return f"stage {stage_name} {{{scoped_body}}}"
 
     return re.sub(r"stage\s+([a-zA-Z0-9_]+)\s*\{(.*?)\}", _scope_stage, query, flags=re.DOTALL)

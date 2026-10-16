@@ -1560,3 +1560,300 @@ def test_router_paths_use_engine_outlier_gates():
                           anomaly_threshold=PipelineRunner.GATE_DEFAULTS["anomaly_threshold"])
   assert _root_gate(zq) == "$personal_z >= 3.0"
   assert _unfilled(fusion) == [] and _unfilled(zq) == []
+
+
+@pytest.mark.anyio
+async def test_v191_360_radar_baseline_enrichment_and_insights_synthesis(monkeypatch):
+  from unittest.mock import AsyncMock
+  from src.config import TenantConfig
+  from src.risk_metrics_engine import RiskMetricsEngine
+  from src.strategy_decider import StrategyDecider
+
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  eng = RiskMetricsEngine(tenant)
+
+  # Simulate:
+  # - Egress has sub-threshold Z=1.70 with inflated std=80.0 vs avg=15.0 (variance-masked!)
+  # - Cloud has dormant baseline awakening: obs=6, avg=0.10, std=3.5, z=1.68
+  # - Workspace has sub-threshold Z=1.55 (pairs with Cloud -> CLOUD_DISCOVERY_TO_COLLECTION)
+  async def fake_exec(session, query, start_iso, end_iso):
+    if "network_bytes_outbound" in query:
+      return {"stats": [{"z": 1.70, "obs": 151.0, "avg": 15.0, "std": 80.0}]}
+    if "resource_creation_total" in query:
+      return {"stats": [{"z": 1.68, "obs": 6.0, "avg": 0.10, "std": 3.5}]}
+    if "workspace_total_download_actions" in query:
+      return {"stats": [{"z": 1.55, "obs": 18.0, "avg": 4.0, "std": 9.0}]}
+    return {"stats": [{"z": 0.2, "obs": 2.0, "avg": 2.0, "std": 1.0}]}
+
+  monkeypatch.setattr(eng.runner, "execute_query_via_mcp", fake_exec)
+  radar_res = await eng.run_360_behavioral_radar(AsyncMock(), "dev.user", entity_type="USER")
+
+  assert "Egress" in radar_res["variance_masked_sectors"]
+  assert "Cloud" in radar_res["dormant_awakening_sectors"]
+  assert set(radar_res["subthreshold_sectors"]) >= {"Egress", "Cloud", "Workspace"}
+  assert radar_res["sector_baseline_std"]["Egress"] == 80.0
+  assert radar_res["sector_baseline_avg"]["Cloud"] == 0.10
+
+  insights = StrategyDecider.analyze_360_insights(
+      radar_result=radar_res,
+      ctx={
+          "primary_entity": "dev.user",
+          "extracted_hosts": ["wkstn-dev-01"],
+          "case_title": "Suspicious Cloud and Workspace Activity",
+      },
+      entity_type="USER",
+  )
+  assert insights["secondary_warranted"] is True
+  assert "Egress" in insights["variance_masked_sectors"]
+  assert "Cloud" in insights["dormant_awakening_sectors"]
+  archetype_names = [m["archetype"] for m in insights["matched_killchain_archetypes"]]
+  assert "CLOUD_DISCOVERY_TO_COLLECTION" in archetype_names
+  assert any(c["entity"] == "wkstn-dev-01" and c["entity_type"] == "ASSET" for c in insights["companion_entities"])
+
+
+@pytest.mark.anyio
+async def test_v191_variance_masked_and_dormant_awakening_secondary_routing(monkeypatch):
+  from src.strategy_decider import StrategyDecider
+
+  monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+  # 1. Variance-masked sub-threshold sector -> routes to 4-Stage Non-Parametric MAD
+  radar_vm = {
+      "top_sector": "Egress",
+      "outlier_sectors": [],
+      "subthreshold_sectors": ["Egress"],
+      "variance_masked_sectors": ["Egress"],
+      "dormant_awakening_sectors": [],
+      "sector_z_scores": {"Auth": 0.1, "Cloud": 0.2, "Workspace": 0.1, "Egress": 1.72, "DNS": 0.1, "Web": 0.1},
+      "sector_observed_counts": {"Auth": 1, "Cloud": 1, "Workspace": 1, "Egress": 25, "DNS": 1, "Web": 1},
+      "sector_baseline_avg": {"Egress": 10.0},
+      "sector_baseline_std": {"Egress": 65.0},
+  }
+  dir_vm = await StrategyDecider.decide_tier2_deep_dive(
+      target_entity="masked.user",
+      entity_type="USER",
+      outlier_vector="Egress",
+      case_info={"id": "301", "title": "Outbound Traffic Variance Check"},
+      alerts=[{"name": "Anomalous Outbound Data"}],
+      connector_events=[],
+      radar_result=radar_vm,
+  )
+  assert dir_vm.model_name == "MAD"
+  assert dir_vm.directive_query == "dynamic_metric"
+  assert dir_vm.target_metric == "network_bytes_outbound"
+  assert dir_vm.confidence_score >= StrategyDecider.TIER_2A_AUTO_EXECUTE_THRESHOLD
+
+  # 2. Dormant baseline awakening -> routes to TWO_PART_HURDLE
+  radar_da = {
+      "top_sector": "Workspace",
+      "outlier_sectors": [],
+      "subthreshold_sectors": ["Workspace"],
+      "variance_masked_sectors": [],
+      "dormant_awakening_sectors": ["Workspace"],
+      "sector_z_scores": {"Auth": 0.1, "Cloud": 0.1, "Workspace": 1.65, "Egress": 0.1, "DNS": 0.1, "Web": 0.1},
+      "sector_observed_counts": {"Auth": 1, "Cloud": 0, "Workspace": 9, "Egress": 1, "DNS": 1, "Web": 1},
+      "sector_baseline_avg": {"Workspace": 0.05},
+      "sector_baseline_std": {"Workspace": 4.0},
+  }
+  dir_da = await StrategyDecider.decide_tier2_deep_dive(
+      target_entity="dormant.user",
+      entity_type="USER",
+      outlier_vector="Workspace",
+      case_info={"id": "302", "title": "Dormant Workspace Account Activity"},
+      alerts=[{"name": "Sudden Drive Activity"}],
+      connector_events=[],
+      radar_result=radar_da,
+  )
+  assert dir_da.model_name == "TWO_PART_HURDLE"
+  assert dir_da.directive_query == "dynamic_metric"
+  assert dir_da.target_metric == "workspace_total_download_actions"
+  assert dir_da.confidence_score >= StrategyDecider.TIER_2A_AUTO_EXECUTE_THRESHOLD
+
+
+def test_v191_bidirectional_tier2b_pivot_confirmed_and_refuted():
+  from src.models import StrategyDirective
+  from src.strategy_decider import StrategyDecider
+
+  # 1. CONFIRMED Tier 2A Outlier on Workspace + elevated Cloud -> pivots to Workspace Triad or Kill-Chain
+  radar_ws_cloud = {
+      "top_sector": "Workspace",
+      "outlier_sectors": ["Workspace", "Cloud"],
+      "sector_z_scores": {"Auth": 0.2, "Cloud": 2.6, "Workspace": 3.8, "Egress": 0.3, "DNS": 0.1, "Web": 0.2},
+      "sector_observed_counts": {"Auth": 2, "Cloud": 14, "Workspace": 45, "Egress": 5, "DNS": 2, "Web": 3},
+      "sector_baseline_avg": {"Cloud": 2.0, "Workspace": 4.0},
+      "sector_baseline_std": {"Cloud": 3.0, "Workspace": 5.0},
+  }
+  t2a_ws = StrategyDirective(
+      selected_skill="secops-risk-metrics-multistage",
+      model_name="MACD_MOMENTUM_VELOCITY",
+      directive_query="macd_momentum",
+      target_entity="insider.user",
+      entity_type="USER",
+      target_metric="workspace_total_download_actions",
+      investigation_tier="TIER_2_DEEP_DIVE",
+      outlier_vector="Workspace",
+  )
+  piv_confirmed = StrategyDecider.decide_tier2_pivot(
+      target_entity="insider.user",
+      entity_type="USER",
+      radar_result=radar_ws_cloud,
+      tier2a_directive=t2a_ws,
+      tier2a_result={"is_outlier": True, "calibrated_risk_index": 82, "stats_rows": 4},
+      alerts=[{"name": "Workspace Mass Download"}],
+      connector_events=[],
+      executed_signatures={StrategyDecider.build_signature("MACD_MOMENTUM_VELOCITY", "workspace_total_download_actions", None, "insider.user")},
+      empty_families=set(),
+      secondary_hunts_run=1,
+  )
+  assert piv_confirmed is not None
+  assert piv_confirmed.investigation_tier == "TIER_2B_PIVOT"
+  assert piv_confirmed.post_data_outcome_class == "ACUTE_OUTLIER"
+  assert piv_confirmed.directive_query in ("workspace_triad", "killchain_archetype", "sector_fusion")
+  assert piv_confirmed.confidence_score >= StrategyDecider.TIER_2B_PIVOT_AUTO_EXECUTE_THRESHOLD
+
+  # 2. REFUTED Tier 2A on Cloud CRUD -> pivots to CLOUD_REPOSITORY_SCOPE (fail mode) or 4-Stage MAD
+  radar_cloud = {
+      "top_sector": "Cloud",
+      "outlier_sectors": ["Cloud"],
+      "sector_z_scores": {"Auth": 0.2, "Cloud": 2.9, "Workspace": 0.1, "Egress": 0.2, "DNS": 0.1, "Web": 0.1},
+      "sector_observed_counts": {"Auth": 2, "Cloud": 22, "Workspace": 1, "Egress": 2, "DNS": 1, "Web": 1},
+  }
+  t2a_cloud = StrategyDirective(
+      selected_skill="secops-risk-metrics-multistage",
+      model_name="CLOUD_CRUD_SURGE",
+      directive_query="cloud_crud",
+      target_entity="sa-prod@proj.iam",
+      entity_type="USER",
+      target_metric="resource_creation_total",
+      investigation_tier="TIER_2_DEEP_DIVE",
+      outlier_vector="Cloud",
+  )
+  piv_refuted = StrategyDecider.decide_tier2_pivot(
+      target_entity="sa-prod@proj.iam",
+      entity_type="USER",
+      radar_result=radar_cloud,
+      tier2a_directive=t2a_cloud,
+      tier2a_result={"is_outlier": False, "calibrated_risk_index": 20, "stats_rows": 3},
+      alerts=[{"name": "IAM Permission Denied Recon"}],
+      connector_events=[],
+      executed_signatures={StrategyDecider.build_signature("CLOUD_CRUD_SURGE", "resource_creation_total", None, "sa-prod@proj.iam")},
+      empty_families=set(),
+      secondary_hunts_run=1,
+  )
+  assert piv_refuted is not None
+  assert piv_refuted.model_name == "CLOUD_REPOSITORY_SCOPE"
+  assert piv_refuted.directive_query == "cloud_repo_scope"
+  assert piv_refuted.outcome_mode == "fail"
+
+
+@pytest.mark.anyio
+async def test_v191_new_risk_metrics_methods_and_6spoke_hex_radar(monkeypatch):
+  from unittest.mock import AsyncMock
+  from src.autonomous_hunter import AutonomousHunterEngine
+  from src.config import TenantConfig
+  from src.models import JITHuntRequest, StrategyDirective
+  from src.risk_metrics_engine import RiskMetricsEngine
+
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  eng = RiskMetricsEngine(tenant)
+  captured_windows = []
+
+  async def fake_exec(session, query, start_iso, end_iso):
+    captured_windows.append((start_iso, end_iso, query))
+    return {
+        "stats": [
+            {
+                "composite_threat_norm_sq": 16.0,
+                "z_a_gated": 3.2,
+                "z_b_gated": 2.4,
+                "alert_z": 4.1,
+                "total_alerts": 18,
+                "fail_z": 3.9,
+                "fail_ratio": 0.72,
+                "composite_risk": 4.3,
+                "fold_change": 5.5,
+                "composite_z_score": 4.4,
+                "modified_z": 4.2,
+            }
+        ]
+    }
+
+  monkeypatch.setattr(eng.runner, "execute_query_via_mcp", fake_exec)
+  mock_session = AsyncMock()
+
+  # 1. 4-Stage MAD enforces >= 30d window
+  res_mad = await eng.run_dynamic_metric_pipeline(
+      mock_session, entity="alice", target_metric="network_bytes_outbound", model_name="MAD", lookback_days=7
+  )
+  assert res_mad["is_outlier"] is True
+  assert res_mad["modified_z"] == 4.2
+
+  # 2. All 5 new v1.9.1 engine methods execute and parse scores
+  res_kc = await eng.run_killchain_archetype(
+      mock_session, entity="alice", archetype="CLOUD_DISCOVERY_TO_COLLECTION", entity_type="USER"
+  )
+  assert res_kc["is_outlier"] is True
+  assert res_kc["archetype"] == "CLOUD_DISCOVERY_TO_COLLECTION"
+
+  res_alert = await eng.run_alert_surge(mock_session, entity="wkstn-01", entity_type="ASSET")
+  assert res_alert["is_outlier"] is True
+  assert res_alert["total_alerts"] == 18
+
+  res_fail = await eng.run_failure_ratio_surge(
+      mock_session, entity="alice", fail_metric="http_queries_fail", entity_type="USER"
+  )
+  assert res_fail["is_outlier"] is True
+  assert res_fail["failure_ratio"] == 0.72
+
+  res_repo = await eng.run_cloud_repository_scope(mock_session, entity="sa@proj", outcome_mode="fail")
+  assert res_repo["is_outlier"] is True
+  assert res_repo["outcome_mode"] == "fail"
+  assert res_repo["target_metric"] == "resource_read_fail"
+
+  res_triad = await eng.run_workspace_triad(mock_session, entity="alice")
+  assert res_triad["is_outlier"] is True
+  assert res_triad["composite_z_score"] == 4.4
+
+  # 3. 6-spoke hexagonal radar SVG for USER and ASSET
+  hunter = AutonomousHunterEngine(tenant)
+  svg_user = hunter.generate_behavioral_radar(
+      "alice",
+      {"Auth": 1.0, "Cloud": 2.0, "Workspace": 3.5, "Egress": 1.2, "DNS": 0.5, "Web": 2.1},
+      entity_type="USER",
+  )
+  assert "USER: ALICE" in svg_user
+  assert "Web & Proxy" in svg_user
+  assert "6-Spoke Hex" in svg_user
+
+  svg_asset = hunter.generate_behavioral_radar(
+      "wkstn-01",
+      {"Auth": 0.5, "Egress": 3.2, "DNS": 1.1, "Flows": 2.8, "Alerts": 4.0, "Web": 1.5},
+      entity_type="ASSET",
+  )
+  assert "ASSET: WKSTN-01" in svg_asset
+  assert "Outbound Flows" in svg_asset
+  assert "Security Alerts" in svg_asset
+
+  # 4. _execute_secondary_directive dispatches all 5 new v1.9.1 directive_query types
+  monkeypatch.setattr("src.autonomous_hunter.RiskMetricsEngine", lambda t: eng)
+  req = JITHuntRequest(target_entity="alice", entity_type="USER", case_id="999")
+  for dq, mname in (
+      ("killchain_archetype", "KILLCHAIN_CLOUD_DISCOVERY_TO_COLLECTION"),
+      ("workspace_triad", "PART_OF_THE_WHOLE_TRIAD_MULTILEVEL"),
+      ("cloud_repo_scope", "CLOUD_REPOSITORY_SCOPE"),
+      ("failure_ratio_surge", "FAILURE_RATIO_SURGE"),
+      ("alert_surge", "ALERT_SURGE"),
+  ):
+    d = StrategyDirective(
+        selected_skill="secops-risk-metrics-multistage",
+        model_name=mname,
+        directive_query=dq,
+        target_entity="alice",
+        entity_type="USER",
+        target_metric="workspace_total_download_actions",
+    )
+    s_res, s_card = await hunter._execute_secondary_directive(mock_session, tenant, req, d)
+    assert s_res is not None and s_res["is_outlier"] is True
+    assert s_card is not None and "Post-Data Outcome Class" in s_card
+    assert d.post_data_outcome_class == "ACUTE_OUTLIER"
+

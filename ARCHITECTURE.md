@@ -109,8 +109,20 @@ create_case_comment / SOAR Rule Trigger]
   * Computes **Calibrated Risk Index (CRI)**:
     $$	ext{CRI}(Z) = 	ext{round}\left(rac{100}{1 + \exp(-0.6 \cdot (Z - 3.0))}ight)$$
   * Filters for findings with $	ext{CRI} \ge 46$ ($Z \ge 3.0\sigma$).
-  * **Query-side gate (skill v1.8.6+)**: every `secops-risk-metrics-multistage` template and router query carries a root `condition:`. Gate values come from `PipelineRunner.GATE_DEFAULTS` (σ ≥ 3.0, fold change ≥ 2.0, fusion D² ≥ 9.0 i.e. D ≥ 3.0, MAD modified Z ≥ 3.5). They match the engine's own outlier rules, so no entity the engine would flag is dropped by the query. Consequence: nominal entities return no rows, and the engine reports them with score 0.0 instead of their sub-threshold value.
-* **Output**: Produces the typed **Clean Hand-Off (CH)** JSON payload.
+  * **Query-side gate (skill v1.8.6+ & v1.9.1)**: every `secops-risk-metrics-multistage` template and router query carries a root `condition:`. Gate values come from `PipelineRunner.GATE_DEFAULTS` (σ ≥ 3.0, fold change ≥ 2.0, fusion D² ≥ 9.0 i.e. D ≥ 3.0, MAD modified Z ≥ 3.5). They match the engine's own outlier rules, so no entity the engine would flag is dropped by the query. Consequence: nominal entities return no rows, and the engine reports them with score 0.0 instead of their sub-threshold value.
+* **Agentic Secondary Investigation & Bidirectional Epistemic Pivot Engine (skill v1.9.1 + v2.7.4)**:
+  * **Enriched 360° Behavioral Radar (`run_360_behavioral_radar`)**: Extracts per-sector `$avg` and `$std` alongside `$z` and `$obs` across all 6 `USER` spokes (`Auth`, `Cloud`, `Workspace`, `Egress`, `DNS`, `Web`) and 6 `ASSET` spokes (`Auth`, `Egress`, `DNS`, `Flows`, `Alerts`, `Web`), identifying `subthreshold_sectors` ($1.25 \le Z < 2.0$), `variance_masked_sectors` ($1.25 \le Z < 3.0$ with inflated $\sigma \ge \max(1.5\mu, 5.0)$), and `dormant_awakening_sectors` ($\text{obs} > 0, \mu < 1.0, Z \ge 1.5$).
+  * **360° Warrant & Insight Analyzer (`StrategyDecider.analyze_360_insights`)**: Synthesizes active/sub-threshold sectors, variance-masked drift (auto-routing to 4-Stage Non-Parametric `MAD` over a 30-day window), dormant baseline awakenings (auto-routing to `TWO_PART_HURDLE`), matched MITRE ATT&CK `KillChainArchetype` topologies, and cross-entity bridges (`USER` $\leftrightarrow$ `ASSET`/`IP`).
+  * **Expanded Tier 2 Execution Portfolio (`RiskMetricsEngine`)**:
+    * `run_killchain_archetype()`: Executes all 8 canonical MITRE ATT&CK `KillChainArchetype` multi-stage fusion pipelines (`CREDENTIAL_ACCESS_TO_EXECUTION`, `INITIAL_ACCESS_TO_DISCOVERY`, `EXECUTION_TO_C2_DNS`, `EXECUTION_TO_EXFILTRATION`, `CREDENTIAL_ACCESS_TO_LATERAL_MOVEMENT`, `CLOUD_DISCOVERY_TO_COLLECTION`, `DEFENSE_EVASION_ALERT_TO_EXFILTRATION`, `C2_BEACON_TO_RARE_DESTINATION_EXFIL`).
+    * `run_workspace_triad()`: 3-Stage `PART_OF_THE_WHOLE_TRIAD_MULTILEVEL` decomposing Workspace downloads, permission changes, and outbound emails against enterprise peers.
+    * `run_cloud_repository_scope()`: Dual-branch service account/user repository scope & caller IP attribution supporting `outcome_mode="fail" | "success" | "total"`.
+    * `run_failure_ratio_surge()`: 2-Stage failure-to-total ratio surge across all 8 `*_fail`/`*_total` Malachite metric families.
+    * `run_alert_surge()`: 2-Stage security & EDR alert accumulation (`alert_event_name_count`) for both `ASSET` and `USER` entities.
+  * **Bidirectional Tier 2B Epistemic Pivot (`StrategyDecider.decide_tier2_pivot`)**:
+    * **Confirmed Tier 2A Outliers (`ACUTE_OUTLIER`)**: Pivots to second-order verification and kill-chain progression (Workspace Triad decomposition, Cloud Repository Scope attribution, Rare Destination Entity Context Graph enrichment, or cross-tactic `KillChainArchetype` fusion).
+    * **Refuted Tier 2A Hypotheses (`CLEAN_OR_SUBTHRESHOLD` / `SPARSE_BASELINE`)**: Pivots across mathematical assumptions (4-Stage Non-Parametric `MAD` for heavy-tailed variance masking, Cloud `fail`-mode access-denied recon, `TWO_PART_HURDLE` for dormant baselines, `MACD_MOMENTUM_VELOCITY`, `CIRCADIAN_VON_MISES`, or Cross-Entity `USER` $\leftrightarrow$ `ASSET` bridges).
+* **Output**: Produces the typed **Clean Hand-Off (CH)** JSON payload and Chronicle SOAR-compliant Case Wall Triage Cards with Post-Data Outcome Classification (`ACUTE_OUTLIER`, `CLEAN_OR_SUBTHRESHOLD`, `FLEET_WAVE`, `SPARSE_BASELINE`) and MITRE ATT&CK kill-chain progression.
 
 ---
 

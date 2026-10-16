@@ -148,6 +148,8 @@ match:
 outcome:
   $z = max($auth_risk.z)
   $observed = max($auth_risk.obs)
+  $avg = max($auth_risk.avg)
+  $std = max($auth_risk.std)
 
 order:
   $z desc""",
@@ -180,6 +182,8 @@ match:
 outcome:
   $z = max($egress_risk.z)
   $observed = max($egress_risk.obs)
+  $avg = max($egress_risk.avg)
+  $std = max($egress_risk.std)
 
 order:
   $z desc""",
@@ -212,6 +216,8 @@ match:
 outcome:
   $z = max($dns_risk.z)
   $observed = max($dns_risk.obs)
+  $avg = max($dns_risk.avg)
+  $std = max($dns_risk.std)
 
 order:
   $z desc""",
@@ -243,6 +249,8 @@ match:
 outcome:
   $z = max($flows_risk.z)
   $observed = max($flows_risk.obs)
+  $avg = max($flows_risk.avg)
+  $std = max($flows_risk.std)
 
 order:
   $z desc""",
@@ -278,6 +286,8 @@ match:
 outcome:
   $z = max($alerts_risk.z)
   $observed = max($alerts_risk.obs)
+  $avg = max($alerts_risk.avg)
+  $std = max($alerts_risk.std)
 
 order:
   $z desc""",
@@ -309,6 +319,8 @@ match:
 outcome:
   $z = max($web_risk.z)
   $observed = max($web_risk.obs)
+  $avg = max($web_risk.avg)
+  $std = max($web_risk.std)
 
 order:
   $z desc""",
@@ -344,6 +356,8 @@ match:
 outcome:
   $z = max($auth_risk.z)
   $observed = max($auth_risk.obs)
+  $avg = max($auth_risk.avg)
+  $std = max($auth_risk.std)
 
 order:
   $z desc""",
@@ -381,6 +395,8 @@ match:
 outcome:
   $z = max($cloud_risk.z)
   $observed = max($cloud_risk.obs)
+  $avg = max($cloud_risk.avg)
+  $std = max($cloud_risk.std)
 
 order:
   $z desc""",
@@ -413,6 +429,8 @@ match:
 outcome:
   $z = max($workspace_risk.z)
   $observed = max($workspace_risk.obs)
+  $avg = max($workspace_risk.avg)
+  $std = max($workspace_risk.std)
 
 order:
   $z desc""",
@@ -445,6 +463,8 @@ match:
 outcome:
   $z = max($egress_risk.z)
   $observed = max($egress_risk.obs)
+  $avg = max($egress_risk.avg)
+  $std = max($egress_risk.std)
 
 order:
   $z desc""",
@@ -477,6 +497,8 @@ match:
 outcome:
   $z = max($dns_risk.z)
   $observed = max($dns_risk.obs)
+  $avg = max($dns_risk.avg)
+  $std = max($dns_risk.std)
 
 order:
   $z desc""",
@@ -508,12 +530,14 @@ match:
 outcome:
   $z = max($web_risk.z)
   $observed = max($web_risk.obs)
+  $avg = max($web_risk.avg)
+  $std = max($web_risk.std)
 
 order:
   $z desc""",
       }
 
-    async def _query_sector(sector_name: str, q_str: str) -> Tuple[str, float, int]:
+    async def _query_sector(sector_name: str, q_str: str) -> Tuple[str, float, int, float, float]:
       try:
         resp = await self.runner.execute_query_via_mcp(session, q_str, start_iso, end_iso)
         rows = self.runner.parse_stats_response(resp)
@@ -529,10 +553,20 @@ order:
             if k in row and row[k] is not None:
               obs_val = int(float(row[k]))
               break
-          return sector_name, z_val, obs_val
+          avg_val = 0.0
+          for k in ("avg", "baseline", "baseline_avg", "$avg", "$baseline"):
+            if k in row and row[k] is not None:
+              avg_val = float(row[k])
+              break
+          std_val = 0.0
+          for k in ("std", "dispersion", "baseline_std", "$std", "$dispersion"):
+            if k in row and row[k] is not None:
+              std_val = float(row[k])
+              break
+          return sector_name, z_val, obs_val, avg_val, std_val
       except Exception as err:
         logger.warning(f"Sector query failed for {sector_name} ({err}); defaulting to 0.0")
-      return sector_name, 0.0, 0
+      return sector_name, 0.0, 0, 0.0, 0.0
 
     # Execute queries sequentially to preserve single MCP stream stability
     results = []
@@ -540,14 +574,27 @@ order:
       res = await _query_sector(name, q_str)
       results.append(res)
 
-    z_scores = {name: z for name, z, _ in results}
-    observed_counts = {name: obs for name, _, obs in results}
+    z_scores = {name: z for name, z, _, _, _ in results}
+    observed_counts = {name: obs for name, _, obs, _, _ in results}
+    baseline_avgs = {name: avg for name, _, _, avg, _ in results}
+    baseline_stds = {name: std for name, _, _, _, std in results}
 
     composite_d = self.runner.compute_euclidean_distance(z_scores)
     cri = self.runner.calculate_cri(composite_d)
     sorted_sectors = sorted(z_scores.items(), key=lambda x: x[1], reverse=True)
     top_sector = sorted_sectors[0][0] if sorted_sectors else "Auth"
     outlier_sectors = [s_name for s_name, z_val in sorted_sectors if abs(z_val) >= 2.0]
+    subthreshold_sectors = [s_name for s_name, z_val in sorted_sectors if 1.25 <= z_val < 2.0]
+    dormant_awakening_sectors = [
+        s_name
+        for s_name, z_val in sorted_sectors
+        if observed_counts.get(s_name, 0) > 0 and baseline_avgs.get(s_name, 0.0) < 1.0 and z_val >= 1.5
+    ]
+    variance_masked_sectors = [
+        s_name
+        for s_name, z_val in sorted_sectors
+        if 1.25 <= z_val < 3.0 and baseline_stds.get(s_name, 0.0) >= max(baseline_avgs.get(s_name, 0.0) * 1.5, 5.0)
+    ]
 
     return {
         "entity": username,
@@ -556,10 +603,16 @@ order:
         "calibrated_risk_index": cri,
         "top_sector": top_sector,
         "outlier_sectors": outlier_sectors,
+        "subthreshold_sectors": subthreshold_sectors,
+        "dormant_awakening_sectors": dormant_awakening_sectors,
+        "variance_masked_sectors": variance_masked_sectors,
         "sector_metrics": dict(sector_metric_map),
         "is_outlier": cri >= 46 or len(outlier_sectors) > 0,
         "sector_z_scores": {k: round(v, 2) for k, v in z_scores.items()},
+        "sector_cri_scores": {k: self.runner.calculate_cri(v) for k, v in z_scores.items()},
         "sector_observed_counts": observed_counts,
+        "sector_baseline_avg": {k: round(v, 2) for k, v in baseline_avgs.items()},
+        "sector_baseline_std": {k: round(v, 2) for k, v in baseline_stds.items()},
         "verdict": "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE"),
     }
 
@@ -832,6 +885,9 @@ order:
         "EMPIRICAL_BAYES_3STAGE": PipelineArchitecture.EMPIRICAL_BAYES_3STAGE,
         "CLOUD_REPOSITORY_SCOPE": PipelineArchitecture.CLOUD_REPOSITORY_SCOPE_DUAL_BRANCH,
         "CLOUD_REPOSITORY_SCOPE_DUAL_BRANCH": PipelineArchitecture.CLOUD_REPOSITORY_SCOPE_DUAL_BRANCH,
+        "HTTP_ERROR_RATIO_SURGE_2STAGE": PipelineArchitecture.HTTP_ERROR_RATIO_SURGE_2STAGE,
+        "HTTP_TARGET_SURGE_2STAGE": PipelineArchitecture.HTTP_TARGET_SURGE_2STAGE,
+        "HYBRID_METRIC_HTTP_UA_PREVALENCE_2STAGE": PipelineArchitecture.HYBRID_METRIC_HTTP_UA_PREVALENCE_2STAGE,
         "HYBRID_METRIC_RAW_ENRICHMENT_2STAGE": PipelineArchitecture.HYBRID_METRIC_RAW_ENRICHMENT_2STAGE,
         "HYBRID_METRIC_ENTROPY_CONCENTRATION_2STAGE": PipelineArchitecture.HYBRID_METRIC_ENTROPY_CONCENTRATION_2STAGE,
         "HYBRID_METRIC_ORTHOGONAL_SPACE_2STAGE": PipelineArchitecture.HYBRID_METRIC_ORTHOGONAL_SPACE_2STAGE,
@@ -846,6 +902,7 @@ order:
     stat_model_map = {
         "STANDARD_Z_SCORE": StatisticalModel.STANDARD_Z_SCORE,
         "MAD": StatisticalModel.MAD,
+        "RELATIVE_DEVIATION": StatisticalModel.RELATIVE_DEVIATION,
         "VARIANCE": StatisticalModel.VARIANCE,
         "POISSON": StatisticalModel.POISSON,
         "COEFFICIENT_OF_VARIATION": StatisticalModel.COEFFICIENT_OF_VARIATION,
@@ -864,7 +921,9 @@ order:
     is_entity_graph = any(
         k in model_upper for k in ("DERIVED_", "WHOIS_", "FLEET_PREVALENCE", "ASSET_AGE", "RARE_DESTINATION")
     )
-    start_iso, end_iso = self._iso_window(lookback_days, is_entity_graph=is_entity_graph)
+    # 4-stage MAD requires ~30d raw window so mad_center / mad_spread compute true 30d median/MAD
+    effective_lookback = max(lookback_days, 30) if model_upper == "MAD" else lookback_days
+    start_iso, end_iso = self._iso_window(effective_lookback, is_entity_graph=is_entity_graph)
 
     if model_upper in ("RARE_DESTINATION_ECG_3STAGE", "RARE_DESTINATION_ECG"):
       host_f = identifier_field if identifier_field and "asset" in identifier_field else "principal.asset.hostname"
@@ -915,27 +974,39 @@ order:
           robust_threshold=gates["robust_threshold"],
       )
 
-    rendered = self.runner.scope_query_to_entity(rendered, entity)
+    rendered = self.runner.scope_query_to_entity(rendered, entity, entity_type=entity_type)
     resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
     rows = self.runner.parse_stats_response(resp)
 
     top_score = 0.0
     observed_val = 0.0
     hist_avg = 0.0
+    z_gap = 0.0
     if rows:
       top_row = rows[0]
       for score_key in (
+          "modified_z",
           "personal_z",
           "cusum_z",
           "z_sector",
           "macd_momentum_score",
           "circadian_threat_score",
           "mad_z_score",
+          "fold_change",
           "z_vs_enterprise",
           "z_vs_team",
+          "composite_z_score",
           "bayesian_z",
+          "posterior_lift",
+          "bayes_shift_ratio",
+          "surge_ratio",
           "hurdle_z",
           "composite_risk",
+          "recon_score",
+          "fail_z",
+          "alert_z",
+          "beacon_score",
+          "flow_z",
           "z_score",
           "z",
       ):
@@ -944,11 +1015,13 @@ order:
           break
       if top_score == 0.0 and "d_sq" in top_row and top_row["d_sq"] is not None:
         top_score = math.sqrt(max(0.0, float(top_row["d_sq"])))
-      for obs_key in ("observed", "a_observed", "observed_hour", "observed_val", "obs", "entity_obs"):
+      if "z_gap" in top_row and top_row["z_gap"] is not None:
+        z_gap = float(top_row["z_gap"])
+      for obs_key in ("observed", "a_observed", "observed_hour", "observed_val", "obs", "entity_obs", "observed_fails", "total_alerts"):
         if obs_key in top_row and top_row[obs_key] is not None:
           observed_val = float(top_row[obs_key])
           break
-      for avg_key in ("hist_avg", "baseline_avg", "avg_hourly", "historical_avg", "avg", "personal_avg"):
+      for avg_key in ("median_val", "hist_avg", "baseline_avg", "avg_hourly", "historical_avg", "avg", "personal_avg"):
         if avg_key in top_row and top_row[avg_key] is not None:
           hist_avg = float(top_row[avg_key])
           break
@@ -960,6 +1033,8 @@ order:
         "model": model_upper,
         "target_metric": target_metric,
         "top_z_score": round(top_score, 2),
+        "modified_z": round(top_score, 2) if model_upper == "MAD" else None,
+        "z_gap": round(z_gap, 2),
         "observed_value": observed_val,
         "baseline_avg": round(hist_avg, 2),
         "calibrated_risk_index": cri,
@@ -1270,6 +1345,350 @@ order:
         "is_outlier": cri >= 60 or top_z >= 3.0,
         "stats_rows": len(rows),
         "executed_query": query,
+    }
+
+  async def run_killchain_archetype(
+      self,
+      session: ClientSession,
+      entity: str,
+      archetype_name: str = "CREDENTIAL_ACCESS_TO_EXECUTION",
+      entity_type: str = "USER",
+      four_stage: bool = False,
+      identifier_field: Optional[str] = None,
+      lookback_days: int = 14,
+      archetype: Optional[str] = None,
+  ) -> Dict[str, Any]:
+    """Executes a v1.9.1 canonical MITRE ATT&CK Multi-Stage Kill-Chain Archetype Fusion hunt."""
+    KillChainArchetype, catalog = self.runner.get_killchain_archetypes()
+    router = self.runner.get_template_router()
+    ent_enum = self._resolve_entity_enum(entity_type)
+
+    raw_arch = (archetype or archetype_name or "CREDENTIAL_ACCESS_TO_EXECUTION").strip().upper()
+    if raw_arch.startswith("KILLCHAIN_"):
+      raw_arch = raw_arch[len("KILLCHAIN_"):]
+    try:
+      arch_enum = KillChainArchetype(raw_arch)
+    except Exception:
+      arch_enum = KillChainArchetype.CREDENTIAL_ACCESS_TO_EXECUTION
+
+    spec = catalog.get(arch_enum, {})
+    supported = spec.get("supported_entities", (ent_enum,))
+    if ent_enum not in supported and supported:
+      ent_enum = supported[0]
+
+    is_rare_dest = bool(spec.get("rare_destination"))
+    start_iso, end_iso = self._iso_window(lookback_days, is_entity_graph=is_rare_dest)
+    rendered = router.build_killchain_hunt_query(
+        archetype=arch_enum,
+        entity_type=ent_enum,
+        four_stage=four_stage,
+        fusion_threshold_sq=self.runner.GATE_DEFAULTS["fusion_threshold_sq"],
+        hypothesis_goal=f"MITRE ATT&CK Kill-Chain ({arch_enum.value}) on {entity}",
+        identifier_field=identifier_field,
+    )
+    rendered = self.runner.scope_query_to_entity(rendered, entity, entity_type=entity_type)
+    resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
+    rows = self.runner.parse_stats_response(resp)
+
+    norm_sq = 0.0
+    z_a = 0.0
+    z_b = 0.0
+    if rows:
+      top_row = rows[0]
+      norm_sq = float(
+          top_row.get("composite_threat_norm_sq")
+          or top_row.get("$composite_threat_norm_sq")
+          or top_row.get("d_sq")
+          or top_row.get("$d_sq")
+          or 0.0
+      )
+      z_a = float(
+          top_row.get("z_a_gated")
+          or top_row.get("z_a")
+          or top_row.get("sector_a_z")
+          or top_row.get("z_sector_a")
+          or 0.0
+      )
+      z_b = float(
+          top_row.get("z_b_gated")
+          or top_row.get("z_b")
+          or top_row.get("sector_b_z")
+          or top_row.get("z_sector_b")
+          or 0.0
+      )
+      direct_d = float(top_row.get("composite_threat_score") or 0.0)
+      if norm_sq <= 0.0 and direct_d > 0.0:
+        norm_sq = direct_d * direct_d
+      elif norm_sq <= 0.0 and (z_a > 0 or z_b > 0):
+        norm_sq = (z_a * z_a) + (z_b * z_b)
+
+    composite_d = math.sqrt(max(0.0, norm_sq))
+    cri = self.runner.calculate_cri(composite_d)
+    tactics = list(spec.get("mitre_tactics", ()))
+    return {
+        "entity": entity,
+        "entity_type": entity_type,
+        "model": f"KILLCHAIN_{arch_enum.value}",
+        "archetype": arch_enum.value,
+        "killchain_archetype": arch_enum.value,
+        "mitre_tactics": tactics,
+        "fusion_metrics": [spec.get("sector_a", ""), spec.get("sector_b", "")],
+        "sector_a_z": round(z_a, 2),
+        "sector_b_z": round(z_b, 2),
+        "composite_d": round(composite_d, 2),
+        "composite_threat_score": round(composite_d, 2),
+        "top_z_score": round(composite_d, 2),
+        "calibrated_risk_index": cri,
+        "is_outlier": cri >= 60 or composite_d >= 3.0,
+        "stats_rows": len(rows),
+        "executed_query": rendered,
+    }
+
+  async def run_alert_surge(
+      self,
+      session: ClientSession,
+      entity: str,
+      entity_type: str = "ASSET",
+      lookback_days: int = 14,
+  ) -> Dict[str, Any]:
+    """Executes the v1.9.1 2-Stage Security & EDR Alert Surge pipeline (alert_event_name_count)."""
+    start_iso, end_iso = self._iso_window(lookback_days)
+    router = self.runner.get_template_router()
+    ent_enum = self._resolve_entity_enum(entity_type)
+    rendered = router.build_alert_surge_query(
+        entity_type=ent_enum,
+        anomaly_threshold=self.runner.GATE_DEFAULTS["anomaly_threshold"],
+        hypothesis_goal=f"Security & EDR Alert Surge (alert_event_name_count) for {entity}",
+    )
+    rendered = self.runner.scope_query_to_entity(rendered, entity, entity_type=entity_type)
+    resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
+    rows = self.runner.parse_stats_response(resp)
+
+    alert_z = 0.0
+    total_alerts = 0
+    distinct_rules = 0
+    novel_rules = 0
+    if rows:
+      top_row = rows[0]
+      alert_z = float(top_row.get("alert_z") or top_row.get("z") or 0.0)
+      total_alerts = int(float(top_row.get("total_alerts") or top_row.get("observed") or 0))
+      distinct_rules = int(float(top_row.get("distinct_rules") or 0))
+      novel_rules = int(float(top_row.get("novel_rules") or 0))
+
+    cri = self.runner.calculate_cri(alert_z)
+    return {
+        "entity": entity,
+        "entity_type": entity_type,
+        "model": "ALERT_SURGE",
+        "target_metric": "alert_event_name_count",
+        "alert_z": round(alert_z, 2),
+        "top_z_score": round(alert_z, 2),
+        "total_alerts": total_alerts,
+        "observed_alerts": total_alerts,
+        "distinct_rules": distinct_rules,
+        "novel_rules": novel_rules,
+        "calibrated_risk_index": cri,
+        "is_outlier": cri >= 60 or alert_z >= 3.0,
+        "stats_rows": len(rows),
+        "executed_query": rendered,
+    }
+
+  async def run_failure_ratio_surge(
+      self,
+      session: ClientSession,
+      entity: str,
+      fail_metric: str = "auth_attempts_fail",
+      entity_type: str = "USER",
+      identifier_field: Optional[str] = None,
+      lookback_days: int = 14,
+  ) -> Dict[str, Any]:
+    """Executes the v1.9.1 2-Stage Failure-to-Total Ratio Surge pipeline across any of the 8 *_fail families."""
+    start_iso, end_iso = self._iso_window(lookback_days)
+    router = self.runner.get_template_router()
+    ent_enum = self._resolve_entity_enum(entity_type)
+    if not fail_metric or not fail_metric.endswith("_fail"):
+      fail_metric = "auth_attempts_fail" if ent_enum.value == "USER" else "http_queries_fail"
+
+    from scripts.preflight_validator import METRIC_CATALOG
+    if fail_metric in METRIC_CATALOG and ent_enum not in METRIC_CATALOG[fail_metric].supported_entity_types:
+      ent_enum = METRIC_CATALOG[fail_metric].supported_entity_types[0]
+
+    rendered = router.build_failure_ratio_surge_query(
+        fail_metric=fail_metric,
+        entity_type=ent_enum,
+        anomaly_threshold=self.runner.GATE_DEFAULTS["anomaly_threshold"],
+        min_fail_ratio=0.40,
+        hypothesis_goal=f"Failure-to-Total Ratio Surge ({fail_metric}) for {entity}",
+        identifier_field=identifier_field,
+    )
+    rendered = self.runner.scope_query_to_entity(rendered, entity, entity_type=entity_type)
+    resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
+    rows = self.runner.parse_stats_response(resp)
+
+    fail_z = 0.0
+    fail_ratio = 0.0
+    recon_score = 0.0
+    observed_fails = 0
+    total_events = 0
+    if rows:
+      top_row = rows[0]
+      fail_z = float(top_row.get("fail_z") or top_row.get("z") or 0.0)
+      fail_ratio = float(top_row.get("fail_ratio") or 0.0)
+      recon_score = float(top_row.get("recon_score") or fail_z)
+      observed_fails = int(float(top_row.get("observed_fails") or 0))
+      total_events = int(float(top_row.get("total_events") or 0))
+
+    effective_score = max(fail_z, recon_score)
+    cri = self.runner.calculate_cri(effective_score)
+    total_metric = fail_metric.replace("_fail", "_total")
+    return {
+        "entity": entity,
+        "entity_type": entity_type,
+        "model": "FAILURE_RATIO_SURGE",
+        "target_metric": fail_metric,
+        "total_metric": total_metric,
+        "fail_z": round(fail_z, 2),
+        "fail_ratio": round(fail_ratio, 3),
+        "failure_ratio": round(fail_ratio, 3),
+        "recon_score": round(recon_score, 2),
+        "observed_fails": observed_fails,
+        "total_events": total_events,
+        "top_z_score": round(effective_score, 2),
+        "calibrated_risk_index": cri,
+        "is_outlier": cri >= 60 or fail_z >= 3.0,
+        "stats_rows": len(rows),
+        "executed_query": rendered,
+    }
+
+  async def run_cloud_repository_scope(
+      self,
+      session: ClientSession,
+      username: str = "",
+      outcome_mode: str = "total",
+      lookback_days: int = 14,
+      entity: Optional[str] = None,
+  ) -> Dict[str, Any]:
+    """Executes the v1.9.1 Cloud Repository Scope Dual-Branch pipeline (supports 'fail', 'success', 'total')."""
+    target_user = entity or username
+    start_iso, end_iso = self._iso_window(lookback_days)
+    router = self.runner.get_template_router()
+    mode_clean = (outcome_mode or "total").strip().lower()
+    if mode_clean == "fail":
+      target_metric = "resource_read_fail"
+    elif mode_clean == "success":
+      target_metric = "resource_read_success"
+    else:
+      target_metric = "resource_read_total"
+      mode_clean = "total"
+
+    rendered = router.build_cloud_repository_scope_query(
+        service_account=target_user,
+        anomaly_threshold=self.runner.GATE_DEFAULTS["anomaly_threshold"],
+        hypothesis_goal=f"Cloud Repository Scope & Origin IP Attribution (mode={mode_clean}) for {target_user}",
+        target_metric=target_metric,
+    )
+    resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
+    rows = self.runner.parse_stats_response(resp)
+
+    composite_risk = 0.0
+    fold_change = 0.0
+    observed_events = 0.0
+    target_resource = "N/A"
+    caller_ip = "N/A"
+    if rows:
+      top_row = rows[0]
+      composite_risk = float(
+          top_row.get("composite_risk")
+          or top_row.get("top_z")
+          or top_row.get("z")
+          or 0.0
+      )
+      fold_change = float(top_row.get("fold_change") or top_row.get("surge_ratio") or 0.0)
+      observed_events = float(top_row.get("observed") or top_row.get("observed_reads") or 0.0)
+      target_resource = str(top_row.get("resource") or top_row.get("target_resource") or "N/A")
+      caller_ip = str(top_row.get("caller_ip") or top_row.get("ip") or "N/A")
+
+    cri = self.runner.calculate_cri(composite_risk)
+    return {
+        "entity": target_user,
+        "entity_type": "USER",
+        "model": "CLOUD_REPOSITORY_SCOPE",
+        "outcome_mode": mode_clean,
+        "metric": target_metric,
+        "target_metric": target_metric,
+        "target_resource": target_resource,
+        "caller_ip": caller_ip,
+        "fold_change": round(fold_change, 2),
+        "observed_events": round(observed_events, 1),
+        "composite_risk": round(composite_risk, 2),
+        "top_z_score": round(composite_risk, 2),
+        "calibrated_risk_index": cri,
+        "is_outlier": cri >= 60 or composite_risk >= 3.0,
+        "stats_rows": len(rows),
+        "executed_query": rendered,
+    }
+
+  async def run_workspace_triad(
+      self,
+      session: ClientSession,
+      username: str = "",
+      lookback_days: int = 14,
+      entity: Optional[str] = None,
+  ) -> Dict[str, Any]:
+    """Executes the v1.9.1 Part-of-the-Whole Triad Multilevel pipeline across Workspace Download, Change, & Email."""
+    target_user = entity or username
+    start_iso, end_iso = self._iso_window(lookback_days)
+    EntityType, PipelineArchitecture, _, _ = self.runner.get_validator_enums()
+    router = self.runner.get_template_router()
+    rendered = router.build_pipeline_query(
+        pipeline_type=PipelineArchitecture.PART_OF_THE_WHOLE_TRIAD_MULTILEVEL,
+        entity_type=EntityType.USER,
+        target_entity=target_user,
+        anomaly_threshold=self.runner.GATE_DEFAULTS["anomaly_threshold"],
+        hypothesis_goal=f"Workspace Exfiltration Triad (Downloads + Changes + Outbound Emails) vs Peer Cohort for {target_user}",
+    )
+    resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
+    rows = self.runner.parse_stats_response(resp)
+
+    composite_z = 0.0
+    z_a = 0.0
+    z_b = 0.0
+    z_c = 0.0
+    obs_val = 0.0
+    if rows:
+      top_row = rows[0]
+      composite_z = float(
+          top_row.get("composite_z_score")
+          or top_row.get("z_vs_enterprise")
+          or top_row.get("z")
+          or 0.0
+      )
+      z_a = float(top_row.get("z_a_vs_ent") or top_row.get("z_a") or 0.0)
+      z_b = float(top_row.get("z_b_vs_ent") or top_row.get("z_b") or 0.0)
+      z_c = float(top_row.get("z_c_vs_ent") or top_row.get("z_c") or 0.0)
+      obs_val = float(top_row.get("observed") or top_row.get("total_actions") or 0.0)
+
+    cri = self.runner.calculate_cri(composite_z)
+    return {
+        "entity": target_user,
+        "entity_type": "USER",
+        "model": "PART_OF_THE_WHOLE_TRIAD_MULTILEVEL",
+        "target_metric": "workspace_total_download_actions",
+        "fusion_metrics": [
+            "workspace_total_download_actions",
+            "workspace_total_change_actions",
+            "workspace_emails_sent",
+        ],
+        "composite_z_score": round(composite_z, 2),
+        "observed_value": round(obs_val, 1),
+        "download_z": round(z_a, 2),
+        "change_z": round(z_b, 2),
+        "email_z": round(z_c, 2),
+        "top_z_score": round(composite_z, 2),
+        "calibrated_risk_index": cri,
+        "is_outlier": cri >= 60 or composite_z >= 3.0,
+        "stats_rows": len(rows),
+        "executed_query": rendered,
     }
 
   @staticmethod

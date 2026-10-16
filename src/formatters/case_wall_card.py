@@ -56,9 +56,9 @@ class CaseWallCardFormatter:
     """Normalizes any 360° radar sector, deep-dive model, or metric into a canonical Common Vector."""
     combined = f"{raw_vector or ''} {model_name or ''} {target_metric or ''}".lower()
 
-    if any(k in combined for k in ("fusion", "multi_sector", "dual_sector", "rollup_sector")):
+    if any(k in combined for k in ("fusion", "multi_sector", "dual_sector", "rollup_sector", "killchain")):
       return "MULTI_SECTOR"
-    if any(k in combined for k in ("workspace", "drive")):
+    if any(k in combined for k in ("workspace", "drive", "triad")):
       return "WORKSPACE"
     if any(k in combined for k in ("cloud", "resource_creation", "resource_deletion", "resource_written", "resource_read", "iam")):
       return "CLOUD"
@@ -212,9 +212,33 @@ class CaseWallCardFormatter:
     ]
 
     if directive and getattr(directive, "fusion_metrics", None):
-      lines.append(f"- **Fused Telemetry Vectors**: `{directive.fusion_metrics[0]}` × `{directive.fusion_metrics[1]}`")
+      fused_str = " × ".join(f"`{m}`" for m in directive.fusion_metrics)
+      lines.append(f"- **Fused Telemetry Vectors**: {fused_str}")
     elif directive and getattr(directive, "target_metric", None):
       lines.append(f"- **Target Telemetry Metric**: `metrics.{directive.target_metric}`")
+
+    if directive and getattr(directive, "post_data_outcome_class", None):
+      lines.append(f"- **Post-Data Outcome Class**: `{directive.post_data_outcome_class}`")
+
+    if directive and getattr(directive, "killchain_progression", None):
+      kc = directive.killchain_progression
+      if isinstance(kc, dict) and kc.get("tactic"):
+        lines.append(
+            f"- **MITRE ATT&CK Progression**: **Tactic**: `{kc.get('tactic')}` | "
+            f"**Upstream**: {kc.get('upstream', 'N/A')} | **Downstream**: {kc.get('downstream', 'N/A')}"
+        )
+
+    if directive and getattr(directive, "radar_insights", None):
+      ri = directive.radar_insights
+      if isinstance(ri, dict):
+        warrants = ri.get("warrant_reasons") or []
+        if warrants:
+          lines.append(f"- **360° Behavioral Insights**: {'; '.join(warrants)}")
+        matched_kc = ri.get("matched_killchain_archetypes") or []
+        if matched_kc:
+          kc_names = ", ".join(f"`{m.get('archetype')}`" for m in matched_kc if isinstance(m, dict) and m.get("archetype"))
+          if kc_names:
+            lines.append(f"- **Matched Kill-Chain Archetypes**: {kc_names}")
 
     if directive and getattr(directive, "confidence_score", None) is not None:
       conf_bar = cls.render_confidence_bar(directive.confidence_score, getattr(directive, "confidence_band", "AUTO_EXECUTE"))
