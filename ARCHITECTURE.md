@@ -288,46 +288,42 @@ create_case_comment / SOAR Rule Trigger]
 
 ---
 
-## 🗂️ Proposed Directory Structure
+## 🗂️ Production Package Structure
 
 ```
 agentic_ueba/
-├── ARCHITECTURE.md                 # System Architecture & Technical Specifications (This File)
-├── GEMINI.md                       # Operational Assistant Instructions
-├── config.yaml                     # SecOps Tenant Settings (Project ID, Customer ID, Region)
+├── ARCHITECTURE.md                     # System Architecture & Technical Specifications (This File)
+├── Dockerfile                          # Cloud Run container build definition
+├── deploy_cloud_run.sh                 # Automated Cloud Run multi-tenant deployment script
+├── requirements.txt                    # Production Python dependencies
 ├── data/
-│   └── state.db                    # SQLite Persistent State & Incident Ledger
+│   └── watchdog_state.json             # Persistent Watchdog & Case Activity Ledger
+├── scripts/
+│   ├── run_live_360_radar.py           # Standalone CLI runner for 360° Behavioral Risk Radar
+│   └── test_case_wall_formatting.py    # SOAR Case Wall HTML sanitizer & card verification
 ├── src/
 │   ├── __init__.py
-│   ├── main.py                     # CLI Entrypoint & Runner
-│   ├── daemon/                     # Continuous Watchdog & Entity Polling Scheduler
-│   │   ├── __init__.py
-│   │   ├── scheduler.py
-│   │   └── entity_enumerator.py
-│   ├── evaluator/                  # Risk Metrics Query Execution & Statistical Evaluation
-│   │   ├── __init__.py
-│   │   ├── query_builder.py
-│   │   ├── stats_engine.py         # CRI Sigmoid, Z-Score, CUSUM Calculators
-│   │   └── handoff_generator.py    # Clean Hand-Off Builder
-│   ├── router/                     # Topological MITRE ATT&CK Routing Matrix
-│   │   ├── __init__.py
-│   │   └── ttp_mapper.py
-│   ├── swarm/                      # Multi-Agent Investigation Swarm
-│   │   ├── __init__.py
-│   │   ├── orchestrator.py         # Swarm Task Dispatcher & Fan-Out
-│   │   ├── agents/
-│   │   │   ├── ioc_hunter.py       # Agent Alpha: IOC Matches & Intel Lookups
-│   │   │   ├── lineage_tracer.py   # Agent Beta: Process Lineage & Command Lines
-│   │   │   └── alert_correlator.py # Agent Gamma: Case & Security Alert History
-│   │   └── judge.py                # Bayesian Synthesis Judge & Confidence Scorer
-│   └── ingestion/                  # Native Chronicle REST Ingestion Client
+│   ├── _bootstrap.py                   # Cloudtop / virtualenv runtime bootstrapper
+│   ├── config.py                       # Multi-tenant configuration & ADC auth header generator
+│   ├── models.py                       # Pydantic schemas (JITHuntRequest, JITHuntResponse, CleanHandOffPayload)
+│   ├── server.py                       # Dual FastMCP + Starlette REST Gateway (incl. compile_hunt_pipeline & dispatch_hybrid_handoff)
+│   ├── autonomous_hunter.py            # ReAct + Deterministic JIT Threat Hunting Engine + Hybrid Engine FunctionDeclarations
+│   ├── dynamic_protocol_adapter.py     # Adapts SKILL.md to JIT persona with v2.0.0 -24.4% reference offloading
+│   ├── pipeline_runner.py              # Template renderer, Malachite AST validator, & get_hybrid_engine() bridge
+│   ├── risk_metrics_engine.py          # Deterministic 30-day UEBA engine (360° Radar, KillChainArchetype, Triad, Cloud CRUD)
+│   ├── stats_hunter_engine.py          # Deterministic inline statistical engine (C2 Jitter, Fano, Shannon, Markov, Zipf, EWMA)
+│   ├── strategy_decider.py             # Epistemic warrant analyzer & Tier 2A -> Tier 2B pivot router
+│   ├── federated_bridge.py             # Cross-skill Macro-to-Micro handoff bridge
+│   ├── watchdog.py                     # Autonomous standing case scanner & 4-hourly Fleet 360° Sweep daemon
+│   └── formatters/
 │       ├── __init__.py
-│       ├── chronicle_client.py     # Native events:import REST Client (ADC Auth)
-│       └── case_dispatcher.py      # SOAR Case Dispatcher & Comment Updater
-└── tests/                          # Unit & Integration Test Suites
-    ├── test_cri.py
-    ├── test_router.py
-    └── test_swarm.py
+│       └── case_wall_card.py           # Chronicle SOAR Case Wall HTML formatter & SVG/Table sanitizer
+└── tests/                              # Automated Unit & Integration Test Suite (64 tests)
+    ├── test_360_pivots_and_models.py
+    ├── test_case_wall_card.py
+    ├── test_DynamicProtocolAdapter.py
+    ├── test_fleet_360_sweep.py
+    └── test_pipeline_gates.py
 ```
 
 ---
