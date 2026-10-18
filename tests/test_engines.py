@@ -1857,3 +1857,26 @@ async def test_v191_new_risk_metrics_methods_and_6spoke_hex_radar(monkeypatch):
     assert s_card is not None and "Post-Data Outcome Class" in s_card
     assert d.post_data_outcome_class == "ACUTE_OUTLIER"
 
+
+def test_vertex_location_and_model_resolution(monkeypatch):
+  from src.config import TenantConfig
+  monkeypatch.delenv("VERTEX_LOCATION", raising=False)
+  monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+  monkeypatch.delenv("GEMINI_MODEL", raising=False)
+
+  cfg = TenantConfig()
+  assert cfg.model == "gemini-3.1-pro-preview"
+  assert cfg.resolve_vertex_location("gemini-3.1-pro-preview") == "global"
+  assert cfg.resolve_vertex_location("gemini-3-flash-preview") == "global"
+  assert cfg.resolve_vertex_location("publishers/google/models/gemini-4-argon") == "global"
+  assert cfg.resolve_vertex_location("gemini-4-argon") == "global"
+  assert cfg.resolve_vertex_location("gemini-2.5-pro") == "us-central1"
+  assert cfg.resolve_vertex_location("gemini-2.5-flash") == "us-central1"
+
+  # Explicit env override wins over automatic model-based routing
+  monkeypatch.setenv("VERTEX_LOCATION", "europe-west4")
+  cfg_override = TenantConfig()
+  assert cfg_override.resolve_vertex_location("gemini-3.1-pro-preview") == "europe-west4"
+  assert cfg_override.resolve_vertex_location("gemini-2.5-pro") == "europe-west4"
+
+

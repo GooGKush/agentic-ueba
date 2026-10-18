@@ -53,17 +53,23 @@ class TenantConfig(BaseModel):
       default_factory=lambda: os.environ.get("CHRONICLE_MCP_URL")
   )
   model: str = Field(
-      default_factory=lambda: os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
+      default_factory=lambda: os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
   )
   fallback_models: List[str] = Field(
       default_factory=lambda: [
           m.strip()
           for m in os.environ.get(
               "GEMINI_FALLBACK_MODELS",
-              "gemini-2.5-flash,gemini-2.0-flash,gemini-1.5-pro",
+              "gemini-3-flash-preview,gemini-2.5-pro,gemini-2.5-flash",
           ).split(",")
           if m.strip()
       ]
+  )
+  vertex_location: Optional[str] = Field(
+      default_factory=lambda: (
+          os.environ.get("VERTEX_LOCATION")
+          or os.environ.get("GOOGLE_CLOUD_LOCATION")
+      )
   )
   allowed_tools: List[str] = Field(
       default_factory=lambda: (
@@ -124,6 +130,27 @@ class TenantConfig(BaseModel):
     if self.mcp_url_override:
       return self.mcp_url_override
     return f"https://chronicle.{self.region}.rep.googleapis.com/mcp"
+
+  def resolve_vertex_location(self, model_name: Optional[str] = None) -> str:
+    """Resolves the Vertex AI endpoint location dynamically per model or env override.
+
+    Priority:
+    1. Explicit `VERTEX_LOCATION` or `GOOGLE_CLOUD_LOCATION` environment override.
+    2. `"global"` for Gemini 3.x, Gemini 4.x, Argon, or `-preview` Model Garden endpoints.
+    3. `"us-central1"` for standard GA regional models (e.g. `gemini-2.5-pro`, `gemini-2.5-flash`).
+    """
+    if self.vertex_location and self.vertex_location.strip():
+      return self.vertex_location.strip()
+
+    raw_model = (model_name or self.model or "").strip().lower()
+    short_model = raw_model.split("/")[-1] if "/" in raw_model else raw_model
+    if (
+        short_model.startswith(("gemini-3", "gemini-4"))
+        or "argon" in short_model
+        or "preview" in short_model
+    ):
+      return "global"
+    return "us-central1"
 
   def get_auth_headers(self) -> Dict[str, str]:
     """Generates GCP Bearer token and project routing header via ADC."""

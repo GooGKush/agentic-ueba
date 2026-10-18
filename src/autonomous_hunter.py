@@ -999,6 +999,24 @@ class AutonomousHunterEngine:
 
     return None, None
 
+  def _get_genai_client(
+      self, tenant: TenantConfig, model_name: Optional[str] = None
+  ) -> genai.Client:
+    """Initializes a Google GenAI client with dynamic per-model Vertex location routing."""
+    gemini_api_key = os.environ.get("GEMINI_API_KEY")
+    if gemini_api_key:
+      return genai.Client(
+          api_key=gemini_api_key,
+          http_options=types.HttpOptions(timeout=180000),
+      )
+    resolved_location = tenant.resolve_vertex_location(model_name)
+    return genai.Client(
+        vertexai=True,
+        project=tenant.project_id,
+        location=resolved_location,
+        http_options=types.HttpOptions(timeout=180000),
+    )
+
   async def execute_jit_hunt(self, req: JITHuntRequest) -> JITHuntResponse:
     """Executes the autonomous JIT investigation end-to-end."""
     # Resolve tenant dynamically
@@ -1008,6 +1026,8 @@ class AutonomousHunterEngine:
         region=req.region or self.default_tenant.region,
         mcp_url_override=self.default_tenant.mcp_url_override,
         model=self.default_tenant.model,
+        fallback_models=self.default_tenant.fallback_models,
+        vertex_location=self.default_tenant.vertex_location,
         allowed_tools=self.default_tenant.allowed_tools,
     )
 
@@ -1018,20 +1038,6 @@ class AutonomousHunterEngine:
         customer_id=tenant.customer_id,
         region=tenant.region,
     )
-
-    gemini_api_key = os.environ.get("GEMINI_API_KEY")
-    if gemini_api_key:
-      ai_client = genai.Client(
-          api_key=gemini_api_key,
-          http_options=types.HttpOptions(timeout=180000),
-      )
-    else:
-      ai_client = genai.Client(
-          vertexai=True,
-          project=tenant.project_id,
-          location="us-central1",
-          http_options=types.HttpOptions(timeout=180000),
-      )
 
     headers = tenant.get_auth_headers()
     custom_timeout = httpx.Timeout(30.0, read=120.0, write=120.0, pool=120.0)
@@ -2438,7 +2444,11 @@ class AutonomousHunterEngine:
 
         for model_candidate in candidate_models:
           try:
-            logger.info(f"Initiating autonomous ReAct investigation with candidate model: {model_candidate}")
+            resolved_loc = tenant.resolve_vertex_location(model_candidate)
+            logger.info(
+                f"Initiating autonomous ReAct investigation with candidate model: {model_candidate} (location={resolved_loc})"
+            )
+            ai_client = self._get_genai_client(tenant, model_candidate)
             chat = ai_client.aio.chats.create(
                 model=model_candidate,
                 config=types.GenerateContentConfig(
