@@ -143,6 +143,12 @@ class PipelineRunner:
     from scripts.triage_formatter import CommonMarkTriageFormatter
     return CommonMarkTriageFormatter
 
+  def get_hybrid_engine(self) -> Any:
+    """Returns the unified Python Hybrid Engine module (scripts.ueba_hybrid_engine) from secops-risk-metrics-multistage v2.0.0+."""
+    self._ensure_skill_path()
+    from scripts import ueba_hybrid_engine
+    return ueba_hybrid_engine
+
   @staticmethod
   def scope_query_to_entity(
       query: str,
