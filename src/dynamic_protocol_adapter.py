@@ -11,6 +11,7 @@ execution contract.
 """
 
 import logging
+import os
 from pathlib import Path
 import re
 from typing import Dict, List, Optional, Tuple
@@ -116,6 +117,20 @@ class DynamicProtocolAdapter:
 
     blocks = []
     EXCLUDED_REFS = {"consultative-worksheet.md", "interaction-flow-template.md"}
+    hybrid_engine_script = skill_dir / "scripts" / "ueba_hybrid_engine.py"
+    if (
+        hybrid_engine_script.is_file()
+        and os.environ.get("SECOPS_DISABLE_HYBRID_TOOLS") != "1"
+        and os.environ.get("SECOPS_HYBRID_FULL_MARKDOWN") != "1"
+    ):
+      EXCLUDED_REFS = EXCLUDED_REFS | {
+          "metrics-catalog.md",
+          "udm-hunting-field-dictionary.md",
+          "malachite-function-factory-matrix.md",
+          "calibrated-risk-index-guide.md",
+          "chart-specifications-guide.md",
+          "clean-handoff-udm-schema.md",
+      }
     if target_refs:
       paths = [ref_dir / r if not r.endswith(".md") else ref_dir / r for r in target_refs]
     else:

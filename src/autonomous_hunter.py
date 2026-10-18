@@ -197,6 +197,142 @@ class AutonomousHunterEngine:
       logger.error(f"Failed generating behavioral radar: {e}")
       return f"ERROR: Could not compute radar metrics: {str(e)}"
 
+  def get_hybrid_function_declarations(self) -> List[types.FunctionDeclaration]:
+    """Returns Gemini FunctionDeclarations for the 3 composable Python Hybrid Engine tools."""
+    return [
+        types.FunctionDeclaration(
+            name="compile_hunt_pipeline",
+            description=(
+                "Compiles a deterministic, AST-validated multi-stage YARA-L 2.0 hunt pipeline, "
+                "Pre-Flight Hunting Specification card, and 1-shot schema validation probe query "
+                "from parameterized UEBA metrics, statistical models, and architectures."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "statistical_model": {
+                        "type": "string",
+                        "description": "Statistical model identifier (e.g. 'STANDARD_Z_SCORE', 'MAD', 'LONGITUDINAL_CUSUM', 'POISSON', 'TWO_PART_HURDLE').",
+                    },
+                    "metrics": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of 30-day Risk Analytics metric names from the Malachite catalog.",
+                    },
+                    "architecture": {
+                        "type": "string",
+                        "description": "Pipeline architecture ('single_metric', 'fusion', 'triad', 'rollup', 'peer_cohort', '360_radar', 'hybrid_enrichment', etc.).",
+                    },
+                    "plane": {
+                        "type": "string",
+                        "description": "Execution plane: 'MACRO_METRICS', 'HYBRID_GRAPH', 'MICRO_RAW_UDM', or 'DUAL_PLANE'.",
+                    },
+                    "entity_type": {
+                        "type": "string",
+                        "description": "Target entity type: 'USER', 'ASSET', 'RESOURCE', 'LOG_TYPE', or 'EMAIL'.",
+                    },
+                    "entity_value": {
+                        "type": "string",
+                        "description": "Optional specific entity identifier (username, hostname, service account) or 'fleet'.",
+                    },
+                    "custom_filter": {
+                        "type": "string",
+                        "description": "Optional additional UDM filter predicate to inject into Stage 1.",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": "Execution mode: 'A' (today UTC acute triage), 'B' (multi-day timeline), or 'C' (per-day sharded baseline).",
+                    },
+                    "window_days": {
+                        "type": "integer",
+                        "description": "Search window duration in days (default 1 for Mode A, 7 or 14 for Mode B/C).",
+                    },
+                    "sensitivity": {
+                        "type": "string",
+                        "description": "Anomaly threshold sensitivity tier: 'HIGH', 'BALANCED', or 'LOW'.",
+                    },
+                },
+                "required": ["statistical_model", "metrics"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="dispatch_hybrid_handoff",
+            description=(
+                "Constructs and dispatches a federated handoff payload (secops-threat-hunt-handoff-v1) "
+                "to secops-statistical-hunter for Turn 1 non-metrics demarcation or Phase 2 Macro-to-Micro "
+                "raw UDM enrichment."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "intent": {
+                        "type": "string",
+                        "description": "Handoff intent (e.g. 'C2_BEACONING_JITTER', 'DIVERSITY_DEFICIT', 'ELEPHANT_FLOW_CONCENTRATION', 'TWO_PART_HURDLE', 'FLEET_PREVALENCE_NORMALIZATION').",
+                    },
+                    "entity_type": {
+                        "type": "string",
+                        "description": "Target entity type ('HOSTNAME', 'USER', 'IP', 'ASSET').",
+                    },
+                    "entity_value": {
+                        "type": "string",
+                        "description": "Target entity identifier.",
+                    },
+                    "lookback": {
+                        "type": "string",
+                        "description": "Search window lookback (e.g. '24h', '7d', '14d').",
+                    },
+                    "sensitivity": {
+                        "type": "string",
+                        "description": "Sensitivity tier ('HIGH', 'BALANCED', 'LOW').",
+                    },
+                },
+                "required": ["intent"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="render_forensic_dossier",
+            description=(
+                "Formats post-execution Chronicle udm_search stats rows (or empty rows for Clean Hunt) "
+                "into the canonical 6-Section CommonMark Forensic Triage Dossier with Calibrated Risk Index (CRI)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "rows": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "List of aggregated outlier row dictionaries returned by udm_search.",
+                    },
+                    "executed_query": {
+                        "type": "string",
+                        "description": "The exact multi-stage YARA-L 2.0 query that was executed via udm_search.",
+                    },
+                    "statistical_model": {
+                        "type": "string",
+                        "description": "Statistical model used in the hunt.",
+                    },
+                    "metric_name": {
+                        "type": "string",
+                        "description": "Primary Risk Analytics metric evaluated.",
+                    },
+                    "entity_type": {
+                        "type": "string",
+                        "description": "Entity type ('USER', 'ASSET', 'RESOURCE').",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": "Execution mode ('A', 'B', or 'C').",
+                    },
+                    "window_days": {
+                        "type": "integer",
+                        "description": "Window duration in days.",
+                    },
+                },
+                "required": ["rows", "executed_query"],
+            },
+        ),
+    ]
+
   def resolve_skill_selection(self, req: JITHuntRequest) -> str:
     """Selects canonical skill dynamically based on alert physics if 'auto'."""
     if req.skill in ("risk-metrics", "secops-risk-metrics-multistage"):
@@ -2226,7 +2362,7 @@ class AutonomousHunterEngine:
               )
           )
 
-        # Register local behavioral radar tool
+        # Register local behavioral radar tool and Python Hybrid Engine tools
         gemini_functions.append(
             types.FunctionDeclaration(
                 name="generate_behavioral_radar",
@@ -2251,6 +2387,8 @@ class AutonomousHunterEngine:
                 },
             )
         )
+        if os.environ.get("SECOPS_DISABLE_HYBRID_TOOLS") != "1":
+          gemini_functions.extend(self.get_hybrid_function_declarations())
 
         candidate_models = [tenant.model]
         for fallback in getattr(tenant, "fallback_models", ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]):
@@ -2343,6 +2481,18 @@ class AutonomousHunterEngine:
                     tool_args.get("telemetry_data", {}),
                 )
                 output_str = json.dumps({"status": "SUCCESS", "svg_length": len(radar_svg)})
+
+              elif tool_name in ("compile_hunt_pipeline", "dispatch_hybrid_handoff", "render_forensic_dossier"):
+                try:
+                  from src.pipeline_runner import PipelineRunner
+                  he_mod = PipelineRunner(tenant).get_hybrid_engine()
+                  fn = getattr(he_mod, tool_name)
+                  res_dict = fn(**tool_args)
+                  if tool_name == "compile_hunt_pipeline" and isinstance(res_dict, dict) and res_dict.get("compiled_query"):
+                    executed_query = executed_query or str(res_dict["compiled_query"])
+                  output_str = json.dumps(res_dict, default=str)
+                except Exception as he_err:
+                  output_str = json.dumps({"status": "ERROR", "error": str(he_err)})
 
               elif tool_name == "create_case_comment":
                 raw_c = tool_args.get("comment", "")

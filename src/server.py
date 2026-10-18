@@ -368,6 +368,57 @@ async def get_case_activity(timeframe: str = "1h", tag: Optional[str] = None) ->
   return watchdog.state.get_activity_report(timeframe=timeframe, tag=tag)
 
 
+@mcp.tool()
+async def compile_hunt_pipeline(
+    statistical_model: str = "STANDARD_Z_SCORE",
+    metrics: str = "auth_attempts_total",
+    architecture: str = "single_metric",
+    plane: str = "MACRO_METRICS",
+    entity_type: str = "USER",
+    entity_value: Optional[str] = None,
+    custom_filter: Optional[str] = None,
+    mode: str = "A",
+    window_days: int = 1,
+    sensitivity: str = "BALANCED",
+) -> Dict[str, Any]:
+  """Python Hybrid Engine (v2.0.0): Compiles an AST-validated multi-stage YARA-L 2.0 hunt pipeline, Pre-Flight specification card, and 1-shot probe query."""
+  from src.pipeline_runner import PipelineRunner
+  he = PipelineRunner(tenant_config).get_hybrid_engine()
+  metric_list = [m.strip() for m in metrics.split(",") if m.strip()] if isinstance(metrics, str) else metrics
+  return he.compile_hunt_pipeline(
+      statistical_model=statistical_model,
+      metrics=metric_list,
+      architecture=architecture,
+      plane=plane,
+      entity_type=entity_type,
+      entity_value=entity_value,
+      custom_filter=custom_filter,
+      mode=mode,
+      window_days=window_days,
+      sensitivity=sensitivity,
+  )
+
+
+@mcp.tool()
+async def dispatch_hybrid_handoff(
+    intent: str,
+    entity_value: str = "fleet",
+    entity_type: str = "HOSTNAME",
+    lookback: str = "24h",
+    sensitivity: str = "BALANCED",
+) -> Dict[str, Any]:
+  """Python Hybrid Engine (v2.0.0): Dispatches a federated handoff payload (secops-threat-hunt-handoff-v1) to secops-statistical-hunter."""
+  from src.pipeline_runner import PipelineRunner
+  he = PipelineRunner(tenant_config).get_hybrid_engine()
+  return he.dispatch_hybrid_handoff(
+      intent=intent,
+      entity_value=entity_value,
+      entity_type=entity_type,
+      lookback=lookback,
+      sensitivity=sensitivity,
+  )
+
+
 # --- 2. REST Endpoints (Playbook-to-Agent Gateway) ---
 
 @mcp.custom_route("/api/v1/cases/activity", methods=["GET"])
