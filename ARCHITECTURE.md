@@ -110,8 +110,9 @@ create_case_comment / SOAR Rule Trigger]
     $$	ext{CRI}(Z) = 	ext{round}\left(rac{100}{1 + \exp(-0.6 \cdot (Z - 3.0))}ight)$$
   * Filters for findings with $	ext{CRI} \ge 46$ ($Z \ge 3.0\sigma$).
   * **Query-side gate (skill v1.8.6+ & v1.9.1)**: every `secops-risk-metrics-multistage` template and router query carries a root `condition:`. Gate values come from `PipelineRunner.GATE_DEFAULTS` (σ ≥ 3.0, fold change ≥ 2.0, fusion D² ≥ 9.0 i.e. D ≥ 3.0, MAD modified Z ≥ 3.5). They match the engine's own outlier rules, so no entity the engine would flag is dropped by the query. Consequence: nominal entities return no rows, and the engine reports them with score 0.0 instead of their sub-threshold value.
-* **Agentic Secondary Investigation & Bidirectional Epistemic Pivot Engine (skill v1.9.1 + v2.7.4)**:
-  * **Enriched 360° Behavioral Radar (`run_360_behavioral_radar`)**: Extracts per-sector `$avg` and `$std` alongside `$z` and `$obs` across all 6 `USER` spokes (`Auth`, `Cloud`, `Workspace`, `Egress`, `DNS`, `Web`) and 6 `ASSET` spokes (`Auth`, `Egress`, `DNS`, `Flows`, `Alerts`, `Web`), identifying `subthreshold_sectors` ($1.25 \le Z < 2.0$), `variance_masked_sectors` ($1.25 \le Z < 3.0$ with inflated $\sigma \ge \max(1.5\mu, 5.0)$), and `dormant_awakening_sectors` ($\text{obs} > 0, \mu < 1.0, Z \ge 1.5$).
+* **Agentic Secondary Investigation & Bidirectional Epistemic Pivot Engine (skill v2.0.1 + v2.7.4)**:
+  * **Enriched 360° Behavioral Radar (`run_360_behavioral_radar` & `build_fleet_360_sector_queries`)**: Extracts per-sector `$avg` and `$std` alongside `$z` and `$obs` across all 6 `USER` spokes (`Auth`, 4-family `Cloud` CRUD across `resource_read_total` / `resource_written_total` / `resource_creation_total` / `resource_deletion_total`, `Workspace`, `Egress`, `DNS`, `Web`) and 6 `ASSET` spokes (`Auth`, `Egress`, `DNS`, `Flows`, `Alerts`, `Web`), identifying `subthreshold_sectors` ($1.25 \le Z < 2.0$), `variance_masked_sectors` ($1.25 \le Z < 3.0$ with inflated $\sigma \ge \max(1.5\mu, 5.0)$), and `dormant_awakening_sectors` ($\text{obs} > 0, \mu < 1.0, Z \ge 1.5$).
+  * **Email-to-`user.userid` Identity Resolution (`resolve_user_identifier`)**: Automatically resolves corporate email addresses (`*@*`, excluding GCP service accounts) to their canonical UDM `user.userid` across the evaluation window before executing `metrics.*` pipelines.
   * **360° Warrant & Insight Analyzer (`StrategyDecider.analyze_360_insights`)**: Synthesizes active/sub-threshold sectors, variance-masked drift (auto-routing to 4-Stage Non-Parametric `MAD` over a 30-day window), dormant baseline awakenings (auto-routing to `TWO_PART_HURDLE`), matched MITRE ATT&CK `KillChainArchetype` topologies, and cross-entity bridges (`USER` $\leftrightarrow$ `ASSET`/`IP`).
   * **Expanded Tier 2 Execution Portfolio (`RiskMetricsEngine`)**:
     * `run_killchain_archetype()`: Executes all 8 canonical MITRE ATT&CK `KillChainArchetype` multi-stage fusion pipelines (`CREDENTIAL_ACCESS_TO_EXECUTION`, `INITIAL_ACCESS_TO_DISCOVERY`, `EXECUTION_TO_C2_DNS`, `EXECUTION_TO_EXFILTRATION`, `CREDENTIAL_ACCESS_TO_LATERAL_MOVEMENT`, `CLOUD_DISCOVERY_TO_COLLECTION`, `DEFENSE_EVASION_ALERT_TO_EXFILTRATION`, `C2_BEACON_TO_RARE_DESTINATION_EXFIL`).
@@ -318,12 +319,11 @@ agentic_ueba/
 │   └── formatters/
 │       ├── __init__.py
 │       └── case_wall_card.py           # Chronicle SOAR Case Wall HTML formatter & SVG/Table sanitizer
-└── tests/                              # Automated Unit & Integration Test Suite (64 tests)
-    ├── test_360_pivots_and_models.py
-    ├── test_case_wall_card.py
-    ├── test_DynamicProtocolAdapter.py
-    ├── test_fleet_360_sweep.py
-    └── test_pipeline_gates.py
+└── tests/                              # Automated Unit & Integration Test Suite (67 tests)
+    ├── test_engines.py
+    ├── test_metric_args.py
+    ├── test_protocol_adapter.py
+    └── test_watchdog.py
 ```
 
 ---

@@ -1054,6 +1054,13 @@ class AutonomousHunterEngine:
       async with mcp_context as streams, ClientSession(streams[0], streams[1]) as session:
         await session.initialize()
 
+        if str(req.entity_type or "USER").upper() in ("USER", "USER_ID", "EMAIL") and RiskMetricsEngine.extract_email_local_part(req.target_entity):
+          req.target_entity = await RiskMetricsEngine(tenant).resolve_user_identifier(
+              session=session,
+              username=req.target_entity,
+              lookback_days=req.lookback_days,
+          )
+
         query_str = (req.query or "").lower().strip()
         if not query_str:
           decided_skill, decided_query, decided_model = StrategyDecider.decide(

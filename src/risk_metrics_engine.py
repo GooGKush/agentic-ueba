@@ -70,6 +70,56 @@ class RiskMetricsEngine:
       return EntityType.ASSET
     return EntityType.USER
 
+  @staticmethod
+  def extract_email_local_part(identifier: str) -> Optional[str]:
+    """Returns the local username part of a corporate email address (excluding GCP service accounts)."""
+    raw = (identifier or "").strip()
+    if "@" not in raw:
+      return None
+    local_part, domain = raw.split("@", 1)
+    local_part = local_part.strip()
+    domain_lower = domain.strip().lower()
+    if not local_part or not domain_lower:
+      return None
+    if domain_lower.endswith(".gserviceaccount.com") or domain_lower.endswith(".iam") or ".iam." in domain_lower:
+      return None
+    return local_part
+
+  async def resolve_user_identifier(
+      self,
+      session: ClientSession,
+      username: str,
+      lookback_days: int = 14,
+  ) -> str:
+    """Resolves a corporate email address to its canonical UDM user.userid over the evaluation window."""
+    local_part = self.extract_email_local_part(username)
+    if not local_part:
+      return username
+    start_iso, end_iso = self._iso_window(lookback_days)
+    probe_query = f"""(principal.user.userid = "{username}" or principal.user.email_addresses = "{username}" or target.user.userid = "{username}" or target.user.email_addresses = "{username}")
+$uid = coalesce(principal.user.userid, target.user.userid)
+$uid != ""
+match:
+  $uid
+outcome:
+  $cnt = count(metadata.id)
+order:
+  $cnt desc
+limit: 5"""
+    try:
+      resp = await self.runner.execute_query_via_mcp(session, probe_query, start_iso, end_iso)
+      rows = self.runner.parse_stats_response(resp)
+      for row in rows:
+        uid = str(row.get("uid") or row.get("$uid") or "").strip()
+        if uid and uid.lower() != username.lower():
+          logger.info(f"Resolved email '{username}' -> user.userid '{uid}' via UDM identity probe.")
+          return uid
+        if uid:
+          return uid
+    except Exception as err:
+      logger.debug(f"Identity resolution probe failed for '{username}' ({err}); falling back to '{local_part}'.")
+    return local_part
+
   def resolve_compatible_fusion_specs(
       self,
       metrics: Sequence[str],
@@ -361,9 +411,14 @@ outcome:
 
 order:
   $z desc""",
-          "Cloud": f"""// Sector: Cloud Infrastructure CRUD
+          "Cloud": f"""// Sector: Cloud Infrastructure CRUD (4-Family Read, Write, Create, Delete)
 stage cloud_risk {{
-    (metadata.event_type = "RESOURCE_CREATION" or metadata.event_type = "USER_RESOURCE_CREATION")
+    (
+        metadata.event_type = "RESOURCE_READ" or metadata.event_type = "USER_RESOURCE_ACCESS" or
+        metadata.event_type = "RESOURCE_WRITTEN" or metadata.event_type = "USER_RESOURCE_UPDATE_CONTENT" or
+        metadata.event_type = "RESOURCE_CREATION" or metadata.event_type = "USER_RESOURCE_CREATION" or
+        metadata.event_type = "RESOURCE_DELETION" or metadata.event_type = "USER_RESOURCE_DELETION"
+    )
     principal.user.userid = "{username}"
     $user = principal.user.userid
     $vendor = metadata.vendor_name
@@ -371,20 +426,65 @@ stage cloud_risk {{
   match:
     $user, $vendor, $product by 1d
   outcome:
+    $obs_r = sum(if(metadata.event_type = "RESOURCE_READ" or metadata.event_type = "USER_RESOURCE_ACCESS", 1, 0))
+    $obs_w = sum(if(metadata.event_type = "RESOURCE_WRITTEN" or metadata.event_type = "USER_RESOURCE_UPDATE_CONTENT", 1, 0))
+    $obs_c = sum(if(metadata.event_type = "RESOURCE_CREATION" or metadata.event_type = "USER_RESOURCE_CREATION", 1, 0))
+    $obs_d = sum(if(metadata.event_type = "RESOURCE_DELETION" or metadata.event_type = "USER_RESOURCE_DELETION", 1, 0))
     $obs = count(metadata.id)
-    $avg = max(metrics.resource_creation_total(
+    $avg_r = max(metrics.resource_read_total(
         period: 1d, window: 30d, metric: event_count_sum, agg: avg,
         principal.user.userid: principal.user.userid,
         metadata.vendor_name: metadata.vendor_name,
         metadata.product_name: metadata.product_name
     ))
-    $std = max(metrics.resource_creation_total(
+    $std_r = max(metrics.resource_read_total(
         period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
         principal.user.userid: principal.user.userid,
         metadata.vendor_name: metadata.vendor_name,
         metadata.product_name: metadata.product_name
     ))
-    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+    $avg_w = max(metrics.resource_written_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.user.userid: principal.user.userid,
+        metadata.vendor_name: metadata.vendor_name,
+        metadata.product_name: metadata.product_name
+    ))
+    $std_w = max(metrics.resource_written_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.user.userid: principal.user.userid,
+        metadata.vendor_name: metadata.vendor_name,
+        metadata.product_name: metadata.product_name
+    ))
+    $avg_c = max(metrics.resource_creation_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.user.userid: principal.user.userid,
+        metadata.vendor_name: metadata.vendor_name,
+        metadata.product_name: metadata.product_name
+    ))
+    $std_c = max(metrics.resource_creation_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.user.userid: principal.user.userid,
+        metadata.vendor_name: metadata.vendor_name,
+        metadata.product_name: metadata.product_name
+    ))
+    $avg_d = max(metrics.resource_deletion_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.user.userid: principal.user.userid,
+        metadata.vendor_name: metadata.vendor_name,
+        metadata.product_name: metadata.product_name
+    ))
+    $std_d = max(metrics.resource_deletion_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.user.userid: principal.user.userid,
+        metadata.vendor_name: metadata.vendor_name,
+        metadata.product_name: metadata.product_name
+    ))
+    $z_r = ($obs_r - $avg_r) / if($std_r > 0, $std_r, 1.0)
+    $z_w = ($obs_w - $avg_w) / if($std_w > 0, $std_w, 1.0)
+    $z_c = ($obs_c - $avg_c) / if($std_c > 0, $std_c, 1.0)
+    $z_d = ($obs_d - $avg_d) / if($std_d > 0, $std_d, 1.0)
+    $z_rw = if($z_r > $z_w, $z_r, $z_w)
+    $z_cd = if($z_c > $z_d, $z_c, $z_d)
 }}
 
 $user = $cloud_risk.user
@@ -393,10 +493,12 @@ match:
   $user by 1d
 
 outcome:
-  $z = max($cloud_risk.z)
-  $observed = max($cloud_risk.obs)
-  $avg = max($cloud_risk.avg)
-  $std = max($cloud_risk.std)
+  $z_rw = max($cloud_risk.z_rw)
+  $z_cd = max($cloud_risk.z_cd)
+  $z = if($z_rw > $z_cd, $z_rw, $z_cd)
+  $observed = sum($cloud_risk.obs)
+  $avg = max($cloud_risk.avg_c) + max($cloud_risk.avg_w) + max($cloud_risk.avg_r) + max($cloud_risk.avg_d)
+  $std = max($cloud_risk.std_c) + max($cloud_risk.std_w) + max($cloud_risk.std_r) + max($cloud_risk.std_d)
 
 order:
   $z desc""",
@@ -1294,7 +1396,9 @@ outcome:
   $z_write = max($cloud_risk.z_write)
   $z_delete = max($cloud_risk.z_delete)
   $z_create = max($cloud_risk.z_create)
-  $top_z = if(if($z_read > $z_write, $z_read, $z_write) > if($z_delete > $z_create, $z_delete, $z_create), if($z_read > $z_write, $z_read, $z_write), if($z_delete > $z_create, $z_delete, $z_create))
+  $z_rw = if($z_read > $z_write, $z_read, $z_write)
+  $z_dc = if($z_delete > $z_create, $z_delete, $z_create)
+  $top_z = if($z_rw > $z_dc, $z_rw, $z_dc)
   $obs_read = max($cloud_risk.obs_read)
   $obs_write = max($cloud_risk.obs_write)
   $obs_delete = max($cloud_risk.obs_delete)
@@ -2008,9 +2112,14 @@ condition:
 
 order:
   $z desc""",
-        "Cloud": f"""// Fleetwide Sector 2: User Cloud Infrastructure CRUD
+        "Cloud": f"""// Fleetwide Sector 2: User Cloud Infrastructure CRUD (4-Family Read, Write, Create, Delete)
 stage cloud_risk {{
-    (metadata.event_type = "RESOURCE_CREATION" or metadata.event_type = "USER_RESOURCE_CREATION")
+    (
+        metadata.event_type = "RESOURCE_READ" or metadata.event_type = "USER_RESOURCE_ACCESS" or
+        metadata.event_type = "RESOURCE_WRITTEN" or metadata.event_type = "USER_RESOURCE_UPDATE_CONTENT" or
+        metadata.event_type = "RESOURCE_CREATION" or metadata.event_type = "USER_RESOURCE_CREATION" or
+        metadata.event_type = "RESOURCE_DELETION" or metadata.event_type = "USER_RESOURCE_DELETION"
+    )
     principal.user.userid = $user
     $vendor = metadata.vendor_name
     $product = metadata.product_name
@@ -2018,20 +2127,65 @@ stage cloud_risk {{
   match:
     $user, $vendor, $product by 1d
   outcome:
+    $obs_r = sum(if(metadata.event_type = "RESOURCE_READ" or metadata.event_type = "USER_RESOURCE_ACCESS", 1, 0))
+    $obs_w = sum(if(metadata.event_type = "RESOURCE_WRITTEN" or metadata.event_type = "USER_RESOURCE_UPDATE_CONTENT", 1, 0))
+    $obs_c = sum(if(metadata.event_type = "RESOURCE_CREATION" or metadata.event_type = "USER_RESOURCE_CREATION", 1, 0))
+    $obs_d = sum(if(metadata.event_type = "RESOURCE_DELETION" or metadata.event_type = "USER_RESOURCE_DELETION", 1, 0))
     $obs = count(metadata.id)
-    $avg = max(metrics.resource_creation_total(
+    $avg_r = max(metrics.resource_read_total(
         period: 1d, window: 30d, metric: event_count_sum, agg: avg,
         principal.user.userid: principal.user.userid,
         metadata.vendor_name: metadata.vendor_name,
         metadata.product_name: metadata.product_name
     ))
-    $std = max(metrics.resource_creation_total(
+    $std_r = max(metrics.resource_read_total(
         period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
         principal.user.userid: principal.user.userid,
         metadata.vendor_name: metadata.vendor_name,
         metadata.product_name: metadata.product_name
     ))
-    $z = ($obs - $avg) / if($std > 0, $std, 1.0)
+    $avg_w = max(metrics.resource_written_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.user.userid: principal.user.userid,
+        metadata.vendor_name: metadata.vendor_name,
+        metadata.product_name: metadata.product_name
+    ))
+    $std_w = max(metrics.resource_written_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.user.userid: principal.user.userid,
+        metadata.vendor_name: metadata.vendor_name,
+        metadata.product_name: metadata.product_name
+    ))
+    $avg_c = max(metrics.resource_creation_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.user.userid: principal.user.userid,
+        metadata.vendor_name: metadata.vendor_name,
+        metadata.product_name: metadata.product_name
+    ))
+    $std_c = max(metrics.resource_creation_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.user.userid: principal.user.userid,
+        metadata.vendor_name: metadata.vendor_name,
+        metadata.product_name: metadata.product_name
+    ))
+    $avg_d = max(metrics.resource_deletion_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.user.userid: principal.user.userid,
+        metadata.vendor_name: metadata.vendor_name,
+        metadata.product_name: metadata.product_name
+    ))
+    $std_d = max(metrics.resource_deletion_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: stddev,
+        principal.user.userid: principal.user.userid,
+        metadata.vendor_name: metadata.vendor_name,
+        metadata.product_name: metadata.product_name
+    ))
+    $z_r = ($obs_r - $avg_r) / if($std_r > 0, $std_r, 1.0)
+    $z_w = ($obs_w - $avg_w) / if($std_w > 0, $std_w, 1.0)
+    $z_c = ($obs_c - $avg_c) / if($std_c > 0, $std_c, 1.0)
+    $z_d = ($obs_d - $avg_d) / if($std_d > 0, $std_d, 1.0)
+    $z_rw = if($z_r > $z_w, $z_r, $z_w)
+    $z_cd = if($z_c > $z_d, $z_c, $z_d)
 }}
 
 $user = $cloud_risk.user
@@ -2040,10 +2194,12 @@ match:
   $user by 1d
 
 outcome:
-  $z = max($cloud_risk.z)
-  $observed = max($cloud_risk.obs)
-  $baseline = max($cloud_risk.avg)
-  $dispersion = max($cloud_risk.std)
+  $z_rw = max($cloud_risk.z_rw)
+  $z_cd = max($cloud_risk.z_cd)
+  $z = if($z_rw > $z_cd, $z_rw, $z_cd)
+  $observed = sum($cloud_risk.obs)
+  $baseline = max($cloud_risk.avg_c) + max($cloud_risk.avg_w) + max($cloud_risk.avg_r) + max($cloud_risk.avg_d)
+  $dispersion = max($cloud_risk.std_c) + max($cloud_risk.std_w) + max($cloud_risk.std_r) + max($cloud_risk.std_d)
 
 condition:
   $z >= {z_gate} and $observed >= {obs_gate}

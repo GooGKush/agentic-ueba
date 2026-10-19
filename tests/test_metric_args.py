@@ -91,6 +91,33 @@ def test_cloud_crud_outcomes_within_compiler_limit():
   root_outcome = root.split("outcome:", 1)[1].split("order:", 1)[0]
   assert len(OUTCOME_VAR.findall(stage_outcome)) <= 20
   assert len(OUTCOME_VAR.findall(root_outcome)) <= 20
+  assert "if(if(" not in query
   for fam in ("resource_read_total", "resource_written_total",
               "resource_deletion_total", "resource_creation_total"):
     assert f"metrics.{fam}(" in query
+
+
+def test_360_radar_cloud_spoke_4family_and_outcome_limits():
+  eng = RiskMetricsEngine()
+  captured = []
+
+  async def fake_exec(session, query, *args, **kwargs):
+    captured.append(query)
+    return {}
+
+  eng.runner.execute_query_via_mcp = fake_exec
+  asyncio.run(eng.run_360_behavioral_radar(None, "user.a", entity_type="USER"))
+  user_cloud_q = [q for q in captured if "stage cloud_risk" in q][0]
+  fleet_cloud_q = eng.build_fleet_360_sector_queries(entity_type="USER")["Cloud"]
+
+  for q in (user_cloud_q, fleet_cloud_q):
+    stage_body, root = q.split("\n}\n", 1)
+    stage_outcome = stage_body.split("outcome:", 1)[1]
+    root_outcome = root.split("outcome:", 1)[1].split("condition:", 1)[0].split("order:", 1)[0]
+    assert len(OUTCOME_VAR.findall(stage_outcome)) <= 20
+    assert len(OUTCOME_VAR.findall(root_outcome)) <= 20
+    assert "if(if(" not in q
+    for fam in ("resource_read_total", "resource_written_total",
+                "resource_deletion_total", "resource_creation_total"):
+      assert f"metrics.{fam}(" in q
+
