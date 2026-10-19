@@ -1880,3 +1880,34 @@ def test_vertex_location_and_model_resolution(monkeypatch):
   assert cfg_override.resolve_vertex_location("gemini-2.5-pro") == "europe-west4"
 
 
+@pytest.mark.anyio
+async def test_v201_email_to_userid_identity_resolution(monkeypatch):
+  from unittest.mock import AsyncMock
+  eng = RiskMetricsEngine()
+
+  assert eng.extract_email_local_part("admin@demo.wsexample.org") == "admin"
+  assert eng.extract_email_local_part("frank.kolzig@stackedpads.local") == "frank.kolzig"
+  assert eng.extract_email_local_part("frank.kolzig") is None
+  assert eng.extract_email_local_part("sa-prod@proj.iam.gserviceaccount.com") is None
+  assert eng.extract_email_local_part("sa-prod@proj.iam") is None
+
+  captured_queries = []
+
+  async def fake_exec(session, query, start_iso, end_iso):
+    captured_queries.append(query)
+    return {"stats": [{"uid": "admin", "cnt": 42}]}
+
+  monkeypatch.setattr(eng.runner, "execute_query_via_mcp", fake_exec)
+  resolved = await eng.resolve_user_identifier(AsyncMock(), "admin@demo.wsexample.org", lookback_days=7)
+  assert resolved == "admin"
+  assert len(captured_queries) == 1
+  assert 'principal.user.email_addresses = "admin@demo.wsexample.org"' in captured_queries[0]
+  assert "coalesce(principal.user.userid, target.user.userid)" in captured_queries[0]
+
+  # Service accounts bypass the email probe
+  sa_resolved = await eng.resolve_user_identifier(AsyncMock(), "sa-prod@proj.iam.gserviceaccount.com")
+  assert sa_resolved == "sa-prod@proj.iam.gserviceaccount.com"
+  assert len(captured_queries) == 1
+
+
+
