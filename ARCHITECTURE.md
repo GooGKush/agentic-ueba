@@ -294,15 +294,15 @@ create_case_comment / SOAR Rule Trigger]
 
 ```
 agentic_ueba/
+├── README.md                           # Operational guide, API reference, & Cloud Run hosting instructions
 ├── ARCHITECTURE.md                     # System Architecture & Technical Specifications (This File)
 ├── Dockerfile                          # Cloud Run container build definition
-├── deploy_cloud_run.sh                 # Automated Cloud Run multi-tenant deployment script
+├── cloudbuild.yaml                     # Cloud Build CI/CD pipeline definition
 ├── requirements.txt                    # Production Python dependencies
 ├── data/
 │   └── watchdog_state.json             # Persistent Watchdog & Case Activity Ledger
 ├── scripts/
-│   ├── run_live_360_radar.py           # Standalone CLI runner for 360° Behavioral Risk Radar
-│   └── test_case_wall_formatting.py    # SOAR Case Wall HTML sanitizer & card verification
+│   └── build_container.sh              # Stages canonical skills into .build/skills for container packaging
 ├── src/
 │   ├── __init__.py
 │   ├── _bootstrap.py                   # Cloudtop / virtualenv runtime bootstrapper
