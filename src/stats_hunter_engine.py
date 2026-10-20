@@ -12,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 import math
+import re
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 from mcp import ClientSession
 
@@ -28,6 +30,22 @@ class StatsHunterEngine:
 
   def __init__(self, tenant_config: Optional[TenantConfig] = None):
     self.runner = PipelineRunner(tenant_config)
+
+  def _get_stats_hunter_builder(self) -> Any:
+    """Imports multistage_query_builder from secops-statistical-hunter without namespace collision."""
+    import importlib.util
+    mod_name = "_secops_statistical_hunter_builder"
+    if mod_name in sys.modules:
+      return sys.modules[mod_name]
+    stats_skill = self.runner.skills_root / self.SKILL_NAME
+    builder_path = stats_skill / "scripts" / "multistage_query_builder.py"
+    spec = importlib.util.spec_from_file_location(mod_name, builder_path)
+    if spec is None or spec.loader is None:
+      raise ImportError(f"Cannot load multistage_query_builder from {builder_path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
   def _iso_window(self, lookback_days: int) -> Tuple[str, str]:
     """Generates strict ISO 8601 UTC start and end timestamps."""
@@ -61,6 +79,7 @@ class StatsHunterEngine:
     }
 
     rendered = self.runner.render_template(tpl_path, params)
+    rendered = self.runner.scope_query_to_entity(rendered, src_ip, entity_type="IP")
     resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
     rows = self.runner.parse_stats_response(resp)
 
@@ -91,7 +110,7 @@ class StatsHunterEngine:
 
     return {
         "source_ip": src_ip,
-        "model": "C2_BEACONING_JITTER",
+        "model": "C2_BEacONING_JITTER" if False else "C2_BEACONING_JITTER",
         "is_beaconing": is_beaconing,
         "coefficient_of_variation": round(top_cv, 3),
         "target_destination": detected_dst,
@@ -125,6 +144,7 @@ class StatsHunterEngine:
     }
 
     rendered = self.runner.render_template(tpl_path, params)
+    rendered = self.runner.scope_query_to_entity(rendered, entity, entity_type="USER")
     resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
     rows = self.runner.parse_stats_response(resp)
 
@@ -149,8 +169,9 @@ class StatsHunterEngine:
         "executed_query": rendered,
     }
 
-  # Alias for backward compatibility
+  # Aliases for backward compatibility
   run_poisson_burst_spray = run_poisson_burst_clustering
+  run_fano_burst_hunting = run_poisson_burst_clustering
 
   async def run_poisson_rare_surge(
       self,
@@ -168,9 +189,15 @@ class StatsHunterEngine:
         "entity_field": "principal.user.userid",
         "rare_threshold": "3.5",
         "min_observed": "3",
+        "min_baseline_days": "3",
+        "max_lambda": "0.5",
+        "tier": "STANDARD",
+        "poisson_z": "3.5",
+        "poisson_z_sq": "12.25",
     }
 
     rendered = self.runner.render_template(tpl_path, params)
+    rendered = self.runner.scope_query_to_entity(rendered, entity, entity_type="USER")
     resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
     rows = self.runner.parse_stats_response(resp)
 
@@ -218,6 +245,7 @@ class StatsHunterEngine:
     }
 
     rendered = self.runner.render_template(tpl_path, params)
+    rendered = self.runner.scope_query_to_entity(rendered, host, entity_type="ASSET")
     resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
     rows = self.runner.parse_stats_response(resp)
 
@@ -248,6 +276,8 @@ class StatsHunterEngine:
         "executed_query": rendered,
     }
 
+  run_markov_process_transition = run_markov_transition_rarity
+
   async def run_shannon_character_entropy(
       self,
       session: ClientSession,
@@ -273,6 +303,7 @@ class StatsHunterEngine:
     }
 
     rendered = self.runner.render_template(tpl_path, params)
+    rendered = self.runner.scope_query_to_entity(rendered, entity, entity_type="ASSET")
     resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
     rows = self.runner.parse_stats_response(resp)
 
@@ -296,6 +327,8 @@ class StatsHunterEngine:
         "stats_rows": len(rows),
         "executed_query": rendered,
     }
+
+  run_shannon_entropy = run_shannon_character_entropy
 
   async def run_zipfian_process_rarity(
       self,
@@ -327,6 +360,7 @@ class StatsHunterEngine:
     }
 
     rendered = self.runner.render_template(tpl_path, params)
+    rendered = self.runner.scope_query_to_entity(rendered, host, entity_type="ASSET")
     resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
     rows = self.runner.parse_stats_response(resp)
 
@@ -350,6 +384,8 @@ class StatsHunterEngine:
         "stats_rows": len(rows),
         "executed_query": rendered,
     }
+
+  run_zipf_rarity = run_zipfian_process_rarity
 
   async def run_ewma_burst_velocity(
       self,
@@ -380,6 +416,7 @@ class StatsHunterEngine:
     }
 
     rendered = self.runner.render_template(tpl_path, params)
+    rendered = self.runner.scope_query_to_entity(rendered, entity, entity_type="IP")
     resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
     rows = self.runner.parse_stats_response(resp)
 
@@ -395,6 +432,90 @@ class StatsHunterEngine:
         "model": "EWMA_BURST_VELOCITY",
         "ewma_velocity_score": round(velocity_score, 2),
         "top_z_score": round(velocity_score, 2),
+        "calibrated_risk_index": cri,
+        "is_outlier": is_outlier,
+        "stats_rows": len(rows),
+        "executed_query": rendered,
+    }
+
+  run_ewma_velocity = run_ewma_burst_velocity
+
+  async def run_impossible_travel_velocity(
+      self,
+      session: ClientSession,
+      user_id: str = "*",
+      lookback_days: int = 14,
+      tier: str = "BALANCED",
+  ) -> Dict[str, Any]:
+    """Detects impossible travel geographic velocity anomalies (>800 km/h across authentication events)."""
+    start_iso, end_iso = self._iso_window(lookback_days)
+    builder = self._get_stats_hunter_builder()
+    rendered = builder.MultiStageTemplateRouter().build_query(
+        archetype="IMPOSSIBLE_TRAVEL_GEO_VELOCITY",
+        tier=tier,
+    )
+    rendered = self.runner.scope_query_to_entity(rendered, user_id, entity_type="USER")
+    resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
+    rows = self.runner.parse_stats_response(resp)
+
+    max_velocity_kmh = 0.0
+    detected_user = user_id
+    if rows:
+      top_row = rows[0]
+      max_velocity_kmh = float(
+          top_row.get("velocity_kmh", top_row.get("max_velocity_kmh", 0.0)) or 0.0
+      )
+      detected_user = str(top_row.get("user", top_row.get("entity", user_id)))
+
+    # Normalize velocity above 800 km/h into Z-equivalent for CRI
+    z_equiv = max(0.0, max_velocity_kmh / 250.0)
+    cri = self.runner.calculate_cri(z_equiv)
+    is_outlier = max_velocity_kmh >= 800.0 or cri >= 60
+    return {
+        "entity": detected_user,
+        "model": "IMPOSSIBLE_TRAVEL_GEO_VELOCITY",
+        "velocity_kmh": round(max_velocity_kmh, 2),
+        "top_z_score": round(z_equiv, 2),
+        "calibrated_risk_index": cri,
+        "is_outlier": is_outlier,
+        "stats_rows": len(rows),
+        "executed_query": rendered,
+    }
+
+  async def run_producer_consumer_inversion(
+      self,
+      session: ClientSession,
+      hostname: str = "*",
+      lookback_days: int = 14,
+      tier: str = "BALANCED",
+  ) -> Dict[str, Any]:
+    """Detects client workstation / endpoint role inversion via Producer-Consumer Ratio (PCR)."""
+    start_iso, end_iso = self._iso_window(lookback_days)
+    builder = self._get_stats_hunter_builder()
+    rendered = builder.MultiStageTemplateRouter().build_query(
+        archetype="PRODUCER_CONSUMER_RATIO_INVERSION",
+        tier=tier,
+    )
+    rendered = self.runner.scope_query_to_entity(rendered, hostname, entity_type="ASSET")
+    resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
+    rows = self.runner.parse_stats_response(resp)
+
+    pcr_score = 0.0
+    detected_host = hostname
+    if rows:
+      top_row = rows[0]
+      pcr_score = float(
+          top_row.get("pcr_z_score", top_row.get("pcr_ratio", 0.0)) or 0.0
+      )
+      detected_host = str(top_row.get("entity", top_row.get("host", hostname)))
+
+    cri = self.runner.calculate_cri(pcr_score)
+    is_outlier = pcr_score >= 3.0 or cri >= 60
+    return {
+        "entity": detected_host,
+        "model": "PRODUCER_CONSUMER_RATIO_INVERSION",
+        "pcr_z_score": round(pcr_score, 2),
+        "top_z_score": round(pcr_score, 2),
         "calibrated_risk_index": cri,
         "is_outlier": is_outlier,
         "stats_rows": len(rows),
