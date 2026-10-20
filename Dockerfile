@@ -21,11 +21,21 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application source
 COPY src/ ./src/
 
-# Install canonical skills directly into /app/skills
+# Install canonical skills into /app/skills (prefers .build/skills staged by scripts/build_container.sh, falls back to GitHub clone)
+COPY requirements.txt .build* /tmp/staged_build/
 RUN mkdir -p /app/skills && \
-    git clone --depth 1 https://github.com/GooGKush/secops-risk-metrics-multistage.git /app/skills/secops-risk-metrics-multistage && \
-    git clone --depth 1 https://github.com/GooGKush/secops-statistical-hunter.git /app/skills/secops-statistical-hunter && \
-    rm -rf /app/skills/*/.git
+    if [ -d /tmp/staged_build/skills/secops-risk-metrics-multistage ] && [ -d /tmp/staged_build/skills/secops-statistical-hunter ]; then \
+      cp -r /tmp/staged_build/skills/secops-risk-metrics-multistage /app/skills/ && \
+      cp -r /tmp/staged_build/skills/secops-statistical-hunter /app/skills/; \
+    elif [ -d /tmp/staged_build/secops-risk-metrics-multistage ] && [ -d /tmp/staged_build/secops-statistical-hunter ]; then \
+      cp -r /tmp/staged_build/secops-risk-metrics-multistage /app/skills/ && \
+      cp -r /tmp/staged_build/secops-statistical-hunter /app/skills/; \
+    else \
+      git clone --depth 1 https://github.com/GooGKush/secops-risk-metrics-multistage.git /app/skills/secops-risk-metrics-multistage && \
+      git clone --depth 1 https://github.com/GooGKush/secops-statistical-hunter.git /app/skills/secops-statistical-hunter && \
+      rm -rf /app/skills/*/.git; \
+    fi && \
+    rm -rf /tmp/staged_build
 
 EXPOSE 8080
 

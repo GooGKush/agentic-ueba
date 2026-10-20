@@ -102,3 +102,32 @@ def test_jit_hunt_models():
   assert d["status"] == "SUCCESS"
   assert d["triage"]["calibrated_risk_index"] == 84.2
   assert d["case_wall_updated"] is True
+
+
+def test_native_secops_zero_bigquery_backend_attribution():
+  """Verify JIT persona and sanitizer enforce 100% Native SecOps architecture (zero BigQuery backend dependency)."""
+  skills_root = get_skills_root()
+  adapter = DynamicProtocolAdapter(skills_root)
+
+  for skill in ("secops-risk-metrics-multistage", "secops-statistical-hunter"):
+    persona = adapter.build_jit_persona(
+        skill_name=skill,
+        project_id="test-project",
+        customer_id="test-customer",
+        region="us",
+    )
+    assert "NATIVE GOOGLE SECOPS ARCHITECTURE (ZERO BIGQUERY DEPENDENCY)" in persona
+    assert "pre-computed BigQuery" not in persona
+    assert "BigQuery summary tables" not in persona
+    assert "BigQuery roll-up" not in persona
+
+  raw_text = (
+      "Google SecOps aggregates telemetry into pre-computed BigQuery summary tables "
+      "via BigQuery roll-up pipelines in a BigQuery backend."
+  )
+  cleaned = DynamicProtocolAdapter.sanitize_bq_backend_references(raw_text)
+  assert "BigQuery" not in cleaned
+  assert "native SecOps pre-computed Risk Analytics metric stores" in cleaned
+  assert "native SecOps pre-computed roll-up pipelines" in cleaned
+  assert "native SecOps backend" in cleaned
+

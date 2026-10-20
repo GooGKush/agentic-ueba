@@ -42,11 +42,34 @@ AUTONOMOUS_JIT_PROTOCOL = """
 4. COMPILER & AST INVARIANTS REMAIN 100% BINDING:
    All AST syntax constraints, match variable bindings ($user, $host by 1d), safe dispersion floors,
    and template assembly rules defined below are non-negotiable.
+
+5. NATIVE GOOGLE SECOPS ARCHITECTURE (ZERO BIGQUERY DEPENDENCY):
+   - All UDM event telemetry, Entity Context Graph (`graph.*`), and 30-day behavioral baselines (`metrics.*`) are computed, stored, and queried 100% natively within Google SecOps.
+   - BigQuery does NOT drive, store, or back Google SecOps UEBA in any capacity whatsoever. If BigQuery disappeared tomorrow, it would have zero impact on SecOps UEBA.
+   - Never state, imply, or explain that SecOps UEBA or `metrics.*` relies on external warehouse summary tables. BigQuery is solely a monitored customer cloud resource (e.g., `bigquery.googleapis.com` in GCP audit logs) that could be the target of an attack.
 """
 
 
 class DynamicProtocolAdapter:
   """Adapts canonical human-facing SecOps skills into autonomous JIT engine personas."""
+
+  _BQ_BACKEND_PATTERNS = (
+      (re.compile(r"pre-computed\s+BigQuery\s+summary\s+tables", re.I), "native SecOps pre-computed Risk Analytics metric stores"),
+      (re.compile(r"pre-computed\s+BigQuery\s+roll-up\s+pipelines", re.I), "native SecOps pre-computed roll-up pipelines"),
+      (re.compile(r"BigQuery\s+summary\s+tables", re.I), "native SecOps Risk Analytics metric stores"),
+      (re.compile(r"BigQuery\s+roll-up\s+pipelines", re.I), "native SecOps pre-computed roll-up pipelines"),
+      (re.compile(r"(?<!zero\s)(?<!no\s)BigQuery\s+backend", re.I), "native SecOps backend"),
+  )
+
+  @classmethod
+  def sanitize_bq_backend_references(cls, text: str) -> str:
+    """Strips any language implying BigQuery backs or drives SecOps UEBA storage/compute."""
+    if not text:
+      return ""
+    cleaned = text
+    for pat, repl in cls._BQ_BACKEND_PATTERNS:
+      cleaned = pat.sub(repl, cleaned)
+    return cleaned
 
   def __init__(self, skills_root: Path):
     self.skills_root = Path(skills_root)
@@ -159,9 +182,9 @@ class DynamicProtocolAdapter:
     skill_dir = self.get_skill_path(skill_name)
     raw_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
     
-    adapted_skill = self.adapt_skill_text(raw_md)
-    template_section = self.load_templates(skill_dir) if include_templates else ""
-    reference_section = self.load_references(skill_dir) if include_references else ""
+    adapted_skill = self.sanitize_bq_backend_references(self.adapt_skill_text(raw_md))
+    template_section = self.sanitize_bq_backend_references(self.load_templates(skill_dir)) if include_templates else ""
+    reference_section = self.sanitize_bq_backend_references(self.load_references(skill_dir)) if include_references else ""
 
     return f"""You are an autonomous Google SecOps JIT Threat Hunting Agent.
 

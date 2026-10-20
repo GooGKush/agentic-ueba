@@ -106,6 +106,8 @@ class AutonomousHunterEngine:
     """
     if not comment:
       return ""
+    # Strip any accidental BigQuery backend attribution before rendering
+    comment = DynamicProtocolAdapter.sanitize_bq_backend_references(comment)
     # Unescape literal backslash escapes if present
     comment = comment.replace("\\n", "\n").replace('\\"', '"').replace("\\'", "'")
     # Strip machine-readable json_triage code block from user-facing case wall comment
@@ -997,6 +999,114 @@ class AutonomousHunterEngine:
       )
       return sec_res, sec_report
 
+    if "impossible_travel" in sec_query or "geo_velocity" in sec_query:
+      sec_res = await StatsHunterEngine(tenant).run_impossible_travel_velocity(
+          session=session,
+          user_id=exec_entity,
+          lookback_days=req.lookback_days,
+      )
+      self._annotate_directive_post_data(directive, sec_res)
+      sec_cri = sec_res["calibrated_risk_index"]
+      sec_outlier = sec_res["is_outlier"]
+      sec_rows = [
+          {
+              "metric": "**Geodesic Travel Velocity**",
+              "observed": f"`{sec_res['velocity_kmh']:.2f}` km/h (`{sec_res.get('distance_km', 0.0):.1f}` km)",
+              "threshold": "$\\ge 800.0$ km/h",
+              "assessment": "⚠️ Impossible Travel Anomaly" if sec_outlier else "✅ Plausible Travel Speed",
+          },
+          {
+              "metric": "**Evaluated Auth Sessions**",
+              "observed": f"`{sec_res.get('stats_rows', 0)}`",
+              "threshold": "Haversine Geodesic Distance",
+              "assessment": "Cross-Location Session Evaluation",
+          },
+      ]
+      sec_report = CaseWallCardFormatter.format_card(
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
+          model_name=directive.model_name,
+          calibrated_risk_index=float(sec_cri),
+          is_outlier=sec_outlier,
+          case_id=req.case_id,
+          rows_count=sec_res.get("stats_rows", 0),
+          directive=directive,
+          metrics_table_rows=sec_rows,
+      )
+      return sec_res, sec_report
+
+    if "producer_consumer" in sec_query or "ratio_inversion" in sec_query:
+      sec_res = await StatsHunterEngine(tenant).run_producer_consumer_inversion(
+          session=session,
+          hostname=exec_entity,
+          lookback_days=req.lookback_days,
+      )
+      self._annotate_directive_post_data(directive, sec_res)
+      sec_cri = sec_res["calibrated_risk_index"]
+      sec_outlier = sec_res["is_outlier"]
+      sec_rows = [
+          {
+              "metric": "**Producer-Consumer Ratio Z ($Z_{PCR}$)**",
+              "observed": f"`{sec_res['pcr_z_score']:+.2f}σ` (Ratio = `{sec_res.get('producer_ratio', 0.0):.3f}`)",
+              "threshold": "$\\ge 3.00\\sigma$",
+              "assessment": "⚠️ Endpoint Producer Role Inversion" if sec_outlier else "✅ Standard Consumer Ratio",
+          },
+          {
+              "metric": "**Evaluated Buckets**",
+              "observed": f"`{sec_res.get('stats_rows', 0)}`",
+              "threshold": "Directional Byte Asymmetry",
+              "assessment": "Outbound vs Inbound Byte Ratio",
+          },
+      ]
+      sec_report = CaseWallCardFormatter.format_card(
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
+          model_name=directive.model_name,
+          calibrated_risk_index=float(sec_cri),
+          is_outlier=sec_outlier,
+          case_id=req.case_id,
+          rows_count=sec_res.get("stats_rows", 0),
+          directive=directive,
+          metrics_table_rows=sec_rows,
+      )
+      return sec_res, sec_report
+
+    if "poisson_rare" in sec_query or "rare_surge" in sec_query:
+      sec_res = await StatsHunterEngine(tenant).run_poisson_rare_surge(
+          session=session,
+          entity=exec_entity,
+          lookback_days=req.lookback_days,
+      )
+      self._annotate_directive_post_data(directive, sec_res)
+      sec_cri = sec_res["calibrated_risk_index"]
+      sec_outlier = sec_res["is_outlier"]
+      sec_rows = [
+          {
+              "metric": "**Poisson Arrival Rarity ($Z_{poisson}$)**",
+              "observed": f"`{sec_res['poisson_z']:+.2f}σ`",
+              "threshold": "$\\ge 3.50\\sigma$",
+              "assessment": "⚠️ Rare Command Arrival Surge" if sec_outlier else "✅ Nominal Arrival Rate",
+          },
+          {
+              "metric": "**Evaluated Buckets**",
+              "observed": f"`{sec_res.get('stats_rows', 0)}`",
+              "threshold": "Quiet Historical Baseline",
+              "assessment": "Discrete Poisson Rarity",
+          },
+      ]
+      sec_report = CaseWallCardFormatter.format_card(
+          target_entity=exec_entity,
+          entity_type=exec_entity_type,
+          model_name=directive.model_name,
+          calibrated_risk_index=float(sec_cri),
+          is_outlier=sec_outlier,
+          case_id=req.case_id,
+          rows_count=sec_res.get("stats_rows", 0),
+          directive=directive,
+          metrics_table_rows=sec_rows,
+      )
+      return sec_res, sec_report
+
     return None, None
 
   def _get_genai_client(
@@ -1029,6 +1139,10 @@ class AutonomousHunterEngine:
         fallback_models=self.default_tenant.fallback_models,
         vertex_location=self.default_tenant.vertex_location,
         allowed_tools=self.default_tenant.allowed_tools,
+        fleet_360_enabled=self.default_tenant.fleet_360_enabled,
+        fleet_360_ingest_events=self.default_tenant.fleet_360_ingest_events,
+        fleet_360_spike_threshold_z=self.default_tenant.fleet_360_spike_threshold_z,
+        fleet_360_spoke_inclusion_z=self.default_tenant.fleet_360_spoke_inclusion_z,
     )
 
     skill_name = self.resolve_skill_selection(req)
@@ -1221,6 +1335,39 @@ class AutonomousHunterEngine:
                   },
               )
               case_wall_updated = True
+              spike_z_gate = float(getattr(tenant, "fleet_360_spike_threshold_z", 3.0))
+              if (
+                  float(radar_result.get("composite_d", 0.0)) >= spike_z_gate
+                  and bool(getattr(tenant, "fleet_360_enabled", False))
+                  and bool(getattr(tenant, "fleet_360_ingest_events", True))
+              ):
+                try:
+                  rm_eng = RiskMetricsEngine(tenant)
+                  now_dt = datetime.now(timezone.utc)
+                  eval_day = str(radar_result.get("evaluated_day") or now_dt.strftime("%Y-%m-%d"))
+                  sec_map = {
+                      s: {
+                          "z": float(z_v),
+                          "obs": float(radar_result.get("sector_observed_counts", {}).get(s, 0)),
+                          "avg": float(radar_result.get("sector_baseline_avg", {}).get(s, 0.0)),
+                          "std": float(radar_result.get("sector_baseline_std", {}).get(s, 0.0)),
+                      }
+                      for s, z_v in radar_result.get("sector_z_scores", {}).items()
+                  }
+                  udm_ev = rm_eng.build_360_outlier_udm_event(
+                      entity_id=str(radar_result.get("entity") or req.target_entity),
+                      entity_type=req.entity_type,
+                      sectors=sec_map,
+                      composite_d=float(radar_result["composite_d"]),
+                      composite_cri=int(cri),
+                      campaign_id=f"case-360-{req.case_id}-{eval_day}",
+                      run_timestamp_iso=now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                      evaluated_day=eval_day,
+                      spike_threshold_z=spike_z_gate,
+                  )
+                  rm_eng.ingest_udm_events([udm_ev])
+                except Exception as ingest_err:
+                  logger.warning(f"Case 360 UDM event ingestion skipped for case {req.case_id}: {ingest_err}")
 
             triage = TriageSummary(
                 calibrated_risk_index=float(cri),
@@ -2840,6 +2987,7 @@ class AutonomousHunterEngine:
       skill_name: str,
   ) -> JITHuntResponse:
     """Extracts structured triage JSON and packages final response."""
+    final_text = DynamicProtocolAdapter.sanitize_bq_backend_references(final_text)
     # Attempt to extract json_triage code block
     triage_data = {}
     json_match = re.search(r"```(?:json_triage|json)\s*(\{.*?\})\s*```", final_text, re.DOTALL)

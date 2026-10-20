@@ -2138,5 +2138,306 @@ async def test_stats_hunter_entity_scoping_and_new_archetypes(monkeypatch):
   assert r9["is_outlier"] is True
 
 
+@pytest.mark.anyio
+async def test_fleet_360_composite_multisector_outlier_emission(monkeypatch):
+  """Entities with multiple sub-3σ spokes whose Euclidean D >= 3.0σ (CRI >= 50) must be emitted."""
+  from datetime import datetime, timezone
+  from unittest.mock import AsyncMock
+  from src.config import TenantConfig
+
+  eng = RiskMetricsEngine(TenantConfig(project_id="test-proj", customer_id="test-cust"))
+
+  # admin has Cloud Z=2.51 and Web Z=2.51 on the same day -> D = sqrt(2.51^2 + 2.51^2) = 3.55 >= 3.0 (CRI=58)
+  # single_sub has only Web Z=2.51 -> D = 2.51 < 3.0 (should NOT be emitted)
+  async def fake_execute(session, query, start_iso, end_iso):
+    if "resource_creation_total" in query:
+      return {
+          "stats": [
+              {"user": "admin", "z": 2.51, "observed": 12, "baseline": 2.0, "dispersion": 4.0}
+          ]
+      }
+    if "http_queries_total" in query:
+      return {
+          "stats": [
+              {"user": "admin", "z": 2.51, "observed": 500, "baseline": 100.0, "dispersion": 160.0},
+              {"user": "single_sub", "z": 2.51, "observed": 300, "baseline": 100.0, "dispersion": 80.0},
+          ]
+      }
+    return {"stats": []}
+
+  monkeypatch.setattr(eng.runner, "execute_query_via_mcp", fake_execute)
+  ingested = []
+  monkeypatch.setattr(
+      eng,
+      "ingest_udm_events",
+      lambda events: (ingested.extend(events) or {"status": "SUCCESS", "events_ingested": len(events), "batches": 1}),
+  )
+
+  res = await eng.run_fleet_360_sweep(
+      session=AsyncMock(),
+      entity_type="USER",
+      spike_threshold_z=3.0,
+      spoke_inclusion_z=2.0,
+      min_observed=5,
+      inter_query_delay_sec=0.0,
+      ingest_events=True,
+      now_utc=datetime(2026, 10, 20, 16, 0, 0, tzinfo=timezone.utc),
+  )
+
+  assert res["outliers_detected"] == 1
+  assert res["outliers_emitted"] == 1
+  out = res["outliers"][0]
+  assert out["entity"] == "admin"
+  assert out["composite_d"] == 3.55
+  assert out["composite_cri"] == 58
+  assert set(out["breached_sectors"]) == {"CLOUD", "WEB"}
+  assert len(ingested) == 1
+  labels = {l["key"]: l["value"] for l in ingested[0]["target"]["resource"]["attribute"]["labels"]}
+  assert labels["Composite CRI"] == "58"
+  assert labels["Breached Vectors"] == "CLOUD, WEB"
+  assert all(sr["threat_status"] == "ACTIVE" for sr in ingested[0]["security_result"][1:])
+
+
+@pytest.mark.anyio
+async def test_360_behavioral_radar_synchronous_day_bucket_alignment(monkeypatch):
+  """run_360_behavioral_radar must align sectors by TIME_BUCKET rather than mixing peak days across a 14d window."""
+  from unittest.mock import AsyncMock
+  from src.config import TenantConfig
+
+  eng = RiskMetricsEngine(TenantConfig(project_id="test-proj", customer_id="test-cust"))
+
+  # Disjoint single-spoke days: Cloud peaks on 2026-10-18 (Z=2.51), Web peaks on 2026-10-12 (Z=2.51)
+  async def fake_disjoint(session, query, start_iso, end_iso):
+    if "resource_creation_total" in query:
+      return {
+          "stats": [
+              {"TIME_BUCKET": "2026-10-18T00:00:00Z", "z": 2.51, "observed": 10, "avg": 2.0, "std": 3.2},
+              {"TIME_BUCKET": "2026-10-20T00:00:00Z", "z": 0.40, "observed": 3, "avg": 2.0, "std": 2.5},
+          ]
+      }
+    if "http_queries_total" in query:
+      return {
+          "stats": [
+              {"TIME_BUCKET": "2026-10-12T00:00:00Z", "z": 2.51, "observed": 800, "avg": 200.0, "std": 240.0},
+          ]
+      }
+    return {"stats": []}
+
+  monkeypatch.setattr(eng.runner, "execute_query_via_mcp", fake_disjoint)
+  res_sync = await eng.run_360_behavioral_radar(AsyncMock(), "admin", lookback_days=14, entity_type="USER")
+  # Must evaluate a single day (2026-10-18, D=2.51, CRI=43), NOT combine 2026-10-18 + 2026-10-12 into D=3.55 (CRI=58)
+  assert res_sync["evaluated_day"] == "2026-10-18"
+  assert res_sync["composite_d"] == 2.51
+  assert res_sync["calibrated_risk_index"] == 43
+  assert res_sync["sector_z_scores"]["Cloud"] == 2.51
+  assert res_sync["sector_z_scores"]["Web"] == 0.0
+
+  # When prefer_latest_day=True, selects 2026-10-20
+  res_latest = await eng.run_360_behavioral_radar(
+      AsyncMock(), "admin", lookback_days=14, entity_type="USER", prefer_latest_day=True
+  )
+  assert res_latest["evaluated_day"] == "2026-10-20"
+  assert res_latest["sector_z_scores"]["Cloud"] == 0.40
+
+
+def test_cloud_sector_zero_dispersion_and_machine_account_filter():
+  """Cloud CRUD queries must guard against zero-stddev saturation and filter AD machine accounts ($)."""
+  eng = RiskMetricsEngine()
+  q_cloud = eng.build_fleet_360_sector_queries(entity_type="USER")["Cloud"]
+  assert 'not re.regex(principal.user.userid, "\\\\$$")' in q_cloud
+  assert "if($std_r > 0, $std_r, 1000000.0)" in q_cloud
+  assert "if($std_w > 0, $std_w, 1000000.0)" in q_cloud
+  assert "if($std_c > 0, $std_c, 1000000.0)" in q_cloud
+  assert "if($std_d > 0, $std_d, 1000000.0)" in q_cloud
+
+
+@pytest.mark.anyio
+async def test_jit_hunt_360_case_wall_ingests_udm_event_when_fleet_360_enabled(monkeypatch):
+  """Posting a 360° Case Wall report with D >= 3.0σ must also ingest a BEHAVIORAL_RISK_RADAR_360 UDM event."""
+  from unittest.mock import AsyncMock
+  from src.autonomous_hunter import AutonomousHunterEngine
+  from src.config import TenantConfig
+  from src.models import JITHuntRequest
+
+  tenant = TenantConfig(
+      project_id="test-proj",
+      customer_id="test-cust",
+      fleet_360_enabled=True,
+      fleet_360_ingest_events=True,
+      fleet_360_spike_threshold_z=3.0,
+  )
+  engine = AutonomousHunterEngine(tenant)
+  req = JITHuntRequest(
+      target_entity="admin",
+      entity_type="USER",
+      case_id="21558",
+      query="profile_360_risk",
+      lookback_days=14,
+      post_to_case_wall=True,
+  )
+
+  mock_radar_res = {
+      "entity": "admin",
+      "evaluated_day": "2026-10-20",
+      "composite_d": 3.54,
+      "calibrated_risk_index": 58,
+      "top_sector": "Cloud",
+      "is_outlier": True,
+      "outlier_sectors": ["Cloud", "Web"],
+      "sector_z_scores": {"Auth": 0.0, "Cloud": 2.51, "Workspace": 0.0, "Egress": 0.0, "DNS": 0.0, "Web": 2.51},
+      "sector_observed_counts": {"Auth": 0, "Cloud": 10, "Workspace": 0, "Egress": 0, "DNS": 0, "Web": 850},
+      "sector_baseline_avg": {"Cloud": 2.0, "Web": 200.0},
+      "sector_baseline_std": {"Cloud": 3.2, "Web": 259.0},
+      "verdict": "NOMINAL_BASELINE",
+  }
+
+  monkeypatch.setattr(
+      "src.autonomous_hunter.RiskMetricsEngine.run_360_behavioral_radar",
+      AsyncMock(return_value=mock_radar_res),
+  )
+  ingested_events = []
+  monkeypatch.setattr(
+      "src.autonomous_hunter.RiskMetricsEngine.ingest_udm_events",
+      lambda self, events: (ingested_events.extend(events) or {"status": "SUCCESS", "events_ingested": len(events), "batches": 1}),
+  )
+
+  mock_session = AsyncMock()
+  mock_session.initialize = AsyncMock()
+  mock_session.__aenter__.return_value = mock_session
+
+  class MockContext:
+    async def __aenter__(self):
+      return (AsyncMock(), AsyncMock())
+    async def __aexit__(self, *args):
+      pass
+
+  monkeypatch.setattr("src.autonomous_hunter.streamable_http_client", lambda *args, **kwargs: MockContext())
+  monkeypatch.setattr("src.autonomous_hunter.ClientSession", lambda *args, **kwargs: mock_session)
+  monkeypatch.setattr("src.config.TenantConfig.get_auth_headers", lambda self: {"Authorization": "Bearer test"})
+
+  resp = await engine.execute_jit_hunt(req)
+  assert resp.status == "SUCCESS"
+  assert len(ingested_events) == 1
+  ev = ingested_events[0]
+  assert ev["metadata"]["product_event_type"] == "BEHAVIORAL_RISK_RADAR_360"
+  assert ev["principal"]["user"]["userid"] == "admin"
+  assert ev["security_result"][0]["risk_score"] == 58
+
+
+@pytest.mark.anyio
+async def test_workspace_triad_and_outcome_variable_alignment(monkeypatch):
+  """Verify run_workspace_triad, run_hybrid_enrichment, run_cloud_repository_scope, and run_dynamic_metric_pipeline align with v2.1.0 skill templates."""
+  from unittest.mock import AsyncMock
+  from src.config import TenantConfig
+  from src.risk_metrics_engine import RiskMetricsEngine
+  from src.stats_hunter_engine import StatsHunterEngine
+  from src.strategy_decider import StrategyDecider
+
+  # 1. StrategyDecider Workspace catalog must use valid v2.1.0 metric names
+  assert "workspace_network_bytes_inbound" not in StrategyDecider.FAMILY_SIGNALS["Workspace"]["metrics"]
+  assert "workspace_network_bytes_total" in StrategyDecider.FAMILY_SIGNALS["Workspace"]["metrics"]
+  assert "workspace_emails_sent_total" in StrategyDecider.FAMILY_SIGNALS["Workspace"]["metrics"]
+
+  eng = RiskMetricsEngine(TenantConfig(project_id="test-proj", customer_id="test-cust"))
+
+  # 2. run_workspace_triad renders workspace_activity_triad_3stage.yl2 and parses d_vs_fleet_sq
+  async def fake_ws_execute(session, query, start_iso, end_iso):
+    assert "metrics.workspace_auth_attempts_total" in query
+    assert "metrics.workspace_total_download_actions" in query
+    assert "metrics.workspace_total_change_actions" in query
+    return {
+        "stats": [{
+            "entity": "insider.user",
+            "d_vs_fleet_sq": 16.0,
+            "z1_vs_enterprise": 2.0,
+            "z2_vs_enterprise": 3.0,
+            "z3_vs_enterprise": 1.73,
+            "m1_observed": 12,
+            "m2_observed": 85,
+            "m3_observed": 19,
+        }]
+    }
+
+  monkeypatch.setattr(eng.runner, "execute_query_via_mcp", fake_ws_execute)
+  ws_res = await eng.run_workspace_triad(AsyncMock(), "insider.user", lookback_days=7)
+  assert ws_res["composite_z_score"] == 4.0  # sqrt(16.0)
+  assert ws_res["top_z_score"] == 4.0
+  assert ws_res["is_outlier"] is True
+  assert ws_res["download_z"] == 3.0
+  assert ws_res["change_z"] == 1.73
+  assert ws_res["email_z"] == 2.0
+  assert ws_res["observed_value"] == 116.0
+  assert "workspace_emails_sent_total" in ws_res["fusion_metrics"]
+
+  # 3. run_hybrid_enrichment parses macro_z_score & signature_diversity
+  async def fake_hybrid_execute(session, query, start_iso, end_iso):
+    return {"stats": [{"entity": "insider.user", "macro_z_score": 4.2, "signature_diversity": 2, "raw_event_count": 30}]}
+
+  monkeypatch.setattr(eng.runner, "execute_query_via_mcp", fake_hybrid_execute)
+  hyb_res = await eng.run_hybrid_enrichment(AsyncMock(), "insider.user", lookback_days=7)
+  assert hyb_res["macro_z_score"] == 4.2
+  assert hyb_res["distinct_micro_signatures"] == 2
+  assert hyb_res["is_outlier"] is True
+
+  # 4. run_cloud_repository_scope parses obs & dest_z
+  async def fake_repo_execute(session, query, start_iso, end_iso):
+    return {"stats": [{"entity": "sa@proj.iam.gserviceaccount.com", "obs": 44, "dest_z": 3.8, "origin_z": 2.9}]}
+
+  monkeypatch.setattr(eng.runner, "execute_query_via_mcp", fake_repo_execute)
+  repo_res = await eng.run_cloud_repository_scope(AsyncMock(), "sa@proj.iam.gserviceaccount.com", lookback_days=7)
+  assert repo_res["observed_events"] == 44.0
+  assert repo_res["composite_risk"] == 3.8
+  assert repo_res["fold_change"] == 3.8
+  assert repo_res["top_z_score"] == 3.8
+  assert repo_res["is_outlier"] is True
+
+  # 5. run_dynamic_metric_pipeline extracts specialized score_key (cusum_drift_score) ahead of personal_z
+  async def fake_cusum_execute(session, query, start_iso, end_iso):
+    return {"stats": [{"entity": "user1", "cusum_drift_score": 3.7, "daily_excess_z": 1.2, "obs": 25, "avg_base": 5.0}]}
+
+  monkeypatch.setattr(eng.runner, "execute_query_via_mcp", fake_cusum_execute)
+  cusum_res = await eng.run_dynamic_metric_pipeline(
+      AsyncMock(),
+      entity="user1",
+      model_name="LONGITUDINAL_CUSUM_DRIFT",
+      target_metric="dns_queries_fail",
+      lookback_days=7,
+  )
+  assert cusum_res["top_z_score"] == 3.7
+  assert cusum_res["observed_value"] == 25.0
+  assert cusum_res["is_outlier"] is True
+
+  # 6. StatsHunterEngine outcome alignment (poisson_z_sq, distance_km, z_score & producer_ratio)
+  stats_eng = StatsHunterEngine(TenantConfig(project_id="test-proj", customer_id="test-cust"))
+
+  async def fake_poisson_rare(session, query, start_iso, end_iso):
+    return {"stats": [{"entity": "admin1", "poisson_z_sq": 16.0, "obs_count": 9}]}
+
+  monkeypatch.setattr(stats_eng.runner, "execute_query_via_mcp", fake_poisson_rare)
+  pr_res = await stats_eng.run_poisson_rare_surge(AsyncMock(), "admin1", lookback_days=7)
+  assert pr_res["poisson_z"] == 4.0  # sqrt(16.0)
+  assert pr_res["is_outlier"] is True
+
+  async def fake_travel(session, query, start_iso, end_iso):
+    return {"stats": [{"entity": "traveler", "distance_km": 4250.5, "distinct_cities": 3, "distinct_countries": 2}]}
+
+  monkeypatch.setattr(stats_eng.runner, "execute_query_via_mcp", fake_travel)
+  tr_res = await stats_eng.run_impossible_travel_velocity(AsyncMock(), "traveler", lookback_days=7)
+  assert tr_res["distance_km"] == 4250.5
+  assert tr_res["max_distance_km"] == 4250.5
+  assert tr_res["is_outlier"] is True
+
+  async def fake_pc(session, query, start_iso, end_iso):
+    return {"stats": [{"entity": "10.0.0.5", "z_score": 4.5, "producer_ratio": 0.92, "sent_bytes": 9200000}]}
+
+  monkeypatch.setattr(stats_eng.runner, "execute_query_via_mcp", fake_pc)
+  pc_res = await stats_eng.run_producer_consumer_inversion(AsyncMock(), "10.0.0.5", lookback_days=7)
+  assert pc_res["pcr_z_score"] == 4.5
+  assert pc_res["producer_ratio"] == 0.92
+  assert pc_res["is_outlier"] is True
+
+
+
+
 
 
