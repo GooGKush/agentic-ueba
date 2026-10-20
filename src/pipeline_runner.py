@@ -20,6 +20,11 @@ import httpx
 from mcp import ClientSession
 
 from src.config import TenantConfig, get_skills_root
+from src.query_integrity_gate import (
+    ChronicleBackendQueryError,
+    QueryIntegrityGate,
+    QueryValidationError,
+)
 
 logger = logging.getLogger("PipelineRunner")
 
@@ -179,11 +184,36 @@ class PipelineRunner:
         scoped_body = re.sub(target_pattern, f'\\1= "{target_entity}"', stage_body, count=1)
       else:
         scoped_body = re.sub(
-            r'(\$(?:entity|user|host|asset|sa)\s*)!=\s*""',
+            r'(\$(?:entity|user|host|asset|sa|src_ip)\s*)!=\s*""',
             f'\\1= "{target_entity}"',
             stage_body,
             count=1,
         )
+        # Fallback for raw UDM stages without a `!= ""` guard (e.g. c2_beaconing_jitter_2stage.yl2
+        # or `$e.principal.asset.hostname = $host` / `$e.principal.user.userid != ""`).
+        if scoped_body == stage_body and (
+            "metadata.event_type" in stage_body or "$e." in stage_body
+        ):
+          scoped_body = re.sub(
+              r'((?:\$[a-zA-Z0-9_]+\.)?(?:principal|target|src)\.(?:asset\.)?(?:hostname|ip|user\.userid)\s*=\s*(\$(?:entity|user|host|asset|sa|src_ip))\b)',
+              f'\\1\n    \\2 = "{target_entity}"',
+              stage_body,
+              count=1,
+          )
+          if scoped_body == stage_body:
+            scoped_body = re.sub(
+                r'((\$(?:entity|user|host|asset|sa|src_ip))\s*=\s*(?:\$[a-zA-Z0-9_]+\.)?(?:principal|target|src)\.(?:asset\.)?(?:hostname|ip|user\.userid)\b)',
+                f'\\1\n    \\2 = "{target_entity}"',
+                stage_body,
+                count=1,
+            )
+          if scoped_body == stage_body:
+            scoped_body = re.sub(
+                r'((?:\$[a-zA-Z0-9_]+\.)?(?:principal|target|src)\.(?:asset\.)?(?:hostname|ip|user\.userid)\s*)!=\s*""',
+                f'\\1= "{target_entity}"',
+                stage_body,
+                count=1,
+            )
       return f"stage {stage_name} {{{scoped_body}}}"
 
     return re.sub(r"stage\s+([a-zA-Z0-9_]+)\s*\{(.*?)\}", _scope_stage, query, flags=re.DOTALL)
@@ -269,8 +299,19 @@ class PipelineRunner:
       query: str,
       start_iso: str,
       end_iso: str,
+      expected_entity: Optional[str] = None,
+      expected_preflight_query: Optional[str] = None,
   ) -> Dict[str, Any]:
     """Executes a multi-stage YARA-L search query against Chronicle OneMCP."""
+    # Pre-dispatch QueryIntegrityGate check (no silent query mutation)
+    QueryIntegrityGate.verify_pre_dispatch(
+        query,
+        expected_entity=expected_entity,
+        expected_preflight_query=expected_preflight_query,
+        ast_validator_fn=self.validate_ast,
+        raise_on_error=True,
+    )
+
     tool_args = {
         "query": query,
         "startTime": start_iso,
@@ -279,24 +320,128 @@ class PipelineRunner:
         "customerId": self.tenant.customer_id,
         "region": self.tenant.region,
     }
-    # Preflight Malachite AST validation check
-    ast_errors = self.validate_ast(query)
-    crit_errors = [e for e in ast_errors if not e.startswith("MISSING_GOAL_HEADER")]
-    if crit_errors:
-      logger.warning(f"Malachite AST preflight invariant warnings: {crit_errors}")
 
     query_preview = " ".join(query[:120].split())
     logger.info(f"Executing query over OneMCP: {query_preview}...")
-    res = await session.call_tool("udm_search", tool_args)
-    if not res.content:
-      return {"stats": [], "events": []}
 
+    max_attempts = 2
+    for attempt in range(max_attempts):
+      res = await session.call_tool("udm_search", tool_args)
+      if not res.content:
+        return {"stats": [], "events": []}
+
+      raw_text = res.content[0].text if hasattr(res.content[0], "text") else ""
+      if not raw_text or not raw_text.strip():
+        return {"stats": [], "events": []}
+
+      is_error_flag = bool(getattr(res, "isError", False))
+      try:
+        parsed = json.loads(raw_text)
+      except Exception as e:
+        logger.warning(f"udm_search returned non-JSON text ({e}): {raw_text[:160]}")
+        parsed = {"raw_text": raw_text, "stats": [], "events": []}
+
+      try:
+        QueryIntegrityGate.verify_backend_response(
+            query,
+            parsed,
+            raw_text=raw_text,
+            is_error_flag=is_error_flag,
+            raise_on_error=True,
+        )
+        return parsed
+      except ChronicleBackendQueryError:
+        if attempt + 1 >= max_attempts:
+          raise
+        logger.warning(
+            f"Retrying udm_search after ChronicleBackendQueryError (attempt {attempt + 1}/{max_attempts})"
+        )
+
+    return {"stats": [], "events": []}
+
+  async def materialize_bridge_data_table(
+      self,
+      session: ClientSession,
+      table_name: str,
+      rows: List[Dict[str, Any]],
+      columns: Optional[List[str]] = None,
+      description: str = "Agentic UEBA Hunt Bridge Table",
+  ) -> Dict[str, Any]:
+    """Creates/updates a Chronicle Data Table (`%<table_name>`) for stateful multi-query bridging."""
+    clean_name = table_name.lstrip("%").strip()
+    if not columns:
+      if rows:
+        columns = list(rows[0].keys())
+      else:
+        columns = ["entity", "risk_tier", "cri_score", "primary_vector"]
+
+    col_info = [
+        {"columnIndex": idx, "originalColumn": col, "columnType": "STRING"}
+        for idx, col in enumerate(columns)
+    ]
+    create_args = {
+        "name": clean_name,
+        "description": description,
+        "columnInfo": col_info,
+        "projectId": self.tenant.project_id,
+        "customerId": self.tenant.customer_id,
+        "region": self.tenant.region,
+    }
+    created = False
+    try:
+      await session.call_tool("create_data_table", create_args)
+      created = True
+    except Exception as e:
+      logger.debug(f"create_data_table '{clean_name}' skipped/existing: {e}")
+
+    formatted_rows = [
+        {"values": [str(r.get(col, "")) for col in columns]}
+        for r in rows
+    ]
+    added_count = 0
+    if formatted_rows:
+      add_args = {
+          "tableName": clean_name,
+          "rows": formatted_rows,
+          "projectId": self.tenant.project_id,
+          "customerId": self.tenant.customer_id,
+          "region": self.tenant.region,
+      }
+      await session.call_tool("add_rows_to_data_table", add_args)
+      added_count = len(formatted_rows)
+
+    return {
+        "table_name": clean_name,
+        "columns": columns,
+        "created": created,
+        "rows_added": added_count,
+    }
+
+  async def fetch_data_table_rows(
+      self,
+      session: ClientSession,
+      table_name: str,
+  ) -> List[Dict[str, Any]]:
+    """Lists rows from a Chronicle Data Table (`%<table_name>`) via OneMCP."""
+    clean_name = table_name.lstrip("%").strip()
+    list_args = {
+        "tableName": clean_name,
+        "projectId": self.tenant.project_id,
+        "customerId": self.tenant.customer_id,
+        "region": self.tenant.region,
+    }
+    res = await session.call_tool("list_data_table_rows", list_args)
+    if not res or not getattr(res, "content", None):
+      return []
     raw_text = res.content[0].text if hasattr(res.content[0], "text") else ""
     if not raw_text or not raw_text.strip():
-      return {"stats": [], "events": []}
-
+      return []
     try:
-      return json.loads(raw_text)
+      data = json.loads(raw_text)
+      if isinstance(data, list):
+        return data
+      if isinstance(data, dict):
+        return data.get("dataTableRows", data.get("rows", []))
     except Exception as e:
-      logger.warning(f"udm_search returned non-JSON text ({e}): {raw_text[:160]}")
-      return {"raw_text": raw_text, "stats": [], "events": []}
+      logger.warning(f"list_data_table_rows returned non-JSON ({e}): {raw_text[:160]}")
+    return []
