@@ -1927,4 +1927,216 @@ async def test_v201_email_to_userid_identity_resolution(monkeypatch):
   assert len(captured_queries) == 1
 
 
+@pytest.mark.anyio
+async def test_query_integrity_gate_and_data_table_bridge(monkeypatch):
+  from unittest.mock import AsyncMock, MagicMock
+  from src.config import TenantConfig
+  from src.pipeline_runner import PipelineRunner
+  from src.query_integrity_gate import (
+      ChronicleBackendQueryError,
+      QueryIntegrityGate,
+      QueryValidationError,
+  )
+
+  runner = PipelineRunner(TenantConfig(project_id="test-proj", customer_id="test-cust"))
+
+  # 1. Pre-dispatch gate catches unresolved placeholder
+  with pytest.raises(QueryValidationError, match="UNRESOLVED_TEMPLATE_PLACEHOLDERS"):
+    QueryIntegrityGate.verify_pre_dispatch(
+        'stage s1 {\n  metadata.event_type = "{{event_type}}"\n  match: $user\n}'
+    )
+
+  # 2. Pre-dispatch gate catches preflight query mutation
+  with pytest.raises(QueryValidationError, match="PREFLIGHT_QUERY_MUTATION"):
+    QueryIntegrityGate.verify_pre_dispatch(
+        'stage s1 {\n  metadata.event_type = "USER_LOGIN"\n  match: $user\n}',
+        expected_preflight_query='stage s1 {\n  metadata.event_type = "NETWORK_CONNECTION"\n  match: $user\n}',
+    )
+
+  # 3. Pre-dispatch gate catches missing entity filter when expected_entity is provided
+  with pytest.raises(QueryValidationError, match="MISSING_ENTITY_FILTER"):
+    QueryIntegrityGate.verify_pre_dispatch(
+        'stage s1 {\n  metadata.event_type = "USER_LOGIN"\n  match: $user\n}',
+        expected_entity="alice.smith",
+    )
+
+  # 4. Pre-dispatch gate catches bare %table without .<column>
+  with pytest.raises(QueryValidationError, match="INVALID_DATA_TABLE_COLUMN_SYNTAX"):
+    QueryIntegrityGate.verify_pre_dispatch(
+        'stage s1 {\n  metadata.event_type = "USER_LOGIN"\n  $user in %ueba_hunt_bridge\n  match: $user\n}'
+    )
+
+  # Valid %table.column syntax passes pre-dispatch gate
+  res_ok = QueryIntegrityGate.verify_pre_dispatch(
+      'stage s1 {\n  metadata.event_type = "USER_LOGIN"\n  $user in %ueba_hunt_bridge.entity\n  $user = "alice.smith"\n  match: $user\n}',
+      expected_entity="alice.smith",
+  )
+  assert res_ok["passed"] is True
+
+  # 5. Post-execution gate catches Chronicle compiler error and retries in execute_query_via_mcp
+  call_count = 0
+
+  async def mock_call_tool(tool_name, args):
+    nonlocal call_count
+    call_count += 1
+    m = MagicMock()
+    if tool_name == "udm_search" and call_count == 1:
+      m.isError = False
+      m.content = [MagicMock(text='{"error": {"message": "invalid argument: syntax error at line 3"}}')]
+      return m
+    if tool_name == "udm_search":
+      m.isError = False
+      m.content = [MagicMock(text='{"stats": [{"user": "alice.smith", "z": 3.8}]}')]
+      return m
+    if tool_name == "list_data_table_rows":
+      m.isError = False
+      m.content = [MagicMock(text='{"rows": [{"values": ["alice.smith", "CRITICAL", "88"]}]}')]
+      return m
+    m.isError = False
+    m.content = [MagicMock(text='{"status": "OK"}')]
+    return m
+
+  mock_session = AsyncMock()
+  mock_session.call_tool = mock_call_tool
+
+  valid_q = 'stage s1 {\n  metadata.event_type = "USER_LOGIN"\n  $user = "alice.smith"\n  match: $user\n  outcome: $c = count(metadata.id)\n}\n$user = $s1.user\nmatch: $user\noutcome: $z = max($s1.c)'
+  resp = await runner.execute_query_via_mcp(
+      mock_session,
+      valid_q,
+      "2026-10-01T00:00:00Z",
+      "2026-10-08T00:00:00Z",
+      expected_entity="alice.smith",
+  )
+  assert call_count == 2
+  assert resp["stats"][0]["user"] == "alice.smith"
+
+  # 6. Persistent backend compiler error raises ChronicleBackendQueryError after 2 attempts
+  async def mock_always_error(tool_name, args):
+    m = MagicMock()
+    m.isError = True
+    m.content = [MagicMock(text="compilation error: semantic error in stage s1")]
+    return m
+
+  mock_session_err = AsyncMock()
+  mock_session_err.call_tool = mock_always_error
+  with pytest.raises(ChronicleBackendQueryError, match="CHRONICLE_BACKEND_QUERY_ERROR"):
+    await runner.execute_query_via_mcp(
+        mock_session_err,
+        valid_q,
+        "2026-10-01T00:00:00Z",
+        "2026-10-08T00:00:00Z",
+    )
+
+  # 7. Data Table materialization and row retrieval
+  mat = await runner.materialize_bridge_data_table(
+      mock_session,
+      "%ueba_hunt_bridge",
+      [{"entity": "alice.smith", "risk_tier": "CRITICAL", "cri_score": "88"}],
+  )
+  assert mat["table_name"] == "ueba_hunt_bridge"
+  assert mat["rows_added"] == 1
+  rows = await runner.fetch_data_table_rows(mock_session, "%ueba_hunt_bridge")
+  assert len(rows) == 1
+
+
+@pytest.mark.anyio
+async def test_stats_hunter_entity_scoping_and_new_archetypes(monkeypatch):
+  from unittest.mock import AsyncMock
+  from src.config import TenantConfig
+  from src.pipeline_runner import PipelineRunner
+  from src.stats_hunter_engine import StatsHunterEngine
+
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  engine = StatsHunterEngine(tenant)
+  captured_queries = []
+
+  async def fake_exec(session, query, start_iso, end_iso):
+    captured_queries.append(query)
+    return {
+        "stats": [
+            {
+                "cv": 0.12,
+                "dst_ip": "198.51.100.42",
+                "fano_factor": 6.5,
+                "poisson_z": 4.2,
+                "markov_threat_score": 4.8,
+                "surprisal_score": 3.9,
+                "shannon_entropy_score": 6.4,
+                "zipf_rarity_score": 4.5,
+                "ewma_velocity_score": 4.1,
+                "velocity_kmh": 1450.0,
+                "user": "traveler.user",
+                "pcr_z_score": 4.3,
+                "entity": "wkstn-pivot-09",
+            }
+        ]
+    }
+
+  monkeypatch.setattr(engine.runner, "execute_query_via_mcp", fake_exec)
+  mock_session = AsyncMock()
+
+  # Verify $e.-prefixed raw UDM stage scoping works
+  e_prefixed = (
+      'stage raw_stage {\n'
+      '  $e.metadata.event_type = "PROCESS_LAUNCH"\n'
+      '  $e.principal.asset.hostname = $host\n'
+      '  match: $host\n'
+      '  outcome: $c = count($e.metadata.id)\n'
+      '}'
+  )
+  scoped_e = PipelineRunner.scope_query_to_entity(e_prefixed, "wkstn-e-01", entity_type="ASSET")
+  assert '$host = "wkstn-e-01"' in scoped_e
+
+  # 1. C2 Beaconing Jitter scopes $src_ip
+  r1 = await engine.run_c2_beaconing_jitter(mock_session, src_ip="10.10.20.55")
+  assert '$src_ip = "10.10.20.55"' in r1["executed_query"]
+  assert r1["is_outlier"] is True
+
+  # 2. Poisson Burst Clustering scopes $entity
+  r2 = await engine.run_poisson_burst_clustering(mock_session, entity="spray.victim")
+  assert '"spray.victim"' in r2["executed_query"]
+  assert r2["is_outlier"] is True
+
+  # 3. Poisson Rare Surge resolves all placeholders and scopes $entity
+  r3 = await engine.run_poisson_rare_surge(mock_session, entity="admin.rare")
+  assert '"admin.rare"' in r3["executed_query"]
+  assert "{{" not in r3["executed_query"]
+  assert r3["is_outlier"] is True
+
+  # 4. Markov Transition Rarity scopes $entity
+  r4 = await engine.run_markov_transition_rarity(mock_session, host="wkstn-markov-01")
+  assert '"wkstn-markov-01"' in r4["executed_query"]
+  assert r4["is_outlier"] is True
+
+  # 5. Shannon Character Entropy scopes $entity
+  r5 = await engine.run_shannon_character_entropy(mock_session, entity="wkstn-entropy-01")
+  assert '"wkstn-entropy-01"' in r5["executed_query"]
+  assert r5["is_outlier"] is True
+
+  # 6. Zipfian Process Rarity scopes $entity
+  r6 = await engine.run_zipfian_process_rarity(mock_session, host="wkstn-zipf-01")
+  assert '"wkstn-zipf-01"' in r6["executed_query"]
+  assert r6["is_outlier"] is True
+
+  # 7. EWMA Burst Velocity scopes $entity
+  r7 = await engine.run_ewma_burst_velocity(mock_session, entity="10.20.30.99")
+  assert '"10.20.30.99"' in r7["executed_query"]
+  assert r7["is_outlier"] is True
+
+  # 8. Impossible Travel Geo Velocity
+  r8 = await engine.run_impossible_travel_velocity(mock_session, user_id="traveler.user")
+  assert r8["model"] == "IMPOSSIBLE_TRAVEL_GEO_VELOCITY"
+  assert '"traveler.user"' in r8["executed_query"]
+  assert r8["velocity_kmh"] == 1450.0
+  assert r8["is_outlier"] is True
+
+  # 9. Producer-Consumer Ratio Inversion
+  r9 = await engine.run_producer_consumer_inversion(mock_session, hostname="wkstn-pivot-09")
+  assert r9["model"] == "PRODUCER_CONSUMER_RATIO_INVERSION"
+  assert '"wkstn-pivot-09"' in r9["executed_query"]
+  assert r9["pcr_z_score"] == 4.3
+  assert r9["is_outlier"] is True
+
+
+
 

@@ -1,8 +1,8 @@
 # 🛡️ Agentic UEBA: Autonomous SecOps Threat Hunter & 360° Behavioral Risk Radar
 
-[![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE) [![Unit Tests](https://img.shields.io/badge/unit%20tests-67%2F67%20passing%20(100%25)-brightgreen.svg)](tests/)
+[![Version](https://img.shields.io/badge/version-v2.1.0-blue.svg)](README.md) [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE) [![Unit Tests](https://img.shields.io/badge/unit%20tests-69%2F69%20passing%20(100%25)-brightgreen.svg)](tests/)
 
-**Agentic UEBA** (`secops-agentic-hunter`) is an autonomous, dual-interface threat hunting and behavioral risk service for **Google Security Operations (Chronicle SIEM & SOAR)**. It embeds the canonical **`secops-risk-metrics-multistage`** (`v2.0.2+`) and **`secops-statistical-hunter`** (`v2.7.5+`) skills to provide continuous tenant-wide behavioral baselining, automated SOAR case triage with 6-pillar HTML/SVG Case Wall reporting, and Just-In-Time (JIT) playbook and MCP execution.
+**Agentic UEBA** (`secops-agentic-hunter`) is an autonomous, dual-interface threat hunting and behavioral risk service for **Google Security Operations (Chronicle SIEM & SOAR)**. It embeds the canonical **`secops-risk-metrics-multistage`** (`v2.1.0+`) and **`secops-statistical-hunter`** (`v2.8.0+`) skills to provide continuous tenant-wide behavioral baselining, automated SOAR case triage with 6-pillar HTML/SVG Case Wall reporting, and Just-In-Time (JIT) playbook and MCP execution.
 
 ---
 
@@ -278,15 +278,16 @@ agentic_ueba/
 │   ├── autonomous_hunter.py            # 3-Stage investigation orchestrator + Gemini ReAct loop
 │   ├── strategy_decider.py             # 360° warrant analyzer & Tier 2A -> Tier 2B epistemic pivot router
 │   ├── risk_metrics_engine.py          # 30d UEBA engine, Fleet 360° sweep, & BEHAVIORAL_RISK_RADAR_360 ingestor
-│   ├── stats_hunter_engine.py          # Inline raw-log statistical engine (C2 CV, Fano, Shannon, Markov, Zipf, EWMA)
-│   ├── pipeline_runner.py              # Template renderer, Malachite AST validator, & hybrid engine bridge
+│   ├── stats_hunter_engine.py          # Inline raw-log statistical engine (C2 CV, Fano, Shannon, Markov, Zipf, EWMA, Impossible Travel, Producer-Consumer)
+│   ├── pipeline_runner.py              # Template renderer, Malachite AST validator, Data Table bridge, & hybrid engine bridge
+│   ├── query_integrity_gate.py         # Pre-dispatch AST/entity/slot/Data-Table validator & post-execution backend error gate
 │   ├── dynamic_protocol_adapter.py     # Runtime SKILL.md protocol adapter with reference offloading
 │   ├── federated_bridge.py             # Cross-skill Macro-to-Micro handoff bridge
 │   ├── watchdog.py                     # Standing case scanner, worker pool, & 4-hour Fleet 360° scheduler
 │   └── formatters/
 │       ├── __init__.py
 │       └── case_wall_card.py           # Chronicle SOAR Case Wall HTML/SVG card formatter & sanitizer
-└── tests/                              # Unit & contract test suite (67 tests)
+└── tests/                              # Unit & contract test suite (69 tests)
     ├── test_engines.py
     ├── test_metric_args.py
     ├── test_protocol_adapter.py
@@ -298,7 +299,7 @@ agentic_ueba/
 ## 🧪 Local Development & Testing
 
 ```bash
-# Run the full 67-test unit and schema contract suite
+# Run the full 69-test unit and schema contract suite
 pytest tests/ -q
 
 # Start the server locally on port 8080
