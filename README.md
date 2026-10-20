@@ -1,5 +1,7 @@
 # 🛡️ Agentic UEBA: Autonomous SecOps Threat Hunter & 360° Behavioral Risk Radar
 
+[![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE) [![Unit Tests](https://img.shields.io/badge/unit%20tests-67%2F67%20passing%20(100%25)-brightgreen.svg)](tests/)
+
 **Agentic UEBA** (`secops-agentic-hunter`) is an autonomous, dual-interface threat hunting and behavioral risk service for **Google Security Operations (Chronicle SIEM & SOAR)**. It embeds the canonical **`secops-risk-metrics-multistage`** (`v2.0.2+`) and **`secops-statistical-hunter`** (`v2.7.5+`) skills to provide continuous tenant-wide behavioral baselining, automated SOAR case triage with 6-pillar HTML/SVG Case Wall reporting, and Just-In-Time (JIT) playbook and MCP execution.
 
 ---
@@ -259,6 +261,7 @@ gcloud run deploy secops-agentic-hunter \
 agentic_ueba/
 ├── README.md                           # Operational guide, API reference, & Cloud Run hosting instructions
 ├── ARCHITECTURE.md                     # Deep-dive system architecture, data contracts, & mathematical models
+├── LICENSE                             # Apache 2.0 License
 ├── Dockerfile                          # Production Python 3.13 container baking in canonical skills
 ├── cloudbuild.yaml                     # Cloud Build CI/CD pipeline (tests -> skill staging -> image build)
 ├── requirements.txt                    # Runtime Python dependencies
@@ -301,3 +304,20 @@ pytest tests/ -q
 # Start the server locally on port 8080
 uvicorn src.server:app --host 0.0.0.0 --port 8080
 ```
+
+---
+
+## 📜 License
+This project is licensed under the [Apache License 2.0](LICENSE).
+```
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+```
+
+---
+*Created and maintained by Greg Kushmerek for Google Security Operations (Chronicle SIEM & SOAR).*
