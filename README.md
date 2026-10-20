@@ -181,6 +181,8 @@ Connect any MCP client (Streamable HTTP) to `https://<YOUR_SERVICE_URL>/mcp`. Av
 | | `hunt_markov_transition` | Rare Living-off-the-Land parent$\rightarrow$child process transitions via Markov 2-gram surprisal. |
 | | `hunt_zipfian_rarity` | Rare administrative binary execution in the enterprise Zipfian power-law tail. |
 | | `hunt_ewma_burst` | Acute intraday kinetic rate surges via EWMA velocity divergence. |
+| | `hunt_impossible_travel` | Supersonic geodesic travel velocity (`math.geo_distance >= 900 km/h`) across consecutive logins. |
+| | `hunt_producer_consumer_inversion` | Endpoints shifting from net data consumers to net data producers ($\rho \ge 0.80$ + $Z$-score spike). |
 
 ---
 

@@ -363,6 +363,50 @@ async def hunt_ewma_burst(
 
 
 @mcp.tool()
+async def hunt_impossible_travel(
+    username: str,
+    case_id: Optional[str] = None,
+    lookback_days: int = 14,
+    post_to_case_wall: bool = True,
+) -> Dict[str, Any]:
+  """Statistical Hunter (v2.8.0): Detects supersonic geodesic travel velocity (math.geo_distance >= 900 km/h) across consecutive logins."""
+  req = JITHuntRequest(
+      target_entity=username,
+      entity_type="USER",
+      alert_name="Impossible Travel Geodesic Velocity Investigation",
+      query="impossible_travel",
+      skill="stats-hunter",
+      lookback_days=lookback_days,
+      case_id=case_id,
+      post_to_case_wall=post_to_case_wall,
+  )
+  resp = await engine.execute_jit_hunt(req)
+  return resp.model_dump()
+
+
+@mcp.tool()
+async def hunt_producer_consumer_inversion(
+    host: str,
+    case_id: Optional[str] = None,
+    lookback_days: int = 14,
+    post_to_case_wall: bool = True,
+) -> Dict[str, Any]:
+  """Statistical Hunter (v2.8.0): Detects endpoints shifting from net data consumers to net data producers (sent/total bytes >= 0.80 + Z-score spike)."""
+  req = JITHuntRequest(
+      target_entity=host,
+      entity_type="HOST",
+      alert_name="Producer-Consumer Byte Ratio Inversion Investigation",
+      query="producer_consumer_inversion",
+      skill="stats-hunter",
+      lookback_days=lookback_days,
+      case_id=case_id,
+      post_to_case_wall=post_to_case_wall,
+  )
+  resp = await engine.execute_jit_hunt(req)
+  return resp.model_dump()
+
+
+@mcp.tool()
 async def get_case_activity(timeframe: str = "1h", tag: Optional[str] = None) -> Dict[str, Any]:
   """Returns an activity summary report of cases touched by the agent (e.g. '1h', '24h', '7d', 'all'), optionally filtered by tag (e.g. 'RISK:CRITICAL', 'RISK:HIGH', 'VECTOR:EGRESS', 'SECOND_ORDER_HUNT')."""
   return watchdog.state.get_activity_report(timeframe=timeframe, tag=tag)
