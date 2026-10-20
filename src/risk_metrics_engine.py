@@ -2389,10 +2389,11 @@ order:
   ) -> Dict[str, Any]:
     """Builds the single 360 Radar UDM event for one outlier entity.
 
-    Carries only: composite CRI, composite distance D (in sigma), and each of the
-    6 sector vectors as "CRI <n> | Z <z>". `event_timestamp` is the time the sweep
-    ran the query (the 30d baseline is evaluated as of that moment);
-    `evaluated_day` is the UTC day bucket that was scored.
+    Carries unbundled roll-up labels (`Peak Vector`, `Peak CRI`, `Peak Z`,
+    `Breached Vectors`) in `target.resource.attribute.labels`, the composite
+    roll-up in `security_result[0]` (`rule_type = "COMPOSITE_360"`), and one
+    `SECTOR_VECTOR` entry per non-zero vector in `security_result[1..N]` sorted
+    descending by Z-score with native `risk_score` (CRI) and `confidence_score` (Z).
     """
     is_asset = entity_type.upper() in ("ASSET", "HOST", "IP")
     norm_type = "ASSET" if is_asset else "USER"
@@ -2405,18 +2406,20 @@ order:
       vectors.append((sec.upper(), z_val, cri))
 
     peak_name, peak_z, peak_cri = max(vectors, key=lambda v: v[1])
-    breached = [v[0] for v in sorted(vectors, key=lambda v: v[1], reverse=True)
-                if v[1] >= spike_threshold_z]
+    sorted_vectors = sorted(vectors, key=lambda v: v[1], reverse=True)
+    breached = [v[0] for v in sorted_vectors if v[1] >= spike_threshold_z]
+    active_vectors = [(name, z, cri) for name, z, cri in sorted_vectors if z > 0.0 and cri > 0]
 
     labels = [
         {"key": "Hunt Campaign ID", "value": campaign_id},
         {"key": "Evaluated Day", "value": evaluated_day},
         {"key": "Composite CRI", "value": str(composite_cri)},
         {"key": "Composite D", "value": f"{composite_d:.2f}"},
+        {"key": "Peak Vector", "value": peak_name},
+        {"key": "Peak CRI", "value": str(peak_cri)},
+        {"key": "Peak Z", "value": f"{peak_z:.2f}"},
+        {"key": "Breached Vectors", "value": ", ".join(breached) or "none"},
     ]
-    labels.extend(
-        {"key": name, "value": f"CRI {cri} | Z {z:.2f}"} for name, z, cri in vectors
-    )
 
     principal = (
         {"hostname": entity_id, "asset": {"hostname": entity_id}}
@@ -2427,6 +2430,31 @@ order:
         f"{norm_type} {entity_id}: Composite CRI {composite_cri} (D={composite_d:.2f}σ); "
         f"breached {', '.join(breached) or 'none'}; peak {peak_name} CRI {peak_cri} (Z {peak_z:.2f})."
     )
+
+    security_results: List[Dict[str, Any]] = [
+        {
+            "rule_name": "360 Behavioral Risk Radar",
+            "rule_type": "COMPOSITE_360",
+            "category": [self.RADAR_360_CATEGORY_BY_SECTOR.get(peak_name, "POLICY_VIOLATION")],
+            "action": ["UNKNOWN_ACTION"],
+            "risk_score": int(composite_cri),
+            "severity": self.derive_cri_severity(composite_cri),
+            "summary": summary,
+        }
+    ]
+    for vec_name, vec_z, vec_cri in active_vectors:
+      security_results.append({
+          "rule_name": f"360 Vector: {vec_name}",
+          "rule_type": "SECTOR_VECTOR",
+          "threat_name": vec_name,
+          "category": [self.RADAR_360_CATEGORY_BY_SECTOR.get(vec_name, "POLICY_VIOLATION")],
+          "action": ["UNKNOWN_ACTION"],
+          "risk_score": int(vec_cri),
+          "confidence_score": round(float(vec_z), 2),
+          "severity": self.derive_cri_severity(vec_cri),
+          "threat_status": "ACTIVE" if vec_z >= spike_threshold_z else "CLEARED",
+          "summary": f"Vector {vec_name}: CRI {vec_cri} | Z {vec_z:.2f}σ",
+      })
 
     return {
         "metadata": {
@@ -2449,16 +2477,7 @@ order:
                 "attribute": {"labels": labels},
             }
         },
-        "security_result": [
-            {
-                "rule_name": "360 Behavioral Risk Radar",
-                "category": [self.RADAR_360_CATEGORY_BY_SECTOR.get(peak_name, "POLICY_VIOLATION")],
-                "action": ["UNKNOWN_ACTION"],
-                "risk_score": int(composite_cri),
-                "severity": self.derive_cri_severity(composite_cri),
-                "summary": summary,
-            }
-        ],
+        "security_result": security_results,
     }
 
   def ingest_udm_events(
