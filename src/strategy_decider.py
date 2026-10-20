@@ -278,6 +278,27 @@ class StrategyDecider:
           "sectors": ["Workspace", "Egress"],
           "fusion_metrics": ["workspace_total_download_actions", "network_bytes_outbound"],
       })
+    if "Workspace" in elevated and "Web" in elevated:
+      matched_archetypes.append({
+          "archetype": "EXFILTRATION_OVER_WEB_SERVICE",
+          "tactics": ["TA0009 Collection", "TA0010 Exfiltration"],
+          "sectors": ["Workspace", "Web"],
+          "fusion_metrics": ["workspace_total_download_actions", "http_queries_total"],
+      })
+    if "Web" in elevated and "Auth" in elevated and str(entity_type).upper() in ("ASSET", "HOST", "IP"):
+      matched_archetypes.append({
+          "archetype": "RECON_TO_INITIAL_ACCESS",
+          "tactics": ["TA0043 Reconnaissance", "TA0001 Initial Access"],
+          "sectors": ["Web", "Auth"],
+          "fusion_metrics": ["http_queries_fail", "auth_attempts_success"],
+      })
+    if "Cloud" in elevated and "Endpoint" in elevated:
+      matched_archetypes.append({
+          "archetype": "RESOURCE_DEV_TO_EXECUTION",
+          "tactics": ["TA0042 Resource Development", "TA0002 Execution"],
+          "sectors": ["Cloud", "Endpoint"],
+          "fusion_metrics": ["resource_creation_total", "file_executions_total"],
+      })
 
     # Companion entities for cross-entity kill-chain bridging
     primary_ent = str(ctx.get("primary_entity") or radar_result.get("entity") or "").lower()

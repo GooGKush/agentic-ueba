@@ -2180,6 +2180,134 @@ class AutonomousHunterEngine:
                 f"Deterministic EWMA fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
             )
 
+        # --- 10B. Deterministic Fast-Path: Impossible Travel Geodesic Velocity ---
+        elif "impossible_travel" in query_str or "geo_velocity" in query_str:
+          try:
+            geo_result = await StatsHunterEngine(tenant).run_impossible_travel_velocity(
+                session=session,
+                user_id=req.target_entity,
+                lookback_days=req.lookback_days,
+            )
+            cri = geo_result["calibrated_risk_index"]
+            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            markdown_report = (
+                f"# Impossible Travel Geodesic Velocity Analysis: {req.target_entity}\n\n"
+                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
+                f"**Max Velocity**: {geo_result['max_velocity_kmh']} km/h (Distance: {geo_result['max_distance_km']} km)\n"
+                f"**Is Outlier**: {geo_result['is_outlier']}\n\n"
+                f"## Forensic Details\n"
+                f"- Evaluated geodesic Haversine distance (`math.geo_distance`) and travel speed across consecutive login sessions.\n"
+            )
+            case_wall_updated = False
+            if req.case_id and req.post_to_case_wall:
+              await session.call_tool(
+                  "create_case_comment",
+                  {
+                      "projectId": tenant.project_id,
+                      "customerId": tenant.customer_id,
+                      "region": tenant.region,
+                      "caseId": str(req.case_id),
+                      "comment": self.sanitize_case_comment(markdown_report),
+                  },
+              )
+              case_wall_updated = True
+            return JITHuntResponse(
+                status="SUCCESS",
+                triage=TriageSummary(
+                    calibrated_risk_index=float(cri),
+                    verdict=verdict,
+                    is_outlier=geo_result["is_outlier"],
+                    primary_vector="impossible_travel_geo_velocity",
+                    top_z_score=float(geo_result.get("top_z_score", 0.0)),
+                    recommended_action="REVOKE_SESSIONS" if cri >= 80 else "MONITOR",
+                    entities_to_quarantine=[req.target_entity] if geo_result["is_outlier"] else [],
+                    mitre_tactics=["TA0001", "TA0006"] if geo_result["is_outlier"] else [],
+                ),
+                clean_hand_off=CleanHandOffPayload(
+                    target_entity=req.target_entity,
+                    entity_type=req.entity_type,
+                    evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    primary_model="secops-statistical-hunter",
+                    outlier_topology="IMPOSSIBLE_TRAVEL_GEO_VELOCITY",
+                    mitre_tactics_mapped=["TA0001", "TA0006"] if geo_result["is_outlier"] else [],
+                    recommended_swarm_playbook="CREDENTIAL_COMPROMISE_CONTAINMENT",
+                    escalation_action="REVOKE_SESSIONS" if cri >= 80 else "MONITOR",
+                ),
+                forensics=ForensicsSummary(
+                    executed_query=geo_result["executed_query"],
+                    markdown_report=markdown_report,
+                ),
+                case_wall_updated=case_wall_updated,
+            )
+          except Exception as fast_path_err:
+            logger.warning(
+                f"Deterministic Impossible Travel fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
+            )
+
+        # --- 10C. Deterministic Fast-Path: Producer-Consumer Byte Ratio Inversion ---
+        elif "producer_consumer" in query_str or "ratio_inversion" in query_str:
+          try:
+            pc_result = await StatsHunterEngine(tenant).run_producer_consumer_inversion(
+                session=session,
+                hostname=req.target_entity,
+                lookback_days=req.lookback_days,
+            )
+            cri = pc_result["calibrated_risk_index"]
+            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            markdown_report = (
+                f"# Producer-Consumer Byte Ratio Inversion Analysis: {req.target_entity}\n\n"
+                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
+                f"**Producer Ratio**: {pc_result['producer_ratio']} (Z-Score: {pc_result['top_z_score']}σ)\n"
+                f"**Is Outlier**: {pc_result['is_outlier']}\n\n"
+                f"## Forensic Details\n"
+                f"- Evaluated directional byte asymmetry (`sent / (sent + recv)`) and outbound byte baseline departure.\n"
+            )
+            case_wall_updated = False
+            if req.case_id and req.post_to_case_wall:
+              await session.call_tool(
+                  "create_case_comment",
+                  {
+                      "projectId": tenant.project_id,
+                      "customerId": tenant.customer_id,
+                      "region": tenant.region,
+                      "caseId": str(req.case_id),
+                      "comment": self.sanitize_case_comment(markdown_report),
+                  },
+              )
+              case_wall_updated = True
+            return JITHuntResponse(
+                status="SUCCESS",
+                triage=TriageSummary(
+                    calibrated_risk_index=float(cri),
+                    verdict=verdict,
+                    is_outlier=pc_result["is_outlier"],
+                    primary_vector="producer_consumer_ratio_inversion",
+                    top_z_score=float(pc_result.get("top_z_score", 0.0)),
+                    recommended_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
+                    entities_to_quarantine=[req.target_entity] if pc_result["is_outlier"] else [],
+                    mitre_tactics=["TA0009", "TA0010"] if pc_result["is_outlier"] else [],
+                ),
+                clean_hand_off=CleanHandOffPayload(
+                    target_entity=req.target_entity,
+                    entity_type=req.entity_type,
+                    evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    primary_model="secops-statistical-hunter",
+                    outlier_topology="PRODUCER_CONSUMER_RATIO_INVERSION",
+                    mitre_tactics_mapped=["TA0009", "TA0010"] if pc_result["is_outlier"] else [],
+                    recommended_swarm_playbook="DATA_STAGING_EXFIL_CONTAINMENT",
+                    escalation_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
+                ),
+                forensics=ForensicsSummary(
+                    executed_query=pc_result["executed_query"],
+                    markdown_report=markdown_report,
+                ),
+                case_wall_updated=case_wall_updated,
+            )
+          except Exception as fast_path_err:
+            logger.warning(
+                f"Deterministic Producer-Consumer fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
+            )
+
         # --- 11. Deterministic Fast-Path: Cross-Vector / Roll-Up Sector Fusion ---
         elif "sector_fusion" in query_str or "fusion" in query_str:
           try:
