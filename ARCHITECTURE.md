@@ -296,6 +296,7 @@ create_case_comment / SOAR Rule Trigger]
 agentic_ueba/
 ├── README.md                           # Operational guide, API reference, & Cloud Run hosting instructions
 ├── ARCHITECTURE.md                     # System Architecture & Technical Specifications (This File)
+├── LICENSE                             # Apache 2.0 License
 ├── Dockerfile                          # Cloud Run container build definition
 ├── cloudbuild.yaml                     # Cloud Build CI/CD pipeline definition
 ├── requirements.txt                    # Production Python dependencies
@@ -338,3 +339,20 @@ agentic_ueba/
 | **Phase 3** | **MITRE Router & TTP Matrix** | `ttp_mapper.py` mapping outlier topologies to MITRE tactics, techniques, and swarm investigation tasks. |
 | **Phase 4** | **Swarm Orchestrator & Agents** | `orchestrator.py` and sub-agents (`ioc_hunter.py`, `lineage_tracer.py`, `alert_correlator.py`). |
 | **Phase 5** | **Bayesian Judge & End-to-End Daemon** | `judge.py` synthesis aggregator, `scheduler.py` daemon loop, and automated Chronicle Case escalation. |
+
+---
+
+## 📜 License
+This project is licensed under the [Apache License 2.0](LICENSE).
+```
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+```
+
+---
+*Created and maintained by Greg Kushmerek for Google Security Operations (Chronicle SIEM & SOAR).*
