@@ -161,9 +161,14 @@ limit: 5"""
       username: str,
       lookback_days: int = 14,
       entity_type: str = "USER",
+      prefer_latest_day: bool = False,
   ) -> Dict[str, Any]:
     """Profiles user or host across 6 canonical orthogonal sectors via v1.8.0 baseline-aligned micro-queries."""
-    start_iso, end_iso = self._iso_window(lookback_days)
+    if lookback_days and int(lookback_days) == 1:
+      start_iso, end_iso, default_bucket_date = self._mode_a_today_window()
+    else:
+      start_iso, end_iso = self._iso_window(lookback_days)
+      default_bucket_date = end_iso[:10]
     is_host = entity_type.upper() in ("ASSET", "HOST", "IP")
     sector_metric_map = self.ASSET_SECTOR_METRICS if is_host else self.USER_SECTOR_METRICS
 
@@ -479,10 +484,10 @@ stage cloud_risk {{
         metadata.vendor_name: metadata.vendor_name,
         metadata.product_name: metadata.product_name
     ))
-    $z_r = ($obs_r - $avg_r) / if($std_r > 0, $std_r, 1.0)
-    $z_w = ($obs_w - $avg_w) / if($std_w > 0, $std_w, 1.0)
-    $z_c = ($obs_c - $avg_c) / if($std_c > 0, $std_c, 1.0)
-    $z_d = ($obs_d - $avg_d) / if($std_d > 0, $std_d, 1.0)
+    $z_r = ($obs_r - $avg_r) / if($std_r > 0, $std_r, 1000000.0)
+    $z_w = ($obs_w - $avg_w) / if($std_w > 0, $std_w, 1000000.0)
+    $z_c = ($obs_c - $avg_c) / if($std_c > 0, $std_c, 1000000.0)
+    $z_d = ($obs_d - $avg_d) / if($std_d > 0, $std_d, 1000000.0)
     $z_rw = if($z_r > $z_w, $z_r, $z_w)
     $z_cd = if($z_c > $z_d, $z_c, $z_d)
 }}
@@ -639,47 +644,107 @@ order:
   $z desc""",
       }
 
-    async def _query_sector(sector_name: str, q_str: str) -> Tuple[str, float, int, float, float]:
+    def _parse_sector_row(row: Dict[str, Any]) -> Tuple[str, float, int, float, float]:
+      raw_tb = str(
+          row.get("TIME_BUCKET")
+          or row.get("time_bucket")
+          or row.get("bucket_date")
+          or row.get("$TIME_BUCKET")
+          or ""
+      ).strip()
+      row_day = (
+          raw_tb[:10]
+          if len(raw_tb) >= 10 and raw_tb[4] == "-" and raw_tb[7] == "-"
+          else ""
+      )
+      z_val = 0.0
+      for k in ("z", "z_score", "$z"):
+        if k in row and row[k] is not None:
+          z_val = float(row[k])
+          break
+      obs_val = 0
+      for k in ("observed", "obs", "$observed", "$obs"):
+        if k in row and row[k] is not None:
+          obs_val = int(float(row[k]))
+          break
+      avg_val = 0.0
+      for k in ("avg", "baseline", "baseline_avg", "$avg", "$baseline"):
+        if k in row and row[k] is not None:
+          avg_val = float(row[k])
+          break
+      std_val = 0.0
+      for k in ("std", "dispersion", "baseline_std", "$std", "$dispersion"):
+        if k in row and row[k] is not None:
+          std_val = float(row[k])
+          break
+      return row_day, z_val, obs_val, avg_val, std_val
+
+    async def _query_sector(
+        sector_name: str, q_str: str
+    ) -> Tuple[str, List[Tuple[str, float, int, float, float]]]:
       try:
         resp = await self.runner.execute_query_via_mcp(session, q_str, start_iso, end_iso)
         rows = self.runner.parse_stats_response(resp)
         if rows:
-          row = rows[0]
-          z_val = 0.0
-          for k in ("z", "z_score", "$z"):
-            if k in row and row[k] is not None:
-              z_val = float(row[k])
-              break
-          obs_val = 0
-          for k in ("observed", "obs", "$observed", "$obs"):
-            if k in row and row[k] is not None:
-              obs_val = int(float(row[k]))
-              break
-          avg_val = 0.0
-          for k in ("avg", "baseline", "baseline_avg", "$avg", "$baseline"):
-            if k in row and row[k] is not None:
-              avg_val = float(row[k])
-              break
-          std_val = 0.0
-          for k in ("std", "dispersion", "baseline_std", "$std", "$dispersion"):
-            if k in row and row[k] is not None:
-              std_val = float(row[k])
-              break
-          return sector_name, z_val, obs_val, avg_val, std_val
+          return sector_name, [_parse_sector_row(r) for r in rows]
       except Exception as err:
         logger.warning(f"Sector query failed for {sector_name} ({err}); defaulting to 0.0")
-      return sector_name, 0.0, 0, 0.0, 0.0
+      return sector_name, []
 
     # Execute queries sequentially to preserve single MCP stream stability
-    results = []
+    sector_rows_map: Dict[str, List[Tuple[str, float, int, float, float]]] = {}
     for name, q_str in sector_queries.items():
-      res = await _query_sector(name, q_str)
-      results.append(res)
+      s_name, parsed_rows = await _query_sector(name, q_str)
+      sector_rows_map[s_name] = parsed_rows
 
-    z_scores = {name: z for name, z, _, _, _ in results}
-    observed_counts = {name: obs for name, _, obs, _, _ in results}
-    baseline_avgs = {name: avg for name, _, _, avg, _ in results}
-    baseline_stds = {name: std for name, _, _, _, std in results}
+    # Align sector vectors on a single synchronous calendar day when TIME_BUCKET is present
+    day_sector_map: Dict[str, Dict[str, Tuple[float, int, float, float]]] = {}
+    for s_name, parsed_rows in sector_rows_map.items():
+      for row_day, z_val, obs_val, avg_val, std_val in parsed_rows:
+        if row_day:
+          day_bucket = day_sector_map.setdefault(row_day, {})
+          if s_name not in day_bucket or z_val > day_bucket[s_name][0]:
+            day_bucket[s_name] = (z_val, obs_val, avg_val, std_val)
+
+    if day_sector_map:
+      if prefer_latest_day:
+        evaluated_day = max(day_sector_map.keys())
+      else:
+        evaluated_day = max(
+            day_sector_map.keys(),
+            key=lambda d: (
+                round(
+                    self.runner.compute_euclidean_distance(
+                        {s: vals[0] for s, vals in day_sector_map[d].items()}
+                    ),
+                    6,
+                ),
+                d,
+            ),
+        )
+      chosen_day_vectors = day_sector_map[evaluated_day]
+      z_scores = {name: chosen_day_vectors.get(name, (0.0, 0, 0.0, 0.0))[0] for name in sector_queries}
+      observed_counts = {name: chosen_day_vectors.get(name, (0.0, 0, 0.0, 0.0))[1] for name in sector_queries}
+      baseline_avgs = {name: chosen_day_vectors.get(name, (0.0, 0, 0.0, 0.0))[2] for name in sector_queries}
+      baseline_stds = {name: chosen_day_vectors.get(name, (0.0, 0, 0.0, 0.0))[3] for name in sector_queries}
+    else:
+      evaluated_day = default_bucket_date
+      z_scores = {
+          name: (sector_rows_map[name][0][1] if sector_rows_map.get(name) else 0.0)
+          for name in sector_queries
+      }
+      observed_counts = {
+          name: (sector_rows_map[name][0][2] if sector_rows_map.get(name) else 0)
+          for name in sector_queries
+      }
+      baseline_avgs = {
+          name: (sector_rows_map[name][0][3] if sector_rows_map.get(name) else 0.0)
+          for name in sector_queries
+      }
+      baseline_stds = {
+          name: (sector_rows_map[name][0][4] if sector_rows_map.get(name) else 0.0)
+          for name in sector_queries
+      }
 
     composite_d = self.runner.compute_euclidean_distance(z_scores)
     cri = self.runner.calculate_cri(composite_d)
@@ -701,6 +766,7 @@ order:
     return {
         "entity": username,
         "entity_type": entity_type.upper(),
+        "evaluated_day": evaluated_day,
         "composite_d": round(composite_d, 2),
         "calibrated_risk_index": cri,
         "top_sector": top_sector,
@@ -964,11 +1030,33 @@ order:
     if target_metric not in mc.known_metrics():
       target_metric = "workspace_total_download_actions" if ent_enum == EntityType.USER else "http_queries_total"
 
-    # v1.8.1 Derived Prevalence Scoping Rule:
-    # HYBRID_METRIC_DERIVED_DOMAIN_PREVALENCE_2STAGE is strictly for HTTP request counts (http_queries_total).
-    # DNS volume (dns_*) or outbound bytes (network_bytes_*) against rare destinations must route to RARE_DESTINATION_ECG_3STAGE.
-    if model_upper == "HYBRID_METRIC_DERIVED_DOMAIN_PREVALENCE_2STAGE" and not target_metric.startswith("http_"):
-      model_upper = "RARE_DESTINATION_ECG_3STAGE"
+    # v1.8.1 Derived Prevalence & Hybrid Pipeline Metric-Compatibility Guards:
+    # - HYBRID_METRIC_DERIVED_DOMAIN_PREVALENCE_2STAGE is strictly for HTTP request counts (http_queries_total).
+    #   DNS volume (dns_*) or outbound bytes (network_bytes_*) against rare destinations must route to RARE_DESTINATION_ECG_3STAGE.
+    if model_upper == "HYBRID_METRIC_DERIVED_DOMAIN_PREVALENCE_2STAGE":
+      if not target_metric.startswith("http_"):
+        model_upper = "RARE_DESTINATION_ECG_3STAGE"
+      else:
+        ent_enum = EntityType.ASSET
+    elif model_upper in (
+        "HYBRID_METRIC_FLEET_PREVALENCE_2STAGE",
+        "FLEET_PREVALENCE_NORMALIZATION",
+        "HYBRID_METRIC_DERIVED_FILE_PREVALENCE_2STAGE",
+    ):
+      if not target_metric.startswith("file_executions_"):
+        target_metric = "file_executions_total"
+    elif model_upper == "HYBRID_METRIC_WHOIS_DOMAIN_LIFECYCLE_2STAGE":
+      if not (target_metric.startswith("http_queries_") or target_metric.startswith("dns_queries_")):
+        target_metric = "http_queries_total"
+      ent_enum = EntityType.ASSET
+    elif model_upper in ("HTTP_TARGET_SURGE_2STAGE", "HYBRID_METRIC_HTTP_UA_PREVALENCE_2STAGE"):
+      target_metric = "http_queries_total"
+      ent_enum = EntityType.ASSET
+    elif model_upper == "HYBRID_METRIC_DERIVED_ASSET_AGE_2STAGE":
+      from scripts.preflight_validator import METRIC_CATALOG as _MC_CAT
+      if EntityType.ASSET not in _MC_CAT[target_metric].supported_entity_types or mc.is_composite_only(target_metric):
+        target_metric = "auth_attempts_total"
+      ent_enum = EntityType.ASSET
 
     # Ensure entity_type is supported for target_metric; adjust if needed
     from scripts.preflight_validator import METRIC_CATALOG
@@ -1088,8 +1176,17 @@ order:
       top_row = rows[0]
       for score_key in (
           "modified_z",
-          "personal_z",
+          "cusum_drift_score",
           "cusum_z",
+          "delta_z",
+          "threat_score",
+          "fused_threat_score",
+          "normalized_odds_score",
+          "macro_z_score",
+          "target_risk_score",
+          "joint_odds_score",
+          "empirical_shift",
+          "posterior_rate",
           "z_sector",
           "macd_momentum_score",
           "circadian_threat_score",
@@ -1109,21 +1206,63 @@ order:
           "alert_z",
           "beacon_score",
           "flow_z",
+          "personal_z",
           "z_score",
           "z",
       ):
         if score_key in top_row and top_row[score_key] is not None:
           top_score = float(top_row[score_key])
           break
-      if top_score == 0.0 and "d_sq" in top_row and top_row["d_sq"] is not None:
-        top_score = math.sqrt(max(0.0, float(top_row["d_sq"])))
+      if top_score == 0.0:
+        for sq_key in ("d_sq", "d_vs_fleet_sq", "d_vs_team_sq", "threat_distance_sq", "composite_threat_norm_sq"):
+          if sq_key in top_row and top_row[sq_key] is not None:
+            top_score = math.sqrt(max(0.0, float(top_row[sq_key])))
+            break
       if "z_gap" in top_row and top_row["z_gap"] is not None:
         z_gap = float(top_row["z_gap"])
-      for obs_key in ("observed", "a_observed", "observed_hour", "observed_val", "obs", "entity_obs", "observed_fails", "total_alerts"):
+      for obs_key in (
+          "observed",
+          "a_observed",
+          "observed_hour",
+          "observed_val",
+          "observed_24h",
+          "obs_24h",
+          "observed_queries",
+          "observed_execs",
+          "macro_observed",
+          "obs_intensity",
+          "m1_observed",
+          "obs",
+          "k",
+          "entity_obs",
+          "observed_fails",
+          "total_alerts",
+          "observed_flows",
+          "originating_hosts",
+          "affected_hosts",
+      ):
         if obs_key in top_row and top_row[obs_key] is not None:
           observed_val = float(top_row[obs_key])
           break
-      for avg_key in ("median_val", "hist_avg", "baseline_avg", "avg_hourly", "historical_avg", "avg", "personal_avg"):
+      for avg_key in (
+          "median_val",
+          "hist_avg",
+          "baseline_avg",
+          "baseline_mean",
+          "mean",
+          "mean_queries",
+          "mean_execs",
+          "macro_mean",
+          "macro_baseline_mean",
+          "host_avg",
+          "e_avg",
+          "lambda",
+          "avg_hourly",
+          "historical_avg",
+          "historical_flow_avg",
+          "avg",
+          "personal_avg",
+      ):
         if avg_key in top_row and top_row[avg_key] is not None:
           hist_avg = float(top_row[avg_key])
           break
@@ -1311,8 +1450,19 @@ order:
     top_z = 0.0
     distinct_sigs = 0
     if rows:
-      top_z = float(rows[0].get("z_score", rows[0].get("z", 0.0)) or 0.0)
-      distinct_sigs = int(rows[0].get("distinct_signatures", 0) or 0)
+      top_z = float(
+          rows[0].get("macro_z_score")
+          or rows[0].get("$macro_z_score")
+          or rows[0].get("z_score")
+          or rows[0].get("z")
+          or 0.0
+      )
+      distinct_sigs = int(
+          rows[0].get("signature_diversity")
+          or rows[0].get("$signature_diversity")
+          or rows[0].get("distinct_signatures")
+          or 0
+      )
 
     cri = self.runner.calculate_cri(top_z)
     return {
@@ -1378,10 +1528,10 @@ stage cloud_risk {{
     $delete_std = {_metric("resource_deletion_total", "stddev")}
     $create_avg = {_metric("resource_creation_total", "avg")}
     $create_std = {_metric("resource_creation_total", "stddev")}
-    $z_read = ($obs_read - $read_avg) / if($read_std > 0, $read_std, 1.0)
-    $z_write = ($obs_write - $write_avg) / if($write_std > 0, $write_std, 1.0)
-    $z_delete = ($obs_delete - $delete_avg) / if($delete_std > 0, $delete_std, 1.0)
-    $z_create = ($obs_create - $create_avg) / if($create_std > 0, $create_std, 1.0)
+    $z_read = ($obs_read - $read_avg) / if($read_std > 0, $read_std, 1000000.0)
+    $z_write = ($obs_write - $write_avg) / if($write_std > 0, $write_std, 1000000.0)
+    $z_delete = ($obs_delete - $delete_avg) / if($delete_std > 0, $delete_std, 1000000.0)
+    $z_create = ($obs_create - $create_avg) / if($create_std > 0, $create_std, 1000000.0)
 }}
 
 $user = $cloud_risk.user
@@ -1703,12 +1853,29 @@ order:
       top_row = rows[0]
       composite_risk = float(
           top_row.get("composite_risk")
+          or top_row.get("$composite_risk")
           or top_row.get("top_z")
+          or top_row.get("dest_z")
           or top_row.get("z")
           or 0.0
       )
-      fold_change = float(top_row.get("fold_change") or top_row.get("surge_ratio") or 0.0)
-      observed_events = float(top_row.get("observed") or top_row.get("observed_reads") or 0.0)
+      fold_change = float(
+          top_row.get("fold_change")
+          or top_row.get("surge_ratio")
+          or top_row.get("dest_z")
+          or top_row.get("origin_z")
+          or 0.0
+      )
+      observed_events = float(
+          top_row.get("obs")
+          or top_row.get("$obs")
+          or top_row.get("observed")
+          or top_row.get("observed_reads")
+          or top_row.get("obs_writes")
+          or top_row.get("obs_deletes")
+          or top_row.get("obs_creates")
+          or 0.0
+      )
       target_resource = str(top_row.get("resource") or top_row.get("target_resource") or "N/A")
       caller_ip = str(top_row.get("caller_ip") or top_row.get("ip") or "N/A")
 
@@ -1738,18 +1905,28 @@ order:
       username: str = "",
       lookback_days: int = 14,
       entity: Optional[str] = None,
+      target_metrics: Optional[Sequence[str]] = None,
   ) -> Dict[str, Any]:
-    """Executes the v1.9.1 Part-of-the-Whole Triad Multilevel pipeline across Workspace Download, Change, & Email."""
+    """Executes the Part-of-the-Whole Triad Multilevel pipeline across Workspace Activity vectors."""
     target_user = entity or username
     start_iso, end_iso = self._iso_window(lookback_days)
     EntityType, PipelineArchitecture, _, _ = self.runner.get_validator_enums()
     router = self.runner.get_template_router()
+    triad_metrics = list(
+        target_metrics
+        or [
+            "workspace_auth_attempts_total",
+            "workspace_total_download_actions",
+            "workspace_total_change_actions",
+        ]
+    )
     rendered = router.build_pipeline_query(
         pipeline_type=PipelineArchitecture.PART_OF_THE_WHOLE_TRIAD_MULTILEVEL,
         entity_type=EntityType.USER,
         target_entity=target_user,
+        target_metrics=triad_metrics,
         anomaly_threshold=self.runner.GATE_DEFAULTS["anomaly_threshold"],
-        hypothesis_goal=f"Workspace Exfiltration Triad (Downloads + Changes + Outbound Emails) vs Peer Cohort for {target_user}",
+        hypothesis_goal=f"Workspace Exfiltration Triad ({' + '.join(triad_metrics)}) vs Peer Cohort for {target_user}",
     )
     resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
     rows = self.runner.parse_stats_response(resp)
@@ -1761,16 +1938,53 @@ order:
     obs_val = 0.0
     if rows:
       top_row = rows[0]
+      d_sq = float(
+          top_row.get("d_vs_fleet_sq")
+          or top_row.get("$d_vs_fleet_sq")
+          or top_row.get("d_vs_team_sq")
+          or top_row.get("$d_vs_team_sq")
+          or 0.0
+      )
       composite_z = float(
           top_row.get("composite_z_score")
           or top_row.get("z_vs_enterprise")
           or top_row.get("z")
+          or (math.sqrt(max(0.0, d_sq)) if d_sq > 0.0 else 0.0)
+      )
+      z_a = float(
+          top_row.get("z_a_vs_ent")
+          or top_row.get("z_a")
+          or top_row.get("z2_vs_enterprise")
+          or top_row.get("z1_vs_enterprise")
           or 0.0
       )
-      z_a = float(top_row.get("z_a_vs_ent") or top_row.get("z_a") or 0.0)
-      z_b = float(top_row.get("z_b_vs_ent") or top_row.get("z_b") or 0.0)
-      z_c = float(top_row.get("z_c_vs_ent") or top_row.get("z_c") or 0.0)
-      obs_val = float(top_row.get("observed") or top_row.get("total_actions") or 0.0)
+      z_b = float(
+          top_row.get("z_b_vs_ent")
+          or top_row.get("z_b")
+          or top_row.get("z3_vs_enterprise")
+          or top_row.get("z2_vs_enterprise")
+          or 0.0
+      )
+      z_c = float(
+          top_row.get("z_c_vs_ent")
+          or top_row.get("z_c")
+          or top_row.get("z1_vs_enterprise")
+          or top_row.get("z3_vs_enterprise")
+          or 0.0
+      )
+      m_obs_sum = (
+          float(top_row.get("m1_observed") or 0.0)
+          + float(top_row.get("m2_observed") or 0.0)
+          + float(top_row.get("m3_observed") or 0.0)
+      )
+      obs_val = float(
+          top_row.get("observed")
+          or top_row.get("total_actions")
+          or m_obs_sum
+          or 0.0
+      )
+      if composite_z <= 0.0 and (z_a > 0.0 or z_b > 0.0 or z_c > 0.0):
+        composite_z = math.sqrt(max(0.0, z_a) ** 2 + max(0.0, z_b) ** 2 + max(0.0, z_c) ** 2)
 
     cri = self.runner.calculate_cri(composite_z)
     return {
@@ -1781,8 +1995,9 @@ order:
         "fusion_metrics": [
             "workspace_total_download_actions",
             "workspace_total_change_actions",
-            "workspace_emails_sent",
+            "workspace_emails_sent_total",
         ],
+        "triad_metrics": triad_metrics,
         "composite_z_score": round(composite_z, 2),
         "observed_value": round(obs_val, 1),
         "download_z": round(z_a, 2),
@@ -2124,6 +2339,7 @@ stage cloud_risk {{
     $vendor = metadata.vendor_name
     $product = metadata.product_name
     $user != ""
+    not re.regex(principal.user.userid, "\\\\$$")
   match:
     $user, $vendor, $product by 1d
   outcome:
@@ -2180,10 +2396,10 @@ stage cloud_risk {{
         metadata.vendor_name: metadata.vendor_name,
         metadata.product_name: metadata.product_name
     ))
-    $z_r = ($obs_r - $avg_r) / if($std_r > 0, $std_r, 1.0)
-    $z_w = ($obs_w - $avg_w) / if($std_w > 0, $std_w, 1.0)
-    $z_c = ($obs_c - $avg_c) / if($std_c > 0, $std_c, 1.0)
-    $z_d = ($obs_d - $avg_d) / if($std_d > 0, $std_d, 1.0)
+    $z_r = ($obs_r - $avg_r) / if($std_r > 0, $std_r, 1000000.0)
+    $z_w = ($obs_w - $avg_w) / if($std_w > 0, $std_w, 1000000.0)
+    $z_c = ($obs_c - $avg_c) / if($std_c > 0, $std_c, 1000000.0)
+    $z_d = ($obs_d - $avg_d) / if($std_d > 0, $std_d, 1000000.0)
     $z_rw = if($z_r > $z_w, $z_r, $z_w)
     $z_cd = if($z_c > $z_d, $z_c, $z_d)
 }}
@@ -2408,6 +2624,8 @@ order:
     peak_name, peak_z, peak_cri = max(vectors, key=lambda v: v[1])
     sorted_vectors = sorted(vectors, key=lambda v: v[1], reverse=True)
     breached = [v[0] for v in sorted_vectors if v[1] >= spike_threshold_z]
+    if not breached and composite_d >= spike_threshold_z:
+      breached = [v[0] for v in sorted_vectors if v[1] >= 2.0]
     active_vectors = [(name, z, cri) for name, z, cri in sorted_vectors if z > 0.0 and cri > 0]
 
     labels = [
@@ -2452,7 +2670,7 @@ order:
           "risk_score": int(vec_cri),
           "confidence_score": round(float(vec_z), 2),
           "severity": self.derive_cri_severity(vec_cri),
-          "threat_status": "ACTIVE" if vec_z >= spike_threshold_z else "CLEARED",
+          "threat_status": "ACTIVE" if vec_name in breached else "CLEARED",
           "summary": f"Vector {vec_name}: CRI {vec_cri} | Z {vec_z:.2f}σ",
       })
 
@@ -2704,18 +2922,24 @@ order:
 
     for (day_bucket, ent_id), sec_map in sorted(entity_vectors.items()):
       max_spoke_z = max((v["z"] for v in sec_map.values()), default=0.0)
-      if max_spoke_z < spike_threshold_z:
+      z_scores = {s: v["z"] for s, v in sec_map.items()}
+      composite_d = self.runner.compute_euclidean_distance(z_scores)
+      if max_spoke_z < spike_threshold_z and composite_d < spike_threshold_z:
         continue
 
       total_detected += 1
-      z_scores = {s: v["z"] for s, v in sec_map.items()}
-      composite_d = self.runner.compute_euclidean_distance(z_scores)
       composite_cri = self.runner.calculate_cri(composite_d)
       breached_sectors = sorted(
           [s for s, v in sec_map.items() if v["z"] >= spike_threshold_z],
           key=lambda s: sec_map[s]["z"],
           reverse=True,
       )
+      if not breached_sectors and composite_d >= spike_threshold_z:
+        breached_sectors = sorted(
+            [s for s, v in sec_map.items() if v["z"] >= spoke_inclusion_z],
+            key=lambda s: sec_map[s]["z"],
+            reverse=True,
+        )
       primary_sector = breached_sectors[0] if breached_sectors else max(sec_map, key=lambda s: sec_map[s]["z"])
 
       if should_emit_fn is not None:

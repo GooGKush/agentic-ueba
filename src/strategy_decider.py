@@ -67,7 +67,7 @@ class StrategyDecider:
               "workspace_total_change_actions",
               "workspace_emails_sent_total",
               "workspace_network_bytes_outbound",
-              "workspace_network_bytes_inbound",
+              "workspace_network_bytes_total",
           },
       },
       "Cloud": {
@@ -747,7 +747,7 @@ class StrategyDecider:
         pivot_why = (
             f"Tier 2A (`{t2a_model}`) confirmed an acute Workspace anomaly on `{target_entity}`. "
             "Pivoting to `PART_OF_THE_WHOLE_TRIAD_MULTILEVEL` verifies whether the user is simultaneously staging document modifications "
-            "(`workspace_total_change_actions`) and outbound emails (`workspace_emails_sent`) relative to their enterprise peer cohort."
+            "(`workspace_total_change_actions`) and outbound emails (`workspace_emails_sent_total`) relative to their enterprise peer cohort."
         )
         score, band, breakdown = cls.score_hypothesis_confidence(
             model_name="PART_OF_THE_WHOLE_TRIAD_MULTILEVEL",
@@ -755,7 +755,7 @@ class StrategyDecider:
             fusion_metrics=[
                 "workspace_total_download_actions",
                 "workspace_total_change_actions",
-                "workspace_emails_sent",
+                "workspace_emails_sent_total",
             ],
             outlier_vector="Workspace",
             ctx=ctx,
@@ -775,7 +775,7 @@ class StrategyDecider:
                 fusion_metrics=[
                     "workspace_total_download_actions",
                     "workspace_total_change_actions",
-                    "workspace_emails_sent",
+                    "workspace_emails_sent_total",
                 ],
                 hypothesis_h0="Confirmed download spike is an isolated administrative backup shared by the team cohort.",
                 hypothesis_h1=f"User `{target_entity}` exhibits a coupled Workspace exfiltration triad departing from peer cohort norms.",

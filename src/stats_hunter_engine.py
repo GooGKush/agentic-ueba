@@ -203,7 +203,13 @@ class StatsHunterEngine:
 
     z_score = 0.0
     if rows:
-      z_score = float(rows[0].get("poisson_z", rows[0].get("z_score", 0.0)) or 0.0)
+      top_row = rows[0]
+      raw_pz = top_row.get("poisson_z") or top_row.get("$poisson_z") or top_row.get("z_score") or top_row.get("$z_score")
+      if raw_pz is not None:
+        z_score = float(raw_pz or 0.0)
+      else:
+        pz_sq = float(top_row.get("poisson_z_sq") or top_row.get("$poisson_z_sq") or 0.0)
+        z_score = math.sqrt(max(0.0, pz_sq))
 
     cri = self.runner.calculate_cri(z_score)
     return {
@@ -459,22 +465,39 @@ class StatsHunterEngine:
     rows = self.runner.parse_stats_response(resp)
 
     max_velocity_kmh = 0.0
+    max_distance_km = 0.0
     detected_user = user_id
     if rows:
       top_row = rows[0]
       max_velocity_kmh = float(
-          top_row.get("velocity_kmh", top_row.get("max_velocity_kmh", 0.0)) or 0.0
+          top_row.get("velocity_kmh")
+          or top_row.get("$velocity_kmh")
+          or top_row.get("max_velocity_kmh")
+          or 0.0
+      )
+      max_distance_km = float(
+          top_row.get("distance_km")
+          or top_row.get("$distance_km")
+          or top_row.get("max_distance_km")
+          or 0.0
       )
       detected_user = str(top_row.get("user", top_row.get("entity", user_id)))
 
-    # Normalize velocity above 800 km/h into Z-equivalent for CRI
-    z_equiv = max(0.0, max_velocity_kmh / 250.0)
+    # Normalize velocity above 800 km/h (or great-circle distance above 500 km) into Z-equivalent for CRI
+    z_equiv = (
+        max(0.0, max_velocity_kmh / 250.0)
+        if max_velocity_kmh > 0.0
+        else max(0.0, max_distance_km / 250.0)
+    )
     cri = self.runner.calculate_cri(z_equiv)
-    is_outlier = max_velocity_kmh >= 800.0 or cri >= 60
+    is_outlier = max_velocity_kmh >= 800.0 or max_distance_km >= 500.0 or cri >= 60
     return {
         "entity": detected_user,
         "model": "IMPOSSIBLE_TRAVEL_GEO_VELOCITY",
         "velocity_kmh": round(max_velocity_kmh, 2),
+        "max_velocity_kmh": round(max_velocity_kmh, 2),
+        "distance_km": round(max_distance_km, 2),
+        "max_distance_km": round(max_distance_km, 2),
         "top_z_score": round(z_equiv, 2),
         "calibrated_risk_index": cri,
         "is_outlier": is_outlier,
@@ -501,11 +524,22 @@ class StatsHunterEngine:
     rows = self.runner.parse_stats_response(resp)
 
     pcr_score = 0.0
+    producer_ratio = 0.0
     detected_host = hostname
     if rows:
       top_row = rows[0]
+      producer_ratio = float(
+          top_row.get("producer_ratio")
+          or top_row.get("$producer_ratio")
+          or top_row.get("pcr_ratio")
+          or 0.0
+      )
       pcr_score = float(
-          top_row.get("pcr_z_score", top_row.get("pcr_ratio", 0.0)) or 0.0
+          top_row.get("pcr_z_score")
+          or top_row.get("z_score")
+          or top_row.get("$z_score")
+          or producer_ratio
+          or 0.0
       )
       detected_host = str(top_row.get("entity", top_row.get("host", hostname)))
 
@@ -515,6 +549,7 @@ class StatsHunterEngine:
         "entity": detected_host,
         "model": "PRODUCER_CONSUMER_RATIO_INVERSION",
         "pcr_z_score": round(pcr_score, 2),
+        "producer_ratio": round(producer_ratio, 3),
         "top_z_score": round(pcr_score, 2),
         "calibrated_risk_index": cri,
         "is_outlier": is_outlier,
