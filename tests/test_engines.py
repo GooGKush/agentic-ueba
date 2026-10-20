@@ -1219,21 +1219,39 @@ def test_build_360_outlier_udm_event_minimal_consistent_schema():
   assert ev["principal"] == {"user": {"userid": "alex.mercer"}}
 
   sr = ev["security_result"]
-  assert len(sr) == 1
+  # 1 COMPOSITE_360 entry + 3 non-zero SECTOR_VECTOR entries (WORKSPACE, EGRESS, AUTH; zero sectors omitted)
+  assert len(sr) == 4
+  assert sr[0]["rule_type"] == "COMPOSITE_360"
   assert sr[0]["risk_score"] == composite_cri and isinstance(sr[0]["risk_score"], int)
+  assert "threat_name" not in sr[0]
+  assert "confidence_score" not in sr[0]
   assert "detection_fields" not in sr[0]
   assert "network" not in ev
 
+  # Non-zero vectors sorted descending by Z-score: WORKSPACE (4.8), EGRESS (3.5), AUTH (2.2)
+  assert [s["threat_name"] for s in sr[1:]] == ["WORKSPACE", "EGRESS", "AUTH"]
+  assert all(s["rule_type"] == "SECTOR_VECTOR" for s in sr[1:])
+  assert sr[1]["risk_score"] == eng.runner.calculate_cri(4.8)
+  assert sr[1]["confidence_score"] == 4.8
+  assert sr[1]["threat_status"] == "ACTIVE"
+  assert sr[2]["risk_score"] == eng.runner.calculate_cri(3.5)
+  assert sr[2]["confidence_score"] == 3.5
+  assert sr[2]["threat_status"] == "ACTIVE"
+  assert sr[3]["risk_score"] == eng.runner.calculate_cri(2.2)
+  assert sr[3]["confidence_score"] == 2.2
+  assert sr[3]["threat_status"] == "CLEARED"
+
   labels = {l["key"]: l["value"] for l in ev["target"]["resource"]["attribute"]["labels"]}
-  # Only: campaign, evaluated day, composite CRI, composite D, and the 6 vectors.
   assert list(labels) == [
       "Hunt Campaign ID", "Evaluated Day", "Composite CRI", "Composite D",
-      "AUTH", "CLOUD", "WORKSPACE", "EGRESS", "DNS", "WEB",
+      "Peak Vector", "Peak CRI", "Peak Z", "Breached Vectors",
   ]
   assert labels["Composite CRI"] == str(composite_cri)
   assert labels["Composite D"] == f"{composite_d:.2f}"
-  assert labels["WORKSPACE"] == f"CRI {eng.runner.calculate_cri(4.8)} | Z 4.80"
-  assert labels["CLOUD"] == "CRI 0 | Z 0.00"
+  assert labels["Peak Vector"] == "WORKSPACE"
+  assert labels["Peak CRI"] == str(eng.runner.calculate_cri(4.8))
+  assert labels["Peak Z"] == "4.80"
+  assert labels["Breached Vectors"] == "WORKSPACE, EGRESS"
 
   assert chronicle_ingest.validate_events([ev]) == []
 
@@ -1241,7 +1259,8 @@ def test_build_360_outlier_udm_event_minimal_consistent_schema():
 def test_build_360_outlier_udm_event_asset_identity_matches_user():
   eng = RiskMetricsEngine()
   common = dict(
-      sectors={"Flows": {"z": 3.9}}, composite_d=3.9, composite_cri=60,
+      sectors={"Flows": {"z": 3.9}, "Alerts": {"z": 2.4}, "Web": {"z": 4.1}},
+      composite_d=5.66, composite_cri=82,
       campaign_id="c", run_timestamp_iso="2026-10-08T16:00:00Z", evaluated_day="2026-10-08",
   )
   user_ev = eng.build_360_outlier_udm_event(entity_id="u", entity_type="USER", **common)
@@ -1250,8 +1269,9 @@ def test_build_360_outlier_udm_event_asset_identity_matches_user():
   assert {k: user_ev["metadata"][k] for k in ident} == {k: asset_ev["metadata"][k] for k in ident}
   assert user_ev["observer"] == asset_ev["observer"]
   assert asset_ev["principal"] == {"hostname": "h", "asset": {"hostname": "h"}}
-  asset_keys = [l["key"] for l in asset_ev["target"]["resource"]["attribute"]["labels"]][4:]
-  assert asset_keys == ["AUTH", "EGRESS", "DNS", "FLOWS", "ALERTS", "WEB"]
+  # Asset event includes ASSET-specific sectors (FLOWS, ALERTS, WEB) in security_result[1:]
+  assert [s["threat_name"] for s in asset_ev["security_result"][1:]] == ["WEB", "FLOWS", "ALERTS"]
+  assert [s["threat_name"] for s in user_ev["security_result"][1:]] == ["WEB"]
 
 
 @pytest.mark.anyio
@@ -1473,8 +1493,8 @@ def test_build_360_outlier_udm_event_matches_skill_handoff_schema():
 
   labels = {l["key"]: l["value"] for l in doc["target"]["resource"]["attribute"]["labels"]}
   sectors = {
-      name.title(): {"z": float(val.split("Z ")[1])}
-      for name, val in labels.items() if val.startswith("CRI ")
+      sr["threat_name"].title(): {"z": float(sr["confidence_score"])}
+      for sr in doc["security_result"][1:]
   }
   sectors = {("DNS" if k == "Dns" else k): v for k, v in sectors.items()}
   ev = eng.build_360_outlier_udm_event(
@@ -1488,17 +1508,14 @@ def test_build_360_outlier_udm_event_matches_skill_handoff_schema():
       evaluated_day=labels["Evaluated Day"],
   )
 
-  # Same identity, observer, principal and label keys/values as the documented event.
+  # Same identity, observer, principal, label keys/values, and full security_result[] array as §10.
   for k in ("product_name", "vendor_name", "event_type", "product_event_type", "event_timestamp"):
     assert ev["metadata"][k] == doc["metadata"][k], k
   assert sorted(ev["metadata"]) == sorted(doc["metadata"])
   assert ev["observer"] == doc["observer"]
   assert ev["principal"] == doc["principal"]
   assert ev["target"]["resource"]["attribute"]["labels"] == doc["target"]["resource"]["attribute"]["labels"]
-  assert sorted(ev["security_result"][0]) == sorted(doc["security_result"][0])
-  assert ev["security_result"][0]["risk_score"] == doc["security_result"][0]["risk_score"]
-  assert ev["security_result"][0]["severity"] == doc["security_result"][0]["severity"]
-  assert ev["security_result"][0]["summary"] == doc["security_result"][0]["summary"]
+  assert ev["security_result"] == doc["security_result"]
 
 
 # --- Skill v1.8.6 root significance gate compatibility -------------------------------------------
