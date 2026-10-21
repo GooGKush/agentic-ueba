@@ -1052,6 +1052,13 @@ order:
     elif model_upper in ("HTTP_TARGET_SURGE_2STAGE", "HYBRID_METRIC_HTTP_UA_PREVALENCE_2STAGE"):
       target_metric = "http_queries_total"
       ent_enum = EntityType.ASSET
+    elif model_upper == "HTTP_ERROR_RATIO_SURGE_2STAGE":
+      if not target_metric.endswith("_fail"):
+        target_metric = "http_queries_fail"
+      ent_enum = EntityType.ASSET
+    elif model_upper in ("HYBRID_DATA_TABLE_BRIDGE_2STAGE", "DATA_TABLE_BRIDGE"):
+      target_metric = "network_bytes_outbound"
+      ent_enum = EntityType.ASSET
     elif model_upper == "HYBRID_METRIC_DERIVED_ASSET_AGE_2STAGE":
       from scripts.preflight_validator import METRIC_CATALOG as _MC_CAT
       if EntityType.ASSET not in _MC_CAT[target_metric].supported_entity_types or mc.is_composite_only(target_metric):
@@ -1106,6 +1113,9 @@ order:
         "PIECEWISE_CRI": StatisticalModel.PIECEWISE_CRI,
         "FLEET_PREVALENCE_SHIELD": StatisticalModel.FLEET_PREVALENCE_SHIELD,
         "ADAPTIVE_CONTEXT_THRESHOLD": StatisticalModel.ADAPTIVE_CONTEXT_THRESHOLD,
+        "MACD_MOMENTUM": StatisticalModel.MACD_MOMENTUM_VELOCITY,
+        "DIVERSITY_DEFICIT": "diversity_deficit_entropy",
+        "DIVERSITY_DEFICIT_ENTROPY": "diversity_deficit_entropy",
     }
 
     is_entity_graph = any(
@@ -1131,6 +1141,9 @@ order:
           host_field=host_f,
           hypothesis_goal=hypothesis_goal or f"FUSION_RARE_DESTINATION_3STAGE ({pair[0]} + {pair[1]}) for {entity}",
       )
+    elif model_upper in ("HYBRID_DATA_TABLE_BRIDGE_2STAGE", "DATA_TABLE_BRIDGE"):
+      tpl_path = self.runner.find_template(self.SKILL_NAME, "hybrid_data_table_bridge_2stage.yl2")
+      rendered = self.runner.render_template(tpl_path, {})
     elif model_upper in pipeline_map and not mc.is_composite_only(target_metric):
       pipe_arch = pipeline_map[model_upper]
       gates = self.runner.GATE_DEFAULTS
@@ -1152,12 +1165,13 @@ order:
       )
     else:
       stat_enum = stat_model_map.get(model_upper, StatisticalModel.LONGITUDINAL_CUSUM)
+      stat_label = stat_enum.value if hasattr(stat_enum, "value") else str(stat_enum)
       gates = self.runner.GATE_DEFAULTS
       rendered = router.build_query(
           target_metric=target_metric,
           entity_type=ent_enum,
           statistical_model=stat_enum,
-          hypothesis_goal=hypothesis_goal or f"{stat_enum.value} on {target_metric} for {entity}",
+          hypothesis_goal=hypothesis_goal or f"{stat_label} on {target_metric} for {entity}",
           identifier_field=identifier_field,
           anomaly_threshold=gates["anomaly_threshold"],
           fold_change_threshold=gates["fold_change_threshold"],
@@ -1172,12 +1186,25 @@ order:
     observed_val = 0.0
     hist_avg = 0.0
     z_gap = 0.0
+    drift_days = None
+    max_daily_z = None
+    explicit_cri = None
     if rows:
       top_row = rows[0]
       for score_key in (
           "modified_z",
           "cusum_drift_score",
+          "cusum_drift",
           "cusum_z",
+          "hourly_z",
+          "shielded_z",
+          "sensitivity_excess",
+          "hurdle_threat_score",
+          "upper_tail_z",
+          "clamped_z",
+          "fano_factor",
+          "poisson_z",
+          "diversity_ratio",
           "delta_z",
           "threat_score",
           "fused_threat_score",
@@ -1207,6 +1234,7 @@ order:
           "beacon_score",
           "flow_z",
           "personal_z",
+          "raw_z",
           "z_score",
           "z",
       ):
@@ -1218,12 +1246,20 @@ order:
           if sq_key in top_row and top_row[sq_key] is not None:
             top_score = math.sqrt(max(0.0, float(top_row[sq_key])))
             break
+      if "cri_score" in top_row and top_row["cri_score"] is not None:
+        explicit_cri = int(round(max(0.0, min(100.0, float(top_row["cri_score"])))))
+      if "drift_days" in top_row and top_row["drift_days"] is not None:
+        drift_days = int(float(top_row["drift_days"]))
+      if "max_daily_z" in top_row and top_row["max_daily_z"] is not None:
+        max_daily_z = round(float(top_row["max_daily_z"]), 2)
       if "z_gap" in top_row and top_row["z_gap"] is not None:
         z_gap = float(top_row["z_gap"])
       for obs_key in (
           "observed",
           "a_observed",
+          "hourly_observed",
           "observed_hour",
+          "daily_observed",
           "observed_val",
           "observed_24h",
           "obs_24h",
@@ -1246,6 +1282,9 @@ order:
           break
       for avg_key in (
           "median_val",
+          "expected_hourly_mean",
+          "hist_avg_daily",
+          "daily_mean",
           "hist_avg",
           "baseline_avg",
           "baseline_mean",
@@ -1267,8 +1306,8 @@ order:
           hist_avg = float(top_row[avg_key])
           break
 
-    cri = self.runner.calculate_cri(top_score)
-    return {
+    cri = explicit_cri if explicit_cri is not None else self.runner.calculate_cri(top_score)
+    result_dict = {
         "entity": entity,
         "entity_type": entity_type,
         "model": model_upper,
@@ -1283,6 +1322,11 @@ order:
         "stats_rows": len(rows),
         "executed_query": rendered,
     }
+    if drift_days is not None:
+      result_dict["drift_days"] = drift_days
+    if max_daily_z is not None:
+      result_dict["max_daily_z"] = max_daily_z
+    return result_dict
 
   async def run_circadian_von_mises(
       self,
@@ -1416,15 +1460,20 @@ order:
       self,
       session: ClientSession,
       username: str,
-      macro_metric_avg: str = "metrics.auth_attempts_total(agg: avg, period: 1d, window: 30d)",
-      macro_metric_std: str = "metrics.auth_attempts_total(agg: stddev, period: 1d, window: 30d)",
+      macro_metric_avg: str = "metrics.auth_attempts_total(period: 1d, window: 30d, metric: event_count_sum, agg: avg, target.user.userid: target.user.userid)",
+      macro_metric_std: str = "metrics.auth_attempts_total(period: 1d, window: 30d, metric: event_count_sum, agg: stddev, target.user.userid: target.user.userid)",
       raw_signature_field: str = "principal.ip",
       lookback_days: int = 14,
   ) -> Dict[str, Any]:
     """Fuses 30-day macro baseline deviation with raw UDM micro-telemetry signatures."""
     start_iso, end_iso = self._iso_window(lookback_days)
     tpl_path = self.runner.find_template(self.SKILL_NAME, "hybrid_metric_raw_enrichment_2stage.yl2")
-    
+    if "target.user.userid:" not in macro_metric_avg and "principal." not in macro_metric_avg:
+      macro_metric_avg = "metrics.auth_attempts_total(period: 1d, window: 30d, metric: event_count_sum, agg: avg, target.user.userid: target.user.userid)"
+    if "target.user.userid:" not in macro_metric_std and "principal." not in macro_metric_std:
+      macro_metric_std = "metrics.auth_attempts_total(period: 1d, window: 30d, metric: event_count_sum, agg: stddev, target.user.userid: target.user.userid)"
+    macro_metric_active = "metrics.auth_attempts_total(period: 1d, window: 30d, metric: event_count_sum, agg: num_metric_periods, target.user.userid: target.user.userid)"
+
     params = {
         "macro_event_type": "USER_LOGIN",
         "macro_entity_field": "target.user.userid",
@@ -1432,7 +1481,7 @@ order:
         "macro_observed_agg": "count(metadata.id)",
         "target_metric_func_avg": macro_metric_avg,
         "target_metric_func_stddev": macro_metric_std,
-        "target_metric_func_active_days": "30",
+        "target_metric_func_active_days": macro_metric_active,
         "raw_event_type": "USER_LOGIN",
         "raw_entity_field": "target.user.userid",
         "raw_event_filter": f'target.user.userid = "{username}"',
@@ -1472,6 +1521,51 @@ order:
         "distinct_micro_signatures": distinct_sigs,
         "calibrated_risk_index": cri,
         "is_outlier": cri >= 46,
+        "stats_rows": len(rows),
+        "executed_query": rendered,
+    }
+
+  async def run_data_table_bridge(
+      self,
+      session: ClientSession,
+      entity: str = "*",
+      data_table_name: str = "ueba_hunt_bridge",
+      column_name: str = "hostname",
+      lookback_days: int = 14,
+  ) -> Dict[str, Any]:
+    """Scores 30-day behavioral metric departures for a bridged cohort stored in a SecOps Data Table."""
+    start_iso, end_iso = self._iso_window(lookback_days)
+    tpl_path = self.runner.find_template(self.SKILL_NAME, "hybrid_data_table_bridge_2stage.yl2")
+    rendered = self.runner.render_template(tpl_path, {})
+    if data_table_name != "ueba_hunt_bridge" or column_name != "hostname":
+      rendered = rendered.replace("%ueba_hunt_bridge.hostname", f"%{data_table_name}.{column_name}")
+    rendered = self.runner.scope_query_to_entity(rendered, entity, entity_type="ASSET")
+    resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
+    rows = self.runner.parse_stats_response(resp)
+
+    personal_z = 0.0
+    observed_24h = 0.0
+    baseline_mean = 0.0
+    active_days = 0
+    if rows:
+      top_row = rows[0]
+      personal_z = float(top_row.get("personal_z") or top_row.get("$personal_z") or top_row.get("z_score") or 0.0)
+      observed_24h = float(top_row.get("observed_24h") or top_row.get("$observed_24h") or 0.0)
+      baseline_mean = float(top_row.get("baseline_mean") or top_row.get("$baseline_mean") or 0.0)
+      active_days = int(float(top_row.get("active_days") or top_row.get("$active_days") or 0))
+
+    cri = self.runner.calculate_cri(personal_z)
+    return {
+        "entity": entity,
+        "model": "HYBRID_DATA_TABLE_BRIDGE_2STAGE",
+        "data_table": f"%{data_table_name}.{column_name}",
+        "personal_z": round(personal_z, 2),
+        "top_z_score": round(personal_z, 2),
+        "observed_24h": observed_24h,
+        "baseline_mean": round(baseline_mean, 2),
+        "active_days": active_days,
+        "calibrated_risk_index": cri,
+        "is_outlier": cri >= 60 or personal_z >= 3.0,
         "stats_rows": len(rows),
         "executed_query": rendered,
     }

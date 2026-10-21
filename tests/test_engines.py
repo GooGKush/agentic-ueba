@@ -196,8 +196,10 @@ def test_ewma_burst_velocity_template_rendering():
       "tier": "STANDARD",
   })
   assert "Exponentially Weighted Moving Average (EWMA)" in rendered
-  assert "trailing_hourly_baseline" in rendered
+  assert "stage entity_baseline" in rendered
+  assert "stage entity_historical_stats" in rendered
   assert "$ewma_velocity_score" in rendered
+  assert "$velocity_score" in rendered
   assert "{{velocity_threshold}}" not in rendered
 
 
@@ -2437,7 +2439,120 @@ async def test_workspace_triad_and_outcome_variable_alignment(monkeypatch):
   assert pc_res["is_outlier"] is True
 
 
+def test_v212_v282_skill_alignment_and_score_extraction(monkeypatch):
+  import asyncio
+  asyncio.run(_async_v212_v282_skill_alignment_and_score_extraction(monkeypatch))
 
 
+async def _async_v212_v282_skill_alignment_and_score_extraction(monkeypatch):
+  """Verifies agentic_ueba alignment with secops-risk-metrics-multistage v2.1.2 and secops-statistical-hunter v2.8.2."""
+  from src.query_integrity_gate import QueryIntegrityGate, QueryValidationError
 
+  rm_engine = RiskMetricsEngine()
+  sh_engine = StatsHunterEngine()
 
+  # 1. QueryIntegrityGate ignores commented-out %table references (e.g. privileged_lateral_expansion_2stage.yl2)
+  builder = sh_engine._get_stats_hunter_builder()
+  priv_q = builder.MultiStageTemplateRouter().build_query(
+      archetype="PRIVILEGED_LATERAL_EXPANSION",
+      tier="BALANCED",
+      entity_type="user",
+  )
+  gate_res = QueryIntegrityGate.validate_preflight_query(priv_q, raise_on_error=True)
+  assert gate_res["valid"] is True
+
+  # Bare %table in active code is still caught
+  with pytest.raises(QueryValidationError):
+    QueryIntegrityGate.verify_pre_dispatch("stage s1 { principal.hostname in %bad_table match: $h outcome: $c = count(metadata.id) }")
+
+  # 2. Verify Stage 2 math model score extraction for v2.1.2 outcome names
+  model_mock_rows = [
+      ("HOURLY_TEMPORAL_ZSCORE", {"hourly_z": 6.25, "hourly_observed": 120, "expected_hourly_mean": 5.0}, 6.25),
+      ("FLEET_PREVALENCE_SHIELD", {"shielded_z": 4.10, "personal_z": 9.80, "observed_val": 50, "hist_avg": 5.0}, 4.10),
+      ("ADAPTIVE_CONTEXT_THRESHOLD", {"sensitivity_excess": 3.75, "personal_z": 7.20, "observed_val": 40, "hist_avg": 4.0}, 3.75),
+      ("TWO_PART_HURDLE", {"hurdle_threat_score": 12.40, "dormant_score": 12.40, "intensity_z": 2.1, "observed_val": 10}, 12.40),
+      ("ASYMMETRIC_DIRECTIONAL_Z", {"upper_tail_z": 5.15, "observed_val": 80, "hist_avg": 10.0}, 5.15),
+      ("VARIANCE", {"fano_factor": 8.50, "observed_val": 60, "hist_avg": 7.0}, 8.50),
+      ("POISSON", {"poisson_z": 4.85, "observed_val": 25, "hist_avg": 2.0}, 4.85),
+      ("PIECEWISE_CRI", {"cri_score": 88.0, "clamped_z": 5.50, "raw_z": 5.50, "observed_val": 90}, 5.50),
+      ("LONGITUDINAL_CUSUM", {"cusum_drift": 7.40, "drift_days": 4, "max_daily_z": 3.80, "daily_mean": 12.0}, 7.40),
+      ("DIVERSITY_DEFICIT_ENTROPY", {"diversity_ratio": 4.20, "observed_val": 50, "hist_avg": 10.0}, 4.20),
+  ]
+
+  for model_name, fake_row, expected_score in model_mock_rows:
+    async def _fake_exec(session, query, start_iso, end_iso, _row=fake_row):
+      # Validate query through QueryIntegrityGate before returning mock row
+      QueryIntegrityGate.verify_pre_dispatch(
+          query,
+          ast_validator_fn=rm_engine.runner.validate_ast,
+          raise_on_error=True,
+      )
+      return _row
+
+    monkeypatch.setattr(rm_engine.runner, "execute_query_via_mcp", _fake_exec)
+    monkeypatch.setattr(rm_engine.runner, "parse_stats_response", lambda resp: [resp])
+    res = await rm_engine.run_dynamic_metric_pipeline(
+        session=None,
+        entity="alex.lund",
+        entity_type="USER",
+        target_metric="auth_attempts_total",
+        model_name=model_name,
+    )
+    assert res["top_z_score"] == pytest.approx(expected_score, 0.01)
+    if model_name == "PIECEWISE_CRI":
+      assert res["calibrated_risk_index"] == 88
+    if model_name == "LONGITUDINAL_CUSUM":
+      assert res["drift_days"] == 4
+      assert res["max_daily_z"] == pytest.approx(3.80, 0.01)
+
+  # 3. Verify HTTP_ERROR_RATIO_SURGE_2STAGE metric guard & HYBRID_DATA_TABLE_BRIDGE_2STAGE
+  for pipe_model in ("HTTP_ERROR_RATIO_SURGE_2STAGE", "HYBRID_DATA_TABLE_BRIDGE_2STAGE"):
+    async def _fake_pipe_exec(session, query, start_iso, end_iso):
+      QueryIntegrityGate.verify_pre_dispatch(
+          query,
+          ast_validator_fn=rm_engine.runner.validate_ast,
+          raise_on_error=True,
+      )
+      return {"personal_z": 4.5, "z_score": 4.5, "observed_24h": 100.0, "baseline_mean": 10.0}
+
+    monkeypatch.setattr(rm_engine.runner, "execute_query_via_mcp", _fake_pipe_exec)
+    monkeypatch.setattr(rm_engine.runner, "parse_stats_response", lambda resp: [resp])
+    p_res = await rm_engine.run_dynamic_metric_pipeline(
+        session=None,
+        entity="srv-web-01",
+        entity_type="ASSET",
+        target_metric="http_queries_total",
+        model_name=pipe_model,
+    )
+    assert p_res["top_z_score"] == 4.5
+
+  # 4. Verify run_hybrid_enrichment passes un-mocked QueryIntegrityGate with num_metric_periods
+  async def _fake_hybrid_exec(session, query, start_iso, end_iso):
+    assert "num_metric_periods" in query
+    QueryIntegrityGate.verify_pre_dispatch(
+        query,
+        ast_validator_fn=rm_engine.runner.validate_ast,
+        raise_on_error=True,
+    )
+    return {"macro_z_score": 5.2, "signature_diversity": 2}
+
+  monkeypatch.setattr(rm_engine.runner, "execute_query_via_mcp", _fake_hybrid_exec)
+  monkeypatch.setattr(rm_engine.runner, "parse_stats_response", lambda resp: [resp])
+  h_res = await rm_engine.run_hybrid_enrichment(session=None, username="frank.kolzig")
+  assert h_res["macro_z_score"] == 5.2
+
+  # 5. Verify StatsHunterEngine.run_dynamic_archetype_pipeline across v2.8.2 templates
+  async def _fake_sh_exec(session, query, start_iso, end_iso):
+    QueryIntegrityGate.verify_pre_dispatch(query, raise_on_error=True)
+    return {"z_score": 4.2, "ewma_velocity_score": 4.2, "velocity_score": 4.2}
+
+  monkeypatch.setattr(sh_engine.runner, "execute_query_via_mcp", _fake_sh_exec)
+  monkeypatch.setattr(sh_engine.runner, "parse_stats_response", lambda resp: [resp])
+  for arch in ("ZSCORE_PROCESS_SURGE", "EWMA_BURST_VELOCITY", "PRIVILEGED_LATERAL_EXPANSION", "DERIVED_CONTEXT_PREVALENCE"):
+    sh_res = await sh_engine.run_dynamic_archetype_pipeline(
+        session=None,
+        entity="wks-eng-01",
+        archetype=arch,
+        entity_type="ASSET",
+    )
+    assert sh_res["top_z_score"] == 4.2
