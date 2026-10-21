@@ -87,7 +87,9 @@ class QueryIntegrityGate:
       errors.extend(ast_errors)
 
     # Check bare Data Table equality or `in` membership without column specification
-    code_no_literals = re.sub(r'"(?:\\.|[^"\\])*"', '""', query)
+    code_no_comments = re.sub(r"//[^\n]*", "", query)
+    code_no_comments = re.sub(r"/\*.*?\*/", "", code_no_comments, flags=re.DOTALL)
+    code_no_literals = re.sub(r'"(?:\\.|[^"\\])*"', '""', code_no_comments)
     for m_dt in re.finditer(r"(?:=|\bin)\s*%([a-zA-Z0-9_]+)(?![.\w])", code_no_literals):
       errors.append(
           f"INVALID_DATA_TABLE_COLUMN_SYNTAX: Data Table reference '%{m_dt.group(1)}' must specify a column (e.g., '%{m_dt.group(1)}.column_name')."
@@ -121,6 +123,8 @@ class QueryIntegrityGate:
     if not valid and raise_on_error:
       raise QueryValidationError(errors, query=query)
     return {"valid": valid, "passed": valid, "errors": errors}
+
+  validate_preflight_query = verify_pre_dispatch
 
   @classmethod
   def verify_backend_response(

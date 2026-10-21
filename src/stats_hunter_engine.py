@@ -47,9 +47,11 @@ class StatsHunterEngine:
     spec.loader.exec_module(mod)
     return mod
 
-  def _iso_window(self, lookback_days: int) -> Tuple[str, str]:
-    """Generates strict ISO 8601 UTC start and end timestamps."""
+  def _iso_window(self, lookback_days: int, is_entity_graph: bool = False) -> Tuple[str, str]:
+    """Generates strict ISO 8601 UTC start and end timestamps (shifts end_dt back 48h for D-2 Entity Graph queries)."""
     end_dt = datetime.now(timezone.utc)
+    if is_entity_graph:
+      end_dt = end_dt - timedelta(hours=48)
     start_dt = end_dt - timedelta(days=lookback_days)
     return (
         start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -429,7 +431,13 @@ class StatsHunterEngine:
     velocity_score = 0.0
     if rows:
       top_row = rows[0]
-      velocity_score = float(top_row.get("ewma_velocity_score", top_row.get("$ewma_velocity_score", 0.0)) or 0.0)
+      velocity_score = float(
+          top_row.get("ewma_velocity_score")
+          or top_row.get("$ewma_velocity_score")
+          or top_row.get("velocity_score")
+          or top_row.get("$velocity_score")
+          or 0.0
+      )
 
     cri = self.runner.calculate_cri(velocity_score)
     is_outlier = cri >= 60 or velocity_score >= velocity_threshold
@@ -437,6 +445,7 @@ class StatsHunterEngine:
         "entity": entity,
         "model": "EWMA_BURST_VELOCITY",
         "ewma_velocity_score": round(velocity_score, 2),
+        "velocity_score": round(velocity_score, 2),
         "top_z_score": round(velocity_score, 2),
         "calibrated_risk_index": cri,
         "is_outlier": is_outlier,
@@ -553,6 +562,89 @@ class StatsHunterEngine:
         "top_z_score": round(pcr_score, 2),
         "calibrated_risk_index": cri,
         "is_outlier": is_outlier,
+        "stats_rows": len(rows),
+        "executed_query": rendered,
+    }
+
+
+  async def run_dynamic_archetype_pipeline(
+      self,
+      session: ClientSession,
+      entity: str = "*",
+      archetype: str = "ZSCORE_PROCESS_SURGE",
+      entity_type: str = "ASSET",
+      event_type: Optional[str] = None,
+      lookback_days: int = 7,
+      tier: str = "BALANCED",
+  ) -> Dict[str, Any]:
+    """Executes any of the 23 canonical secops-statistical-hunter (v2.8.2) raw UDM multi-stage templates."""
+    builder = self._get_stats_hunter_builder()
+    router = builder.MultiStageTemplateRouter()
+    arch_up = archetype.strip().upper()
+    is_ecg = any(
+        k in arch_up
+        for k in ("DERIVED_CONTEXT", "GLOBAL_THREAT_INTEL", "GLOBAL_CONTEXT", "WHOIS", "ASSET_AGE", "FILE_PREVALENCE", "DOMAIN_PREVALENCE")
+    )
+    ent_lower = "user" if entity_type.upper() == "USER" else ("ip" if entity_type.upper() == "IP" else "host")
+    window_hours = float(max(1, lookback_days) * 24)
+    rendered = router.build_query(
+        archetype=arch_up,
+        tier=tier,
+        entity_type=ent_lower,
+        event_type=event_type,
+        window_hours=window_hours,
+    )
+    if "DERIVED_CONTEXT" in rendered or "GLOBAL_CONTEXT" in rendered:
+      is_ecg = True
+    start_iso, end_iso = self._iso_window(lookback_days, is_entity_graph=is_ecg)
+    rendered = self.runner.scope_query_to_entity(rendered, entity, entity_type=entity_type)
+    resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
+    rows = self.runner.parse_stats_response(resp)
+
+    primary_score = 0.0
+    score_metric = "z_score"
+    if rows:
+      top_row = rows[0]
+      score_keys = list(getattr(builder, "PRIMARY_SCORE_KEYS", ())) + [
+          "ewma_velocity_score",
+          "velocity_score",
+          "markov_threat_score",
+          "shannon_entropy_score",
+          "zipf_rarity_score",
+          "pcr_z_score",
+          "producer_ratio",
+      ]
+      for k in score_keys:
+        if k in top_row and top_row[k] is not None:
+          score_metric = k
+          primary_score = float(top_row[k])
+          break
+        if f"${k}" in top_row and top_row[f"${k}"] is not None:
+          score_metric = k
+          primary_score = float(top_row[f"${k}"])
+          break
+
+    if score_metric == "cv" and rows:
+      z_equiv = max(0.0, (1.0 - primary_score) * 6.0)
+    elif score_metric == "diversity_z":
+      z_equiv = max(0.0, -primary_score)
+    elif score_metric in ("poisson_z_sq", "threat_vector_norm_sq"):
+      z_equiv = math.sqrt(max(0.0, primary_score))
+    elif score_metric in ("velocity_kmh", "max_velocity_kmh"):
+      z_equiv = max(0.0, primary_score / 250.0)
+    else:
+      z_equiv = max(0.0, primary_score)
+
+    cri = self.runner.calculate_cri(z_equiv) if rows else 14
+    return {
+        "entity": entity,
+        "entity_type": entity_type,
+        "model": arch_up,
+        "score_metric": score_metric,
+        "primary_score": round(primary_score, 3),
+        "top_z_score": round(z_equiv, 2),
+        "calibrated_risk_index": cri,
+        "is_outlier": bool(rows) and (cri >= 60 or z_equiv >= 3.0),
         "stats_rows": len(rows),
         "executed_query": rendered,
     }
