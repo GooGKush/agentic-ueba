@@ -33,6 +33,7 @@ except ImportError:
 
 from src.config import TenantConfig
 from src.models import JITHuntRequest, JITHuntResponse
+from src.playbook_runner import PlaybookRunner
 from src.risk_metrics_engine import RiskMetricsEngine
 from src.strategy_decider import StrategyDecider
 
@@ -151,6 +152,9 @@ class WatchdogState:
     self.fleet_360_emissions: Dict[str, Dict[str, Any]] = {}
     self.last_fleet_360_sweep_time: Optional[str] = None
     self.fleet_360_sweeps: List[Dict[str, Any]] = []
+    self.playbooks: Dict[str, Dict[str, Any]] = {}
+    self.playbook_emissions: Dict[str, Dict[str, Any]] = {}
+    self.playbook_runs: List[Dict[str, Any]] = []
     self.load()
 
   def load(self) -> None:
@@ -171,6 +175,15 @@ class WatchdogState:
         raw_sweeps = data.get("fleet_360_sweeps", [])
         if isinstance(raw_sweeps, list):
           self.fleet_360_sweeps = raw_sweeps[-50:]
+        raw_playbooks = data.get("playbooks", {})
+        if isinstance(raw_playbooks, dict):
+          self.playbooks = raw_playbooks
+        raw_pb_emissions = data.get("playbook_emissions", {})
+        if isinstance(raw_pb_emissions, dict):
+          self.playbook_emissions = raw_pb_emissions
+        raw_pb_runs = data.get("playbook_runs", [])
+        if isinstance(raw_pb_runs, list):
+          self.playbook_runs = raw_pb_runs[-50:]
         logger.info(f"Loaded watchdog state with {len(self.seen_case_ids)} seen cases.")
       except Exception as e:
         logger.warning(f"Failed loading watchdog state file: {e}")
@@ -186,6 +199,9 @@ class WatchdogState:
           "fleet_360_emissions": self.fleet_360_emissions,
           "last_fleet_360_sweep_time": self.last_fleet_360_sweep_time,
           "fleet_360_sweeps": self.fleet_360_sweeps[-50:],
+          "playbooks": self.playbooks,
+          "playbook_emissions": self.playbook_emissions,
+          "playbook_runs": self.playbook_runs[-50:],
       }
       # Atomic file replacement prevents corrupted state writes during process interruption
       tmp_file = self.state_file.with_suffix(".tmp")
@@ -284,6 +300,70 @@ class WatchdogState:
       self.fleet_360_sweeps = self.fleet_360_sweeps[-50:]
     self.save()
 
+  def should_emit_playbook_match(
+      self,
+      bucket_date: str,
+      playbook_id: str,
+      query_id: str,
+      entity_id: str,
+      effective_z: float,
+      min_delta_z: float = 2.0,
+  ) -> bool:
+    """Intra-day deduplication check for scheduled Markdown playbook hunts."""
+    key = f"{bucket_date}:{playbook_id.lower()}:{query_id.lower()}:{entity_id.lower()}"
+    prev = self.playbook_emissions.get(key)
+    if not prev:
+      return True
+    prev_z = float(prev.get("effective_z", 0.0))
+    if (float(effective_z) - prev_z) >= min_delta_z:
+      return True
+    return False
+
+  def record_playbook_emission(
+      self,
+      bucket_date: str,
+      playbook_id: str,
+      query_id: str,
+      entity_id: str,
+      effective_z: float,
+      cri_score: int,
+  ) -> None:
+    """Records an intra-day playbook match emission for deduplication across sweeps."""
+    key = f"{bucket_date}:{playbook_id.lower()}:{query_id.lower()}:{entity_id.lower()}"
+    prev = self.playbook_emissions.get(key, {})
+    prev_z = float(prev.get("effective_z", 0.0))
+    prev_cri = int(prev.get("cri_score", 0))
+    self.playbook_emissions[key] = {
+        "bucket_date": bucket_date,
+        "playbook_id": playbook_id,
+        "query_id": query_id,
+        "entity_id": entity_id.lower(),
+        "effective_z": round(max(prev_z, float(effective_z)), 2),
+        "cri_score": max(prev_cri, int(cri_score)),
+        "emission_count": int(prev.get("emission_count", 0)) + 1,
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    while len(self.playbook_emissions) > self.max_state_size:
+      oldest_key = next(iter(self.playbook_emissions))
+      self.playbook_emissions.pop(oldest_key, None)
+    self.save()
+
+  def record_playbook_run(self, run_summary: Dict[str, Any]) -> None:
+    """Persists summary telemetry for a completed Markdown playbook hunt pass."""
+    pb_id = str(run_summary.get("playbook_id", ""))
+    ts = run_summary.get("timestamp") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if pb_id and pb_id in self.playbooks:
+      self.playbooks[pb_id]["last_run_time"] = ts
+      self.playbooks[pb_id]["last_status"] = run_summary.get("status", "SUCCESS")
+      self.playbooks[pb_id]["last_matches_found"] = run_summary.get("total_matches_found", 0)
+      self.playbooks[pb_id]["last_events_emitted"] = run_summary.get("total_matches_emitted", 0)
+      if run_summary.get("content_sha256"):
+        self.playbooks[pb_id]["content_sha256"] = run_summary["content_sha256"]
+    self.playbook_runs.append(run_summary)
+    if len(self.playbook_runs) > 50:
+      self.playbook_runs = self.playbook_runs[-50:]
+    self.save()
+
   def reset(self) -> None:
     self.seen_case_ids.clear()
     self.recent_results.clear()
@@ -291,6 +371,8 @@ class WatchdogState:
     self.fleet_360_emissions.clear()
     self.fleet_360_sweeps.clear()
     self.last_fleet_360_sweep_time = None
+    self.playbook_emissions.clear()
+    self.playbook_runs.clear()
     self.save()
 
   def get_activity_report(
@@ -418,18 +500,44 @@ class WatchdogDaemon:
 
     self._scan_task: Optional[asyncio.Task] = None
     self._fleet_360_task: Optional[asyncio.Task] = None
+    self._playbook_task: Optional[asyncio.Task] = None
     self._task: Optional[asyncio.Task] = None  # Backward-compatibility alias
     self._workers: List[asyncio.Task] = []
     self._work_queue: Optional[asyncio.Queue] = None
     self._in_flight_case_ids: Set[str] = set()
     self._scan_lock = asyncio.Lock()
     self._fleet_360_lock = asyncio.Lock()
+    self._playbook_lock = asyncio.Lock()
     self._active_worker_count = 0
     self._is_running = False
+    self._playbook_scheduler_running = False
+    self.playbook_runner = PlaybookRunner(
+        tenant_config=self.tenant,
+        risk_engine=getattr(self.engine, "risk_engine", None),
+    )
 
   @property
   def is_running(self) -> bool:
     return self._is_running and self._scan_task is not None and not self._scan_task.done()
+
+  @property
+  def is_playbook_scheduler_running(self) -> bool:
+    return (
+        self._playbook_scheduler_running
+        and self._playbook_task is not None
+        and not self._playbook_task.done()
+    )
+
+  def _ensure_playbook_scheduler(self) -> None:
+    """Starts the background playbook scheduler loop if any playbook is enabled."""
+    has_enabled = any(pb.get("enabled", True) for pb in self.state.playbooks.values())
+    if has_enabled and not self.is_playbook_scheduler_running:
+      try:
+        loop = asyncio.get_running_loop()
+        self._playbook_scheduler_running = True
+        self._playbook_task = loop.create_task(self._playbook_loop())
+      except RuntimeError:
+        pass
 
   def start(self) -> Dict[str, Any]:
     """Starts the background producer-consumer monitoring loop, worker pool, and 4h fleet 360 sweep."""
@@ -446,6 +554,7 @@ class WatchdogDaemon:
     self._task = self._scan_task
     if self.fleet_360_enabled:
       self._fleet_360_task = asyncio.create_task(self._fleet_360_loop())
+    self._ensure_playbook_scheduler()
     logger.info(
         f"Watchdog daemon started. Polling every {self.interval_seconds}s "
         f"with {self.worker_concurrency} workers (queue capacity {self.queue_size}, "
@@ -458,18 +567,22 @@ class WatchdogDaemon:
         "queue_size": self.queue_size,
         "fleet_360_enabled": self.fleet_360_enabled,
         "fleet_360_interval_seconds": self.fleet_360_interval_seconds,
+        "playbooks_registered": len(self.state.playbooks),
     }
 
   def stop(self) -> Dict[str, Any]:
     """Stops the background monitoring loop and worker tasks cleanly."""
-    if not self.is_running:
+    if not self.is_running and not self.is_playbook_scheduler_running:
       return {"status": "NOT_RUNNING"}
 
     self._is_running = False
+    self._playbook_scheduler_running = False
     if self._scan_task and not self._scan_task.done():
       self._scan_task.cancel()
     if self._fleet_360_task and not self._fleet_360_task.done():
       self._fleet_360_task.cancel()
+    if self._playbook_task and not self._playbook_task.done():
+      self._playbook_task.cancel()
     for w in self._workers:
       if not w.done():
         w.cancel()
@@ -500,6 +613,10 @@ class WatchdogDaemon:
         "last_fleet_360_sweep_time": self.state.last_fleet_360_sweep_time,
         "fleet_360_tracked_entities": len(self.state.fleet_360_emissions),
         "fleet_360_recent_sweeps": self.state.fleet_360_sweeps[-5:],
+        "playbook_scheduler_running": self.is_playbook_scheduler_running,
+        "playbooks_registered": len(self.state.playbooks),
+        "playbooks": list(self.state.playbooks.values()),
+        "playbook_recent_runs": self.state.playbook_runs[-5:],
     }
 
   async def _worker_loop(self, worker_id: int) -> None:
@@ -1064,4 +1181,271 @@ class WatchdogDaemon:
         await asyncio.sleep(self.fleet_360_interval_seconds)
       except asyncio.CancelledError:
         break
+
+  async def register_playbook(
+      self,
+      url: str,
+      playbook_id: Optional[str] = None,
+      interval_seconds: int = 14400,
+      ingest_events: bool = True,
+      unscope_seeded_to_fleet: bool = False,
+      inter_query_delay_sec: float = 1.0,
+      enabled: bool = True,
+      run_immediately: bool = False,
+      http_client: Optional[httpx.AsyncClient] = None,
+      mcp_session: Optional[Any] = None,
+  ) -> Dict[str, Any]:
+    """Fetches, parses, AST-validates, and registers a Markdown hunting playbook subscription."""
+    pb_id = (playbook_id or PlaybookRunner.derive_playbook_id(url)).strip().lower()
+    md_text, norm_source, content_sha = await self.playbook_runner.fetch_markdown(
+        url, http_client=http_client
+    )
+    specs = self.playbook_runner.parse_markdown_playbook(md_text)
+    valid_count = sum(1 for s in specs if not s.ast_errors)
+    invalid_count = len(specs) - valid_count
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    existing = self.state.playbooks.get(pb_id, {})
+    record = {
+        "playbook_id": pb_id,
+        "url": url,
+        "normalized_source": norm_source,
+        "content_sha256": content_sha,
+        "enabled": bool(enabled),
+        "interval_seconds": max(60, int(interval_seconds)),
+        "ingest_events": bool(ingest_events),
+        "unscope_seeded_to_fleet": bool(unscope_seeded_to_fleet),
+        "inter_query_delay_sec": float(inter_query_delay_sec),
+        "queries_discovered": len(specs),
+        "queries_ast_valid": valid_count,
+        "queries_ast_invalid": invalid_count,
+        "queries": [s.to_dict(include_query=False) for s in specs],
+        "registered_at": existing.get("registered_at", now_iso),
+        "updated_at": now_iso,
+        "last_run_time": existing.get("last_run_time"),
+        "last_status": existing.get("last_status", "REGISTERED"),
+        "last_matches_found": existing.get("last_matches_found", 0),
+        "last_events_emitted": existing.get("last_events_emitted", 0),
+    }
+    self.state.playbooks[pb_id] = record
+    self.state.save()
+
+    if enabled:
+      self._ensure_playbook_scheduler()
+
+    immediate_run_report = None
+    if run_immediately:
+      immediate_run_report = await self.run_playbook_once(
+          playbook_id=pb_id,
+          http_client=http_client,
+          mcp_session=mcp_session,
+      )
+
+    return {
+        "status": "REGISTERED",
+        "playbook": self.state.playbooks[pb_id],
+        "scheduler_running": self.is_playbook_scheduler_running,
+        "immediate_run": immediate_run_report,
+    }
+
+  def stop_playbook(
+      self,
+      playbook_id: str,
+      delete: bool = False,
+  ) -> Dict[str, Any]:
+    """Stops (disables) or deletes a registered Markdown playbook subscription."""
+    pb_id = playbook_id.strip().lower()
+    if pb_id not in self.state.playbooks:
+      return {"status": "NOT_FOUND", "playbook_id": pb_id}
+
+    if delete:
+      removed = self.state.playbooks.pop(pb_id)
+      self.state.save()
+      if not any(pb.get("enabled", False) for pb in self.state.playbooks.values()):
+        self._playbook_scheduler_running = False
+        if self._playbook_task and not self._playbook_task.done():
+          self._playbook_task.cancel()
+      return {"status": "DELETED", "playbook_id": pb_id, "playbook": removed}
+
+    self.state.playbooks[pb_id]["enabled"] = False
+    self.state.playbooks[pb_id]["updated_at"] = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    self.state.save()
+
+    if not any(pb.get("enabled", False) for pb in self.state.playbooks.values()):
+      self._playbook_scheduler_running = False
+      if self._playbook_task and not self._playbook_task.done():
+        self._playbook_task.cancel()
+
+    return {
+        "status": "STOPPED",
+        "playbook_id": pb_id,
+        "playbook": self.state.playbooks[pb_id],
+        "scheduler_running": self.is_playbook_scheduler_running,
+    }
+
+  def list_playbooks(self, playbook_id: Optional[str] = None) -> Dict[str, Any]:
+    """Lists registered Markdown playbooks and recent execution history."""
+    if playbook_id:
+      pb_id = playbook_id.strip().lower()
+      pb = self.state.playbooks.get(pb_id)
+      if not pb:
+        return {"status": "NOT_FOUND", "playbook_id": pb_id}
+      runs = [r for r in self.state.playbook_runs if r.get("playbook_id") == pb_id]
+      return {
+          "status": "SUCCESS",
+          "scheduler_running": self.is_playbook_scheduler_running,
+          "playbook": pb,
+          "recent_runs": runs[-10:],
+      }
+
+    return {
+        "status": "SUCCESS",
+        "scheduler_running": self.is_playbook_scheduler_running,
+        "total_playbooks": len(self.state.playbooks),
+        "playbooks": list(self.state.playbooks.values()),
+        "recent_runs": self.state.playbook_runs[-15:],
+    }
+
+  async def run_playbook_once(
+      self,
+      playbook_id: Optional[str] = None,
+      url: Optional[str] = None,
+      ingest_events: Optional[bool] = None,
+      unscope_seeded_to_fleet: Optional[bool] = None,
+      inter_query_delay_sec: Optional[float] = None,
+      lookback_days_override: Optional[int] = None,
+      now_utc: Optional[datetime] = None,
+      http_client: Optional[httpx.AsyncClient] = None,
+      mcp_session: Optional[Any] = None,
+  ) -> Dict[str, Any]:
+    """Executes a single pass of a registered or ad-hoc Markdown hunting playbook."""
+    if self._playbook_lock.locked():
+      logger.warning("Playbook hunt pass is already in progress. Skipping concurrent run.")
+      return {"status": "SKIPPED_CONCURRENT"}
+
+    async with self._playbook_lock:
+      pb_cfg: Dict[str, Any] = {}
+      if playbook_id:
+        pb_id_clean = playbook_id.strip().lower()
+        pb_cfg = self.state.playbooks.get(pb_id_clean, {})
+        if not pb_cfg and not url:
+          raise KeyError(f"Playbook '{pb_id_clean}' is not registered.")
+      else:
+        pb_id_clean = PlaybookRunner.derive_playbook_id(url or "playbook")
+
+      target_url = url or pb_cfg.get("url")
+      if not target_url:
+        raise ValueError("Either a registered 'playbook_id' or 'url' must be provided.")
+
+      use_ingest = (
+          bool(ingest_events)
+          if ingest_events is not None
+          else bool(pb_cfg.get("ingest_events", True))
+      )
+      use_unscope = (
+          bool(unscope_seeded_to_fleet)
+          if unscope_seeded_to_fleet is not None
+          else bool(pb_cfg.get("unscope_seeded_to_fleet", False))
+      )
+      use_delay = (
+          float(inter_query_delay_sec)
+          if inter_query_delay_sec is not None
+          else float(pb_cfg.get("inter_query_delay_sec", 1.0))
+      )
+
+      async def _run_with_session(session: Any) -> Dict[str, Any]:
+        report = await self.playbook_runner.execute_playbook(
+            session=session,
+            source=target_url,
+            playbook_id=pb_id_clean,
+            ingest_events=use_ingest,
+            unscope_seeded_to_fleet=use_unscope,
+            inter_query_delay_sec=use_delay,
+            lookback_days_override=lookback_days_override,
+            now_utc=now_utc,
+            should_emit_fn=self.state.should_emit_playbook_match,
+            record_emit_fn=self.state.record_playbook_emission,
+            http_client=http_client,
+        )
+        self.state.record_playbook_run({
+            "timestamp": report["timestamp"],
+            "playbook_id": report["playbook_id"],
+            "source": report["source"],
+            "content_sha256": report["content_sha256"],
+            "status": report["status"],
+            "queries_discovered": report["queries_discovered"],
+            "queries_executed": report["queries_executed"],
+            "queries_skipped": report["queries_skipped"],
+            "total_matches_found": report["total_matches_found"],
+            "total_matches_emitted": report["total_matches_emitted"],
+            "total_matches_suppressed_dedup": report["total_matches_suppressed_dedup"],
+            "total_udm_events_generated": report["total_udm_events_generated"],
+        })
+        return report
+
+      if mcp_session is not None:
+        return await _run_with_session(mcp_session)
+
+      if not self.tenant.project_id or not self.tenant.customer_id:
+        return {
+            "status": "SKIPPED_MISSING_CONFIG",
+            "playbook_id": pb_id_clean,
+            "timestamp": (now_utc or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+
+      headers = self.tenant.get_auth_headers()
+      custom_timeout = httpx.Timeout(30.0, read=120.0, write=120.0, pool=120.0)
+      async with httpx.AsyncClient(headers=headers, timeout=custom_timeout, follow_redirects=True):
+        def _create_mcp_context():
+          try:
+            return streamable_http_client(
+                self.tenant.mcp_url, headers=headers, timeout=60.0, sse_read_timeout=300.0
+            )
+          except TypeError:
+            return streamable_http_client(self.tenant.mcp_url, headers=headers)
+
+        mcp_context = _create_mcp_context()
+        async with mcp_context as streams, ClientSession(streams[0], streams[1]) as session:
+          await session.initialize()
+          return await _run_with_session(session)
+
+  async def _playbook_loop(self) -> None:
+    """Background scheduler loop executing registered Markdown playbooks when due."""
+    logger.info("Markdown Playbook scheduler loop started.")
+    while self._playbook_scheduler_running:
+      try:
+        now = datetime.now(timezone.utc)
+        for pb_id, pb_cfg in list(self.state.playbooks.items()):
+          if not pb_cfg.get("enabled", True):
+            continue
+          interval = max(60, int(pb_cfg.get("interval_seconds", 14400)))
+          last_run_str = pb_cfg.get("last_run_time")
+          is_due = True
+          if last_run_str:
+            try:
+              last_dt = datetime.fromisoformat(str(last_run_str).replace("Z", "+00:00"))
+              elapsed = (now - last_dt).total_seconds()
+              is_due = elapsed >= interval
+            except Exception:
+              is_due = True
+
+          if is_due:
+            logger.info(f"Scheduled Markdown playbook '{pb_id}' is due; starting execution pass.")
+            try:
+              await self.run_playbook_once(playbook_id=pb_id)
+            except Exception as pb_err:
+              logger.error(f"Scheduled playbook '{pb_id}' execution failed: {_unwrap_exception(pb_err)}")
+      except asyncio.CancelledError:
+        logger.info("Markdown Playbook scheduler loop cancelled.")
+        break
+      except Exception as e:
+        logger.error(f"Error in Markdown Playbook scheduler loop: {_unwrap_exception(e)}")
+
+      try:
+        await asyncio.sleep(15)
+      except asyncio.CancelledError:
+        break
+
 

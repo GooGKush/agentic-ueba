@@ -463,6 +463,57 @@ async def dispatch_hybrid_handoff(
   )
 
 
+@mcp.tool()
+async def manage_playbook(
+    action: str = "list",
+    url: Optional[str] = None,
+    playbook_id: Optional[str] = None,
+    interval_seconds: int = 14400,
+    ingest_events: bool = True,
+    unscope_seeded_to_fleet: bool = False,
+    run_immediately: bool = False,
+) -> Dict[str, Any]:
+  """Registers, lists, or stops a periodic Markdown hunting playbook (e.g. from a GitHub URL)."""
+  act = action.lower().strip()
+  if act in ("register", "start", "add"):
+    if not url:
+      return {"status": "ERROR", "error_message": "'url' is required to register a playbook."}
+    return await watchdog.register_playbook(
+        url=url,
+        playbook_id=playbook_id,
+        interval_seconds=interval_seconds,
+        ingest_events=ingest_events,
+        unscope_seeded_to_fleet=unscope_seeded_to_fleet,
+        enabled=True,
+        run_immediately=run_immediately,
+    )
+  if act in ("stop", "pause", "disable"):
+    if not playbook_id:
+      return {"status": "ERROR", "error_message": "'playbook_id' is required to stop a playbook."}
+    return watchdog.stop_playbook(playbook_id=playbook_id, delete=False)
+  if act in ("delete", "remove"):
+    if not playbook_id:
+      return {"status": "ERROR", "error_message": "'playbook_id' is required to delete a playbook."}
+    return watchdog.stop_playbook(playbook_id=playbook_id, delete=True)
+  return watchdog.list_playbooks(playbook_id=playbook_id)
+
+
+@mcp.tool()
+async def run_markdown_playbook(
+    url: Optional[str] = None,
+    playbook_id: Optional[str] = None,
+    ingest_events: bool = True,
+    unscope_seeded_to_fleet: bool = False,
+) -> Dict[str, Any]:
+  """Executes an on-demand pass of a Markdown hunting playbook from a GitHub URL or registered playbook_id."""
+  return await watchdog.run_playbook_once(
+      playbook_id=playbook_id,
+      url=url,
+      ingest_events=ingest_events,
+      unscope_seeded_to_fleet=unscope_seeded_to_fleet,
+  )
+
+
 # --- 2. REST Endpoints (Playbook-to-Agent Gateway) ---
 
 @mcp.custom_route("/api/v1/cases/activity", methods=["GET"])
@@ -625,6 +676,114 @@ async def fleet_360_sweep_endpoint(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ERROR", "error_message": str(e)}, status_code=500)
 
 
+# --- 4. Markdown Hunting Playbook Routes ---
+
+@mcp.custom_route("/api/v1/playbooks", methods=["GET"])
+async def list_playbooks_endpoint(request: Request) -> JSONResponse:
+  """Lists registered Markdown playbooks, their schedule status, and recent runs."""
+  playbook_id = request.query_params.get("playbook_id")
+  res = watchdog.list_playbooks(playbook_id=playbook_id)
+  status_code = 404 if res.get("status") == "NOT_FOUND" else 200
+  return JSONResponse(res, status_code=status_code)
+
+
+@mcp.custom_route("/api/v1/playbooks", methods=["POST"])
+async def register_playbook_endpoint(request: Request) -> JSONResponse:
+  """Registers or updates a Markdown hunting playbook from a GitHub URL or local path."""
+  try:
+    body = await request.json() if await request.body() else {}
+    url = body.get("url") or body.get("source")
+    if not url:
+      return JSONResponse(
+          {"status": "ERROR", "error_message": "Missing required field 'url'."},
+          status_code=400,
+      )
+    res = await watchdog.register_playbook(
+        url=str(url),
+        playbook_id=body.get("playbook_id"),
+        interval_seconds=int(body.get("interval_seconds", 14400)),
+        ingest_events=bool(body.get("ingest_events", True)),
+        unscope_seeded_to_fleet=bool(body.get("unscope_seeded_to_fleet", False)),
+        inter_query_delay_sec=float(body.get("inter_query_delay_sec", 1.0)),
+        enabled=bool(body.get("enabled", True)),
+        run_immediately=bool(body.get("run_immediately", False)),
+    )
+    return JSONResponse(res, status_code=200)
+  except Exception as e:
+    logger.exception(f"Playbook registration failed: {e}")
+    return JSONResponse({"status": "ERROR", "error_message": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/v1/playbooks/run", methods=["POST"])
+async def run_playbook_endpoint(request: Request) -> JSONResponse:
+  """Executes a single pass of a registered or ad-hoc Markdown hunting playbook."""
+  try:
+    body = await request.json() if await request.body() else {}
+    playbook_id = body.get("playbook_id")
+    url = body.get("url") or body.get("source")
+    if not playbook_id and not url:
+      return JSONResponse(
+          {
+              "status": "ERROR",
+              "error_message": "Provide either 'playbook_id' or 'url' in request body.",
+          },
+          status_code=400,
+      )
+    res = await watchdog.run_playbook_once(
+        playbook_id=playbook_id,
+        url=url,
+        ingest_events=bool(body["ingest_events"]) if "ingest_events" in body else None,
+        unscope_seeded_to_fleet=(
+            bool(body["unscope_seeded_to_fleet"])
+            if "unscope_seeded_to_fleet" in body
+            else None
+        ),
+        inter_query_delay_sec=(
+            float(body["inter_query_delay_sec"])
+            if "inter_query_delay_sec" in body
+            else None
+        ),
+        lookback_days_override=(
+            int(body["lookback_days"]) if "lookback_days" in body else None
+        ),
+    )
+    return JSONResponse(res, status_code=200)
+  except KeyError as ke:
+    return JSONResponse({"status": "NOT_FOUND", "error_message": str(ke)}, status_code=404)
+  except Exception as e:
+    logger.exception(f"Playbook run failed: {e}")
+    return JSONResponse({"status": "ERROR", "error_message": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/v1/playbooks/stop", methods=["POST"])
+async def stop_playbook_endpoint(request: Request) -> JSONResponse:
+  """Stops (disables) or deletes a scheduled Markdown playbook subscription."""
+  try:
+    body = await request.json() if await request.body() else {}
+    playbook_id = body.get("playbook_id")
+    if not playbook_id:
+      return JSONResponse(
+          {"status": "ERROR", "error_message": "Missing required field 'playbook_id'."},
+          status_code=400,
+      )
+    delete = bool(body.get("delete", False))
+    res = watchdog.stop_playbook(playbook_id=str(playbook_id), delete=delete)
+    status_code = 404 if res.get("status") == "NOT_FOUND" else 200
+    return JSONResponse(res, status_code=status_code)
+  except Exception as e:
+    logger.exception(f"Playbook stop failed: {e}")
+    return JSONResponse({"status": "ERROR", "error_message": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/v1/playbooks/{playbook_id}", methods=["DELETE"])
+async def delete_playbook_endpoint(request: Request) -> JSONResponse:
+  """Deletes a registered Markdown playbook subscription by ID."""
+  playbook_id = request.path_params.get("playbook_id", "")
+  res = watchdog.stop_playbook(playbook_id=str(playbook_id), delete=True)
+  status_code = 404 if res.get("status") == "NOT_FOUND" else 200
+  return JSONResponse(res, status_code=status_code)
+
+
 # Build standard ASGI app supporting both MCP SSE and HTTP REST routes
 app = mcp.streamable_http_app()
 
@@ -635,10 +794,12 @@ async def combined_lifespan(application):
     if tenant_config.watchdog_enabled:
       logger.info("Auto-starting Watchdog daemon on server startup.")
       watchdog.start()
+    else:
+      watchdog._ensure_playbook_scheduler()
     try:
       yield
     finally:
-      if watchdog.is_running:
+      if watchdog.is_running or watchdog.is_playbook_scheduler_running:
         logger.info("Stopping Watchdog daemon on server shutdown.")
         watchdog.stop()
 

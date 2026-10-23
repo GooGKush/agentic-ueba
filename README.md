@@ -1,6 +1,6 @@
 # 🛡️ Agentic UEBA: Autonomous SecOps Threat Hunter & 360° Behavioral Risk Radar
 
-[![Version](https://img.shields.io/badge/version-v2.1.0-blue.svg)](README.md) [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE) [![Unit Tests](https://img.shields.io/badge/unit%20tests-69%2F69%20passing%20(100%25)-brightgreen.svg)](tests/)
+[![Version](https://img.shields.io/badge/version-v2.2.0-blue.svg)](README.md) [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE) [![Unit Tests](https://img.shields.io/badge/unit%20tests-82%2F82%20passing%20(100%25)-brightgreen.svg)](tests/)
 
 **Agentic UEBA** (`secops-agentic-hunter`) is an autonomous, dual-interface threat hunting and behavioral risk service for **Google Security Operations (Chronicle SIEM & SOAR)**. It embeds the canonical **`secops-risk-metrics-multistage`** (`v2.1.0+`) and **`secops-statistical-hunter`** (`v2.8.0+`) skills to provide continuous tenant-wide behavioral baselining, automated SOAR case triage with 6-pillar HTML/SVG Case Wall reporting, and Just-In-Time (JIT) playbook and MCP execution.
 
@@ -144,16 +144,50 @@ curl -X POST "https://<YOUR_SERVICE_URL>/api/v1/radar/fleet-sweep" \
   }'
 ```
 
-#### 3. Watchdog Control & Case Activity Ledger
+#### 3. Autonomous Markdown Hunting Playbooks (`/api/v1/playbooks`)
+Point `agentic-ueba` at a public GitHub Markdown URL (e.g., `https://github.com/GooGKush/docs/blob/main/php2shell-ueba-hunting.md`) to automatically normalize the URL to `raw.githubusercontent.com`, extract all multi-stage YARA-L 2.0 `stage` queries, validate them against the Malachite AST validator, schedule periodic searches, chain upstream candidate IPs into seeded follow-up queries, and ingest matches as `PLAYBOOK_BEHAVIORAL_HUNT_MATCH` UDM events via `IngestionService.ImportEvents`:
+
+```bash
+# Register and start a periodic Markdown playbook (every 4 hours)
+curl -X POST "https://<YOUR_SERVICE_URL>/api/v1/playbooks" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "playbook_id": "php2shell-ueba",
+    "url": "https://github.com/GooGKush/docs/blob/main/php2shell-ueba-hunting.md",
+    "interval_seconds": 14400,
+    "ingest_events": true,
+    "run_immediately": true
+  }'
+
+# Inspect registered playbooks and recent run summaries
+curl "https://<YOUR_SERVICE_URL>/api/v1/playbooks"
+
+# Trigger an on-demand single pass
+curl -X POST "https://<YOUR_SERVICE_URL>/api/v1/playbooks/run" \
+  -H "Content-Type: application/json" \
+  -d '{"playbook_id": "php2shell-ueba", "ingest_events": true}'
+
+# Pause or stop a scheduled playbook
+curl -X POST "https://<YOUR_SERVICE_URL>/api/v1/playbooks/stop" \
+  -H "Content-Type: application/json" \
+  -d '{"playbook_id": "php2shell-ueba", "delete": false}'
+```
+
+#### 4. Watchdog Control & Case Activity Ledger
 | Method | Path | Description |
 | :--- | :--- | :--- |
 | `GET` | `/healthz` | Cloud Run liveness/readiness check (reports default tenant & watchdog state). |
-| `GET` | `/api/v1/watchdog/status` | Returns runtime status, queue depth, active workers, and recent 360° sweep stats. |
-| `POST` | `/api/v1/watchdog/start` | Starts the background case-polling loop, worker pool, and 4h fleet 360° scheduler. |
+| `GET` | `/api/v1/watchdog/status` | Returns runtime status, queue depth, active workers, 360° sweep stats, and registered playbooks. |
+| `POST` | `/api/v1/watchdog/start` | Starts the background case-polling loop, worker pool, 4h fleet 360° scheduler, and playbook scheduler. |
 | `POST` | `/api/v1/watchdog/stop` | Cleanly cancels background polling and worker tasks. |
-| `POST` | `/api/v1/watchdog/reset-state` | Clears seen cases and intra-day 360° deduplication state in `data/watchdog_state.json`. |
+| `POST` | `/api/v1/watchdog/reset-state` | Clears seen cases and intra-day deduplication state in `data/watchdog_state.json`. |
 | `POST` | `/api/v1/cases/scan` | Triggers an immediate single scan pass over open SOAR cases (`{"limit": 5}`). |
 | `GET` | `/api/v1/cases/activity` | Returns triaged case ledger filtered by `?timeframe=24h` (`1h`, `24h`, `7d`, `all`) and optional `?tag=RISK:CRITICAL,SECOND_ORDER_HUNT`. |
+| `POST` | `/api/v1/playbooks` | Registers, AST-validates, and schedules a Markdown hunting playbook from a GitHub URL or file path. |
+| `GET` | `/api/v1/playbooks` | Lists registered Markdown playbooks, query inventory, schedule state, and recent run history. |
+| `POST` | `/api/v1/playbooks/run` | Executes an on-demand single pass of a registered or ad-hoc Markdown playbook. |
+| `POST` | `/api/v1/playbooks/stop` | Pauses (`delete: false`) or removes (`delete: true`) a registered Markdown playbook. |
+| `DELETE` | `/api/v1/playbooks/{playbook_id}` | Deletes a registered Markdown playbook subscription. |
 
 ---
 
@@ -169,6 +203,8 @@ Connect any MCP client (Streamable HTTP) to `https://<YOUR_SERVICE_URL>/mcp`. Av
 | | `scan_open_cases` | Scans open Chronicle SOAR cases and executes autonomous hunts. |
 | | `control_watchdog` | Starts, stops, resets, or queries the background `WatchdogDaemon`. |
 | | `get_case_activity` | Queries the triaged case ledger by `timeframe` and `tag`. |
+| | `manage_playbook` | Registers, lists, pauses, or deletes a scheduled Markdown hunting playbook from a GitHub URL. |
+| | `run_markdown_playbook` | Executes an on-demand pass of a Markdown hunting playbook and ingests matched UDM events. |
 | **Hybrid Compiler** | `compile_hunt_pipeline` | Compiles an AST-validated multi-stage YARA-L 2.0 query, Pre-Flight card, and 1-shot probe. |
 | | `dispatch_hybrid_handoff` | Dispatches a federated `secops-threat-hunt-handoff-v1` payload to `secops-statistical-hunter`. |
 | **Specialized Hunters** | `hunt_cloud_crud` | 30-day baseline Cloud CRUD write surge with companion dimensions. |
@@ -281,17 +317,19 @@ agentic_ueba/
 │   ├── strategy_decider.py             # 360° warrant analyzer & Tier 2A -> Tier 2B epistemic pivot router
 │   ├── risk_metrics_engine.py          # 30d UEBA engine, Fleet 360° sweep, & BEHAVIORAL_RISK_RADAR_360 ingestor
 │   ├── stats_hunter_engine.py          # Inline raw-log statistical engine (C2 CV, Fano, Shannon, Markov, Zipf, EWMA, Impossible Travel, Producer-Consumer)
+│   ├── playbook_runner.py              # GitHub Markdown playbook fetcher, AST validator, query chainer, & UDM event builder
 │   ├── pipeline_runner.py              # Template renderer, Malachite AST validator, Data Table bridge, & hybrid engine bridge
 │   ├── query_integrity_gate.py         # Pre-dispatch AST/entity/slot/Data-Table validator & post-execution backend error gate
 │   ├── dynamic_protocol_adapter.py     # Runtime SKILL.md protocol adapter with reference offloading
 │   ├── federated_bridge.py             # Cross-skill Macro-to-Micro handoff bridge
-│   ├── watchdog.py                     # Standing case scanner, worker pool, & 4-hour Fleet 360° scheduler
+│   ├── watchdog.py                     # Standing case scanner, worker pool, 4h Fleet 360° & Markdown playbook scheduler
 │   └── formatters/
 │       ├── __init__.py
 │       └── case_wall_card.py           # Chronicle SOAR Case Wall HTML/SVG card formatter & sanitizer
-└── tests/                              # Unit & contract test suite (69 tests)
+└── tests/                              # Unit & contract test suite (82 tests)
     ├── test_engines.py
     ├── test_metric_args.py
+    ├── test_playbook_runner.py
     ├── test_protocol_adapter.py
     └── test_watchdog.py
 ```
