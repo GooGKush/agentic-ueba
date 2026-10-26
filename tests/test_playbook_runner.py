@@ -340,9 +340,13 @@ async def test_watchdog_playbook_lifecycle_and_intraday_deduplication(tmp_path, 
   assert run1["queries_executed"] == 2
   assert run1["total_matches_found"] == 2
   assert run1["total_matches_emitted"] == 2
-  assert run1["total_udm_events_generated"] == 2
+  # 2 per-query match events + 1 cross-query convergence event for 203.0.113.10
+  assert run1["total_udm_events_generated"] == 3
+  assert len(run1["converged_entities"]) == 1
+  assert run1["converged_entities"][0]["entity"] == "203.0.113.10"
+  assert run1["converged_entities"][0]["distinct_queries_matched"] == 2
   assert len(ingested_batches) == 1
-  assert len(ingested_batches[0]) == 2
+  assert len(ingested_batches[0]) == 3
   # Verify Query 1B had 203.0.113.10 chained into it
   assert '(principal.asset.ip = "203.0.113.10")' in executed_queries[1]
 
@@ -446,4 +450,362 @@ async def test_server_playbook_rest_endpoints(tmp_path, monkeypatch):
   assert resp_del.status_code == 200
   data_del = json.loads(resp_del.body.decode("utf-8"))
   assert data_del["status"] == "DELETED"
+
+
+@pytest.mark.anyio
+async def test_option1_piecewise_unification_and_option3_capstone_udm_loopback(tmp_path, monkeypatch):
+  capstone_md = """# Cloud Threats Playbook with Option 1 Piecewise & Option 3 Capstone
+
+### 1. Query 3: Unified Cold-Start Hurdle & 30-Day MAD Secret Harvesting
+
+```yara
+// ============================================================================
+// Goal: Detect secret harvesting across both cold-start (<5 active days) and mature (>=5 active days) identities.
+// Statistical Model: Piecewise Two-Part Hurdle + 4-Stage 30-Day MAD
+// ============================================================================
+
+stage stage1_daily {
+    metadata.event_type = "RESOURCE_READ"
+    principal.user.userid = $user
+    $user != ""
+
+  match:
+    $user by 1d
+
+  outcome:
+    $daily_val = count(metadata.id)
+    $distinct_secrets = count_distinct(target.resource.name)
+}
+
+stage stage2_median {
+    $user = $stage1_daily.user
+    $daily_val = $stage1_daily.daily_val
+
+  match:
+    $user
+
+  outcome:
+    $median_val = percentile($daily_val, 50)
+    $active_days = count($daily_val)
+}
+
+stage stage3_mad {
+    $user = $stage1_daily.user
+    $daily_val = $stage1_daily.daily_val
+    $user = $stage2_median.user
+    $median_val = $stage2_median.median_val
+
+  match:
+    $user
+
+  outcome:
+    $abs_dev = math.abs($daily_val - $median_val)
+    $mad_raw = percentile($abs_dev, 50)
+    $baseline_median = max($median_val)
+    $baseline_days = max($stage2_median.active_days)
+}
+
+$user = $stage1_daily.user
+$observed_val = $stage1_daily.daily_val
+$observed_secrets = $stage1_daily.distinct_secrets
+$day_bucket = $stage1_daily.window_start
+$user = $stage3_mad.user
+
+match:
+  $user, $day_bucket
+
+outcome:
+  $obs = max($observed_val)
+  $secrets = max($observed_secrets)
+  $med = max($stage3_mad.baseline_median)
+  $mad = max($stage3_mad.mad_raw)
+  $raw_active_days = max($stage3_mad.baseline_days)
+  $scaled_mad = $mad * 1.4826
+  $safe_mad = if($scaled_mad > 0, $scaled_mad, 1.0)
+  $modified_z = ($obs - $med) / $safe_mad
+  $hurdle_rarity_boost = if($raw_active_days <= 4, 3.0, 1.0)
+  $hurdle_threat_score = math.log($obs + 1) * $secrets * $hurdle_rarity_boost / 4.0
+  $unified_threat_score = if($raw_active_days <= 4, $hurdle_threat_score, $modified_z)
+
+condition:
+  $obs >= 5 and $unified_threat_score >= 3.5
+
+order:
+  $unified_threat_score desc
+```
+
+### 2. Capstone Query: Multi-Scenario Entity Convergence via UDM Loopback
+
+```yara
+// ============================================================================
+// Goal: Correlate entities matching >= 2 distinct queries in this playbook via PLAYBOOK_BEHAVIORAL_HUNT_MATCH.
+// Statistical Model: 2-Stage UDM Loopback Euclidean L2 Norm Convergence
+// ============================================================================
+
+stage stage1_query_hits {
+    metadata.event_type = "GENERIC_EVENT"
+    metadata.product_event_type = "PLAYBOOK_BEHAVIORAL_HUNT_MATCH"
+    principal.user.userid = $entity
+    security_result.rule_name = $rule_name
+    $entity != ""
+    $rule_name != ""
+
+  match:
+    $entity, $rule_name by 1d
+
+  outcome:
+    $query_z = max(security_result.confidence_score)
+    $query_cri = max(security_result.risk_score)
+}
+
+$entity = $stage1_query_hits.entity
+$day_bucket = $stage1_query_hits.window_start
+
+match:
+  $entity, $day_bucket by 1d
+
+outcome:
+  $distinct_queries = count_distinct($stage1_query_hits.rule_name)
+  $triggered_queries = array_distinct($stage1_query_hits.rule_name)
+  $capstone_threat_norm_sq = sum($stage1_query_hits.query_z * $stage1_query_hits.query_z)
+  $max_single_cri = max($stage1_query_hits.query_cri)
+
+condition:
+  $distinct_queries >= 2 and $capstone_threat_norm_sq >= 25.0
+
+order:
+  $capstone_threat_norm_sq desc
+```
+"""
+  md_file = tmp_path / "cloud-threats-ueba-hunting.md"
+  md_file.write_text(capstone_md, encoding="utf-8")
+
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  risk_eng = RiskMetricsEngine(tenant)
+  runner = PlaybookRunner(tenant_config=tenant, risk_engine=risk_eng)
+
+  specs = runner.parse_markdown_playbook(capstone_md)
+  assert len(specs) == 2
+  assert specs[0].ast_errors == []
+  assert specs[0].is_capstone is False
+  assert specs[0].entity_type_hint == "USER"
+
+  assert specs[1].ast_errors == []
+  assert specs[1].is_capstone is True
+  assert specs[1].plane == "UDM_LOOPBACK_CONVERGENCE"
+  assert specs[1].default_lookback_days == 7
+  assert specs[1].entity_type_hint == "USER"
+
+  events_order = []
+
+  async def fake_execute(session, query, start_iso, end_iso):
+    if "$indexed_events = count(metadata.id)" in query:
+      events_order.append("VALIDATE_UDM_INDEXED")
+      return {"stats": [{"run_id": "test_run", "indexed_events": 1}]}
+    if "PLAYBOOK_BEHAVIORAL_HUNT_MATCH" in query:
+      events_order.append("EXECUTE_CAPSTONE")
+      return {
+          "stats": [
+              {
+                  "entity": "svc-terraform@prod.iam.gserviceaccount.com",
+                  "distinct_queries": 2,
+                  "capstone_threat_norm_sq": 36.0,
+              }
+          ]
+      }
+    events_order.append("EXECUTE_UPSTREAM")
+    return {
+        "stats": [
+            {
+                "user": "svc-terraform@prod.iam.gserviceaccount.com",
+                "unified_threat_score": 5.4,
+                "obs": 42,
+            }
+        ]
+    }
+
+  ingested_events = []
+
+  def fake_ingest(events):
+    ingested_events.extend(events)
+    events_order.append(f"INGEST_{len(events)}")
+    return {"status": "SUCCESS", "events_ingested": len(events), "batches": 1}
+
+  monkeypatch.setattr(risk_eng.runner, "execute_query_via_mcp", fake_execute)
+  monkeypatch.setattr(risk_eng, "ingest_udm_events", fake_ingest)
+
+  res = await runner.execute_playbook(
+      session=AsyncMock(),
+      source=str(md_file),
+      run_id="run_cloud_threats_20261026_abc12345",
+      scope_capstone_to_run_id=True,
+      udm_validation_poll_sec=0.0,
+      inter_query_delay_sec=0.0,
+  )
+  assert res["status"] == "SUCCESS"
+  assert res["run_id"] == "run_cloud_threats_20261026_abc12345"
+  # Upstream query executes -> UDM events flushed -> UDM index validated -> Capstone executes -> Capstone event flushed
+  assert events_order == [
+      "EXECUTE_UPSTREAM",
+      "INGEST_1",
+      "VALIDATE_UDM_INDEXED",
+      "EXECUTE_CAPSTONE",
+      "INGEST_1",
+  ]
+  assert res["udm_sync_validation"]["status"] == "VERIFIED"
+  assert res["udm_sync_validation"]["expected_events"] == 1
+  assert res["udm_sync_validation"]["indexed_events"] == 1
+  assert res["udm_sync_validation"]["verified"] is True
+  assert ingested_events[0]["metadata"]["product_log_id"] == "run_cloud_threats_20261026_abc12345"
+  assert res["queries"][0]["matched_entities"][0]["score_field"] == "unified_threat_score"
+  assert res["queries"][0]["matched_entities"][0]["effective_z"] == 5.4
+  assert res["queries"][1]["matched_entities"][0]["score_field"] == "capstone_threat_norm_sq"
+  assert res["queries"][1]["matched_entities"][0]["effective_z"] == 6.0
+
+
+@pytest.mark.anyio
+async def test_udm_indexing_lag_retry_and_partial_timeout(tmp_path, monkeypatch):
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  risk_eng = RiskMetricsEngine(tenant)
+  runner = PlaybookRunner(tenant_config=tenant, risk_engine=risk_eng)
+
+  poll_counts = [0, 1, 2]
+  seen_queries = []
+
+  async def fake_execute(session, query, start_iso, end_iso):
+    seen_queries.append(query)
+    cnt = poll_counts.pop(0) if poll_counts else 2
+    return {"stats": [{"run_id": "run_lag_test_001", "indexed_events": cnt}]}
+
+  monkeypatch.setattr(risk_eng.runner, "execute_query_via_mcp", fake_execute)
+
+  # 1. Succeeds on 3rd attempt when indexed_events reaches expected_events (2)
+  val_ok = await runner.verify_udm_run_indexed(
+      session=AsyncMock(),
+      run_id="run_lag_test_001",
+      expected_events=2,
+      start_iso="2026-10-26T00:00:00Z",
+      end_iso="2026-10-26T18:00:00Z",
+      max_attempts=4,
+      poll_interval_sec=0.0,
+  )
+  assert val_ok["status"] == "VERIFIED"
+  assert val_ok["verified"] is True
+  assert val_ok["attempts"] == 3
+  assert val_ok["expected_events"] == 2
+  assert val_ok["indexed_events"] == 2
+  assert 'metadata.product_log_id = "run_lag_test_001"' in seen_queries[0]
+
+  # 2. Reports PARTIAL_TIMEOUT if only 1 of 3 events is indexed after max_attempts
+  poll_counts = [0, 1, 1]
+  val_partial = await runner.verify_udm_run_indexed(
+      session=AsyncMock(),
+      run_id="run_lag_test_002",
+      expected_events=3,
+      start_iso="2026-10-26T00:00:00Z",
+      end_iso="2026-10-26T18:00:00Z",
+      max_attempts=3,
+      poll_interval_sec=0.0,
+  )
+  assert val_partial["status"] == "PARTIAL_TIMEOUT"
+  assert val_partial["verified"] is False
+  assert val_partial["attempts"] == 3
+  assert val_partial["expected_events"] == 3
+  assert val_partial["indexed_events"] == 1
+
+
+@pytest.mark.anyio
+async def test_subthreading_io_offload_and_parallel_playbook_wave_concurrency(tmp_path, monkeypatch):
+  import asyncio
+  import threading
+  from src.watchdog import WatchdogDaemon, WatchdogState
+
+  md_file_a = tmp_path / "pb-alpha.md"
+  md_file_b = tmp_path / "pb-beta.md"
+  md_file_a.write_text(SAMPLE_PLAYBOOK_MD, encoding="utf-8")
+  md_file_b.write_text(SAMPLE_PLAYBOOK_MD, encoding="utf-8")
+
+  state_file = tmp_path / "watchdog_parallel_state.json"
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  risk_eng = RiskMetricsEngine(tenant)
+  mock_hunter = MagicMock()
+  mock_hunter.risk_engine = risk_eng
+  daemon = WatchdogDaemon(engine=mock_hunter, tenant_config=tenant, state_file=state_file)
+
+  await daemon.register_playbook(
+      playbook_id="pb-alpha",
+      url=str(md_file_a),
+      interval_seconds=3600,
+      ingest_events=True,
+      run_immediately=False,
+  )
+  await daemon.register_playbook(
+      playbook_id="pb-beta",
+      url=str(md_file_b),
+      interval_seconds=3600,
+      ingest_events=True,
+      run_immediately=False,
+  )
+
+  active_queries = 0
+  max_concurrent_queries = 0
+  ingest_thread_names = []
+
+  async def fake_execute(session, query, start_iso, end_iso):
+    nonlocal active_queries, max_concurrent_queries
+    active_queries += 1
+    max_concurrent_queries = max(max_concurrent_queries, active_queries)
+    await asyncio.sleep(0.03)
+    active_queries -= 1
+    if "stage1_bailout" in query:
+      return {
+          "stats": [
+              {
+                  "client_ip": "198.51.100.77",
+                  "target_ip": "203.0.113.10",
+                  "bailout_events": 2,
+                  "carrier_events": 1,
+                  "carrier_size": 450000,
+              }
+          ]
+      }
+    return {
+        "stats": [
+            {
+                "entity": "203.0.113.10",
+                "personal_z": 5.2,
+                "z_score": 5.2,
+                "observed_val": 12500000,
+            }
+        ]
+    }
+
+  def fake_ingest(events):
+    ingest_thread_names.append(threading.current_thread().name)
+    return {"status": "SUCCESS", "events_ingested": len(events), "batches": 1}
+
+  monkeypatch.setattr(risk_eng.runner, "execute_query_via_mcp", fake_execute)
+  monkeypatch.setattr(risk_eng, "ingest_udm_events", fake_ingest)
+
+  mock_session = AsyncMock()
+  # Launch pb-alpha, pb-beta, and a duplicate pb-alpha concurrently
+  res_alpha_1, res_beta, res_alpha_dup = await asyncio.gather(
+      daemon.run_playbook_once(playbook_id="pb-alpha", inter_query_delay_sec=0.0, mcp_session=mock_session),
+      daemon.run_playbook_once(playbook_id="pb-beta", inter_query_delay_sec=0.0, mcp_session=mock_session),
+      daemon.run_playbook_once(playbook_id="pb-alpha", inter_query_delay_sec=0.0, mcp_session=mock_session),
+  )
+
+  # Both distinct playbooks succeed in parallel
+  assert res_alpha_1["status"] == "SUCCESS"
+  assert res_beta["status"] == "SUCCESS"
+  # Duplicate concurrent execution of pb-alpha is safely skipped by its per-playbook lock
+  assert res_alpha_dup["status"] == "SKIPPED_CONCURRENT"
+  # Both playbooks executed queries concurrently across the event loop
+  assert max_concurrent_queries >= 2
+  # Synchronous UDM ingestion was offloaded to the secops-ueba-io worker thread pool
+  assert len(ingest_thread_names) >= 2
+  assert all(name.startswith("secops-ueba-io") for name in ingest_thread_names)
+
+
+
 

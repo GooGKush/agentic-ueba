@@ -2839,6 +2839,24 @@ order:
         "batches": batches,
     }
 
+  async def async_ingest_udm_events(
+      self,
+      udm_events: Sequence[Dict[str, Any]],
+      batch_size: Optional[int] = None,
+      access_token: Optional[str] = None,
+  ) -> Dict[str, Any]:
+    """Offloads synchronous UDM validation and Chronicle ImportEvents HTTP calls to a worker thread."""
+    kwargs: Dict[str, Any] = {}
+    if batch_size is not None:
+      kwargs["batch_size"] = batch_size
+    if access_token is not None:
+      kwargs["access_token"] = access_token
+    return await self.runner.run_in_io_thread(
+        self.ingest_udm_events,
+        udm_events,
+        **kwargs,
+    )
+
   async def run_fleet_360_sweep(
       self,
       session: ClientSession,
@@ -3086,7 +3104,7 @@ order:
     }
     if ingest_events and udm_events_to_ingest:
       try:
-        ingestion_result = self.ingest_udm_events(udm_events_to_ingest)
+        ingestion_result = await self.async_ingest_udm_events(udm_events_to_ingest)
         logger.info(
             f"Fleet 360 [{norm_type}] UDM ingestion succeeded: "
             f"events_ingested={ingestion_result.get('events_ingested', 0)}, "
