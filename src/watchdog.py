@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 from pathlib import Path
+import threading
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import httpx
@@ -142,6 +143,7 @@ class WatchdogState:
   """Persistent state tracking for processed cases and intra-day 360 radar emissions."""
 
   def __init__(self, state_file: Optional[Path] = None, max_state_size: int = 2000, max_results: int = 1000):
+    self._lock = threading.RLock()
     self.state_file = state_file or Path("data/watchdog_state.json")
     self.max_state_size = max_state_size
     self.max_results = max_results
@@ -158,57 +160,63 @@ class WatchdogState:
     self.load()
 
   def load(self) -> None:
-    if self.state_file.is_file():
-      try:
-        data = json.loads(self.state_file.read_text(encoding="utf-8"))
-        raw_seen = data.get("seen_case_ids", [])
-        self.seen_case_ids = OrderedDict(
-            (str(cid), None) for cid in raw_seen[-self.max_state_size:]
-        )
-        self.last_scan_time = data.get("last_scan_time")
-        self.triaged_count = int(data.get("triaged_count", len(self.seen_case_ids)))
-        self.recent_results = data.get("recent_results", [])
-        raw_emissions = data.get("fleet_360_emissions", {})
-        if isinstance(raw_emissions, dict):
-          self.fleet_360_emissions = raw_emissions
-        self.last_fleet_360_sweep_time = data.get("last_fleet_360_sweep_time")
-        raw_sweeps = data.get("fleet_360_sweeps", [])
-        if isinstance(raw_sweeps, list):
-          self.fleet_360_sweeps = raw_sweeps[-50:]
-        raw_playbooks = data.get("playbooks", {})
-        if isinstance(raw_playbooks, dict):
-          self.playbooks = raw_playbooks
-        raw_pb_emissions = data.get("playbook_emissions", {})
-        if isinstance(raw_pb_emissions, dict):
-          self.playbook_emissions = raw_pb_emissions
-        raw_pb_runs = data.get("playbook_runs", [])
-        if isinstance(raw_pb_runs, list):
-          self.playbook_runs = raw_pb_runs[-50:]
-        logger.info(f"Loaded watchdog state with {len(self.seen_case_ids)} seen cases.")
-      except Exception as e:
-        logger.warning(f"Failed loading watchdog state file: {e}")
+    with self._lock:
+      if self.state_file.is_file():
+        try:
+          data = json.loads(self.state_file.read_text(encoding="utf-8"))
+          raw_seen = data.get("seen_case_ids", [])
+          self.seen_case_ids = OrderedDict(
+              (str(cid), None) for cid in raw_seen[-self.max_state_size:]
+          )
+          self.last_scan_time = data.get("last_scan_time")
+          self.triaged_count = int(data.get("triaged_count", len(self.seen_case_ids)))
+          self.recent_results = data.get("recent_results", [])
+          raw_emissions = data.get("fleet_360_emissions", {})
+          if isinstance(raw_emissions, dict):
+            self.fleet_360_emissions = raw_emissions
+          self.last_fleet_360_sweep_time = data.get("last_fleet_360_sweep_time")
+          raw_sweeps = data.get("fleet_360_sweeps", [])
+          if isinstance(raw_sweeps, list):
+            self.fleet_360_sweeps = raw_sweeps[-50:]
+          raw_playbooks = data.get("playbooks", {})
+          if isinstance(raw_playbooks, dict):
+            self.playbooks = raw_playbooks
+          raw_pb_emissions = data.get("playbook_emissions", {})
+          if isinstance(raw_pb_emissions, dict):
+            self.playbook_emissions = raw_pb_emissions
+          raw_pb_runs = data.get("playbook_runs", [])
+          if isinstance(raw_pb_runs, list):
+            self.playbook_runs = raw_pb_runs[-50:]
+          logger.info(f"Loaded watchdog state with {len(self.seen_case_ids)} seen cases.")
+        except Exception as e:
+          logger.warning(f"Failed loading watchdog state file: {e}")
 
   def save(self) -> None:
-    try:
-      self.state_file.parent.mkdir(parents=True, exist_ok=True)
-      payload = {
-          "seen_case_ids": list(self.seen_case_ids.keys()),
-          "last_scan_time": self.last_scan_time,
-          "triaged_count": self.triaged_count,
-          "recent_results": self.recent_results[-self.max_results:],
-          "fleet_360_emissions": self.fleet_360_emissions,
-          "last_fleet_360_sweep_time": self.last_fleet_360_sweep_time,
-          "fleet_360_sweeps": self.fleet_360_sweeps[-50:],
-          "playbooks": self.playbooks,
-          "playbook_emissions": self.playbook_emissions,
-          "playbook_runs": self.playbook_runs[-50:],
-      }
-      # Atomic file replacement prevents corrupted state writes during process interruption
-      tmp_file = self.state_file.with_suffix(".tmp")
-      tmp_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-      tmp_file.replace(self.state_file)
-    except Exception as e:
-      logger.error(f"Failed persisting watchdog state: {e}")
+    with self._lock:
+      try:
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "seen_case_ids": list(self.seen_case_ids.keys()),
+            "last_scan_time": self.last_scan_time,
+            "triaged_count": self.triaged_count,
+            "recent_results": self.recent_results[-self.max_results:],
+            "fleet_360_emissions": dict(self.fleet_360_emissions),
+            "last_fleet_360_sweep_time": self.last_fleet_360_sweep_time,
+            "fleet_360_sweeps": self.fleet_360_sweeps[-50:],
+            "playbooks": dict(self.playbooks),
+            "playbook_emissions": dict(self.playbook_emissions),
+            "playbook_runs": self.playbook_runs[-50:],
+        }
+        # Atomic file replacement prevents corrupted state writes during process interruption
+        tmp_file = self.state_file.with_suffix(".tmp")
+        tmp_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp_file.replace(self.state_file)
+      except Exception as e:
+        logger.error(f"Failed persisting watchdog state: {e}")
+
+  async def save_async(self) -> None:
+    """Offloads atomic state serialization and disk write to a background worker thread."""
+    await asyncio.to_thread(self.save)
 
   def record_case(self, case_id: str, summary: Optional[Dict[str, Any]] = None) -> None:
     cid = str(case_id)
@@ -497,6 +505,12 @@ class WatchdogDaemon:
     self.queue_size = getattr(self.tenant, "watchdog_queue_size", 100)
     self.fleet_360_enabled = getattr(self.tenant, "fleet_360_enabled", True)
     self.fleet_360_interval_seconds = getattr(self.tenant, "fleet_360_interval_seconds", 14400)
+    self.playbook_concurrency = max(
+        1, int(getattr(self.tenant, "playbook_concurrency", 3))
+    )
+    self.playbook_query_concurrency = max(
+        1, int(getattr(self.tenant, "playbook_query_concurrency", 3))
+    )
 
     self._scan_task: Optional[asyncio.Task] = None
     self._fleet_360_task: Optional[asyncio.Task] = None
@@ -508,6 +522,10 @@ class WatchdogDaemon:
     self._scan_lock = asyncio.Lock()
     self._fleet_360_lock = asyncio.Lock()
     self._playbook_lock = asyncio.Lock()
+    self._playbook_locks: Dict[str, asyncio.Lock] = {}
+    self._playbook_semaphore: Optional[asyncio.Semaphore] = None
+    self._playbook_semaphore_loop: Optional[asyncio.AbstractEventLoop] = None
+    self._active_playbook_count = 0
     self._active_worker_count = 0
     self._is_running = False
     self._playbook_scheduler_running = False
@@ -515,6 +533,23 @@ class WatchdogDaemon:
         tenant_config=self.tenant,
         risk_engine=getattr(self.engine, "risk_engine", None),
     )
+
+  def _get_per_playbook_lock(self, pb_id: str) -> asyncio.Lock:
+    """Returns a dedicated asyncio.Lock for `pb_id` so distinct playbooks can run in parallel."""
+    key = (pb_id or "default").strip().lower()
+    lock = self._playbook_locks.get(key)
+    if lock is None:
+      lock = asyncio.Lock()
+      self._playbook_locks[key] = lock
+    return lock
+
+  def _get_playbook_semaphore(self) -> asyncio.Semaphore:
+    """Returns a per-event-loop semaphore bounding concurrent playbook executions."""
+    loop = asyncio.get_running_loop()
+    if self._playbook_semaphore is None or self._playbook_semaphore_loop is not loop:
+      self._playbook_semaphore = asyncio.Semaphore(self.playbook_concurrency)
+      self._playbook_semaphore_loop = loop
+    return self._playbook_semaphore
 
   @property
   def is_running(self) -> bool:
@@ -614,6 +649,9 @@ class WatchdogDaemon:
         "fleet_360_tracked_entities": len(self.state.fleet_360_emissions),
         "fleet_360_recent_sweeps": self.state.fleet_360_sweeps[-5:],
         "playbook_scheduler_running": self.is_playbook_scheduler_running,
+        "playbook_concurrency": self.playbook_concurrency,
+        "playbook_query_concurrency": self.playbook_query_concurrency,
+        "active_playbooks": self._active_playbook_count,
         "playbooks_registered": len(self.state.playbooks),
         "playbooks": list(self.state.playbooks.values()),
         "playbook_recent_runs": self.state.playbook_runs[-5:],
@@ -1314,111 +1352,144 @@ class WatchdogDaemon:
       url: Optional[str] = None,
       ingest_events: Optional[bool] = None,
       unscope_seeded_to_fleet: Optional[bool] = None,
+      query_concurrency: Optional[int] = None,
       inter_query_delay_sec: Optional[float] = None,
       lookback_days_override: Optional[int] = None,
       now_utc: Optional[datetime] = None,
       http_client: Optional[httpx.AsyncClient] = None,
       mcp_session: Optional[Any] = None,
   ) -> Dict[str, Any]:
-    """Executes a single pass of a registered or ad-hoc Markdown hunting playbook."""
-    if self._playbook_lock.locked():
-      logger.warning("Playbook hunt pass is already in progress. Skipping concurrent run.")
-      return {"status": "SKIPPED_CONCURRENT"}
+    """Executes a single pass of a registered or ad-hoc Markdown hunting playbook.
 
-    async with self._playbook_lock:
-      pb_cfg: Dict[str, Any] = {}
-      if playbook_id:
-        pb_id_clean = playbook_id.strip().lower()
-        pb_cfg = self.state.playbooks.get(pb_id_clean, {})
-        if not pb_cfg and not url:
-          raise KeyError(f"Playbook '{pb_id_clean}' is not registered.")
-      else:
-        pb_id_clean = PlaybookRunner.derive_playbook_id(url or "playbook")
+    Uses per-playbook locks so distinct playbooks can run in parallel (up to
+    `self.playbook_concurrency` concurrent playbooks), while preventing overlapping
+    runs of the same `playbook_id`.
+    """
+    pb_cfg: Dict[str, Any] = {}
+    if playbook_id:
+      pb_id_clean = playbook_id.strip().lower()
+      pb_cfg = self.state.playbooks.get(pb_id_clean, {})
+      if not pb_cfg and not url:
+        raise KeyError(f"Playbook '{pb_id_clean}' is not registered.")
+    else:
+      pb_id_clean = PlaybookRunner.derive_playbook_id(url or "playbook")
 
-      target_url = url or pb_cfg.get("url")
-      if not target_url:
-        raise ValueError("Either a registered 'playbook_id' or 'url' must be provided.")
-
-      use_ingest = (
-          bool(ingest_events)
-          if ingest_events is not None
-          else bool(pb_cfg.get("ingest_events", True))
+    per_pb_lock = self._get_per_playbook_lock(pb_id_clean)
+    if per_pb_lock.locked() or self._playbook_lock.locked():
+      logger.warning(
+          f"Playbook '{pb_id_clean}' hunt pass is already in progress. Skipping concurrent run."
       )
-      use_unscope = (
-          bool(unscope_seeded_to_fleet)
-          if unscope_seeded_to_fleet is not None
-          else bool(pb_cfg.get("unscope_seeded_to_fleet", False))
-      )
-      use_delay = (
-          float(inter_query_delay_sec)
-          if inter_query_delay_sec is not None
-          else float(pb_cfg.get("inter_query_delay_sec", 1.0))
-      )
+      return {"status": "SKIPPED_CONCURRENT", "playbook_id": pb_id_clean}
 
-      async def _run_with_session(session: Any) -> Dict[str, Any]:
-        report = await self.playbook_runner.execute_playbook(
-            session=session,
-            source=target_url,
-            playbook_id=pb_id_clean,
-            ingest_events=use_ingest,
-            unscope_seeded_to_fleet=use_unscope,
-            inter_query_delay_sec=use_delay,
-            lookback_days_override=lookback_days_override,
-            now_utc=now_utc,
-            should_emit_fn=self.state.should_emit_playbook_match,
-            record_emit_fn=self.state.record_playbook_emission,
-            http_client=http_client,
+    pb_sem = self._get_playbook_semaphore()
+    async with per_pb_lock, pb_sem:
+      self._active_playbook_count += 1
+      try:
+        target_url = url or pb_cfg.get("url")
+        if not target_url:
+          raise ValueError("Either a registered 'playbook_id' or 'url' must be provided.")
+
+        use_ingest = (
+            bool(ingest_events)
+            if ingest_events is not None
+            else bool(pb_cfg.get("ingest_events", True))
         )
-        self.state.record_playbook_run({
-            "timestamp": report["timestamp"],
-            "playbook_id": report["playbook_id"],
-            "source": report["source"],
-            "content_sha256": report["content_sha256"],
-            "status": report["status"],
-            "queries_discovered": report["queries_discovered"],
-            "queries_executed": report["queries_executed"],
-            "queries_skipped": report["queries_skipped"],
-            "total_matches_found": report["total_matches_found"],
-            "total_matches_emitted": report["total_matches_emitted"],
-            "total_matches_suppressed_dedup": report["total_matches_suppressed_dedup"],
-            "total_udm_events_generated": report["total_udm_events_generated"],
-        })
-        return report
+        use_unscope = (
+            bool(unscope_seeded_to_fleet)
+            if unscope_seeded_to_fleet is not None
+            else bool(pb_cfg.get("unscope_seeded_to_fleet", False))
+        )
+        use_delay = (
+            float(inter_query_delay_sec)
+            if inter_query_delay_sec is not None
+            else float(pb_cfg.get("inter_query_delay_sec", 1.0))
+        )
+        use_q_conc = (
+            int(query_concurrency)
+            if query_concurrency is not None
+            else int(pb_cfg.get("query_concurrency", self.playbook_query_concurrency))
+        )
 
-      if mcp_session is not None:
-        return await _run_with_session(mcp_session)
+        async def _run_with_session(session: Any) -> Dict[str, Any]:
+          report = await self.playbook_runner.execute_playbook(
+              session=session,
+              source=target_url,
+              playbook_id=pb_id_clean,
+              ingest_events=use_ingest,
+              unscope_seeded_to_fleet=use_unscope,
+              query_concurrency=use_q_conc,
+              inter_query_delay_sec=use_delay,
+              lookback_days_override=lookback_days_override,
+              now_utc=now_utc,
+              should_emit_fn=self.state.should_emit_playbook_match,
+              record_emit_fn=self.state.record_playbook_emission,
+              http_client=http_client,
+          )
+          await self.playbook_runner.runner.run_in_io_thread(
+              self.state.record_playbook_run,
+              {
+                  "timestamp": report["timestamp"],
+                  "playbook_id": report["playbook_id"],
+                  "run_id": report.get("run_id"),
+                  "source": report["source"],
+                  "content_sha256": report["content_sha256"],
+                  "status": report["status"],
+                  "queries_discovered": report["queries_discovered"],
+                  "queries_executed": report["queries_executed"],
+                  "queries_skipped": report["queries_skipped"],
+                  "total_matches_found": report["total_matches_found"],
+                  "total_matches_emitted": report["total_matches_emitted"],
+                  "total_matches_suppressed_dedup": report["total_matches_suppressed_dedup"],
+                  "total_udm_events_generated": report["total_udm_events_generated"],
+              },
+          )
+          return report
 
-      if not self.tenant.project_id or not self.tenant.customer_id:
-        return {
-            "status": "SKIPPED_MISSING_CONFIG",
-            "playbook_id": pb_id_clean,
-            "timestamp": (now_utc or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }
+        if mcp_session is not None:
+          return await _run_with_session(mcp_session)
 
-      headers = self.tenant.get_auth_headers()
-      custom_timeout = httpx.Timeout(30.0, read=120.0, write=120.0, pool=120.0)
-      async with httpx.AsyncClient(headers=headers, timeout=custom_timeout, follow_redirects=True):
-        def _create_mcp_context():
-          try:
-            return streamable_http_client(
-                self.tenant.mcp_url, headers=headers, timeout=60.0, sse_read_timeout=300.0
-            )
-          except TypeError:
-            return streamable_http_client(self.tenant.mcp_url, headers=headers)
+        if not self.tenant.project_id or not self.tenant.customer_id:
+          return {
+              "status": "SKIPPED_MISSING_CONFIG",
+              "playbook_id": pb_id_clean,
+              "timestamp": (now_utc or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }
 
-        mcp_context = _create_mcp_context()
-        async with mcp_context as streams, ClientSession(streams[0], streams[1]) as session:
-          await session.initialize()
-          return await _run_with_session(session)
+        headers = await self.playbook_runner.runner.run_in_io_thread(
+            self.tenant.get_auth_headers
+        )
+        custom_timeout = httpx.Timeout(30.0, read=120.0, write=120.0, pool=120.0)
+        async with httpx.AsyncClient(headers=headers, timeout=custom_timeout, follow_redirects=True):
+          def _create_mcp_context():
+            try:
+              return streamable_http_client(
+                  self.tenant.mcp_url, headers=headers, timeout=60.0, sse_read_timeout=300.0
+              )
+            except TypeError:
+              return streamable_http_client(self.tenant.mcp_url, headers=headers)
+
+          mcp_context = _create_mcp_context()
+          async with mcp_context as streams, ClientSession(streams[0], streams[1]) as session:
+            await session.initialize()
+            return await _run_with_session(session)
+      finally:
+        self._active_playbook_count = max(0, self._active_playbook_count - 1)
 
   async def _playbook_loop(self) -> None:
-    """Background scheduler loop executing registered Markdown playbooks when due."""
-    logger.info("Markdown Playbook scheduler loop started.")
+    """Background scheduler loop executing registered Markdown playbooks concurrently when due."""
+    logger.info(
+        f"Markdown Playbook scheduler loop started (playbook_concurrency={self.playbook_concurrency}, "
+        f"query_concurrency={self.playbook_query_concurrency})."
+    )
     while self._playbook_scheduler_running:
       try:
         now = datetime.now(timezone.utc)
+        due_playbook_ids: List[str] = []
         for pb_id, pb_cfg in list(self.state.playbooks.items()):
           if not pb_cfg.get("enabled", True):
+            continue
+          per_pb_lock = self._get_per_playbook_lock(pb_id)
+          if per_pb_lock.locked():
             continue
           interval = max(60, int(pb_cfg.get("interval_seconds", 14400)))
           last_run_str = pb_cfg.get("last_run_time")
@@ -1432,11 +1503,23 @@ class WatchdogDaemon:
               is_due = True
 
           if is_due:
-            logger.info(f"Scheduled Markdown playbook '{pb_id}' is due; starting execution pass.")
+            due_playbook_ids.append(pb_id)
+
+        if due_playbook_ids:
+          logger.info(
+              f"Launching {len(due_playbook_ids)} due Markdown playbooks concurrently "
+              f"(max parallel={self.playbook_concurrency}): {due_playbook_ids}"
+          )
+
+          async def _run_due_pb(target_pb_id: str) -> None:
             try:
-              await self.run_playbook_once(playbook_id=pb_id)
+              await self.run_playbook_once(playbook_id=target_pb_id)
             except Exception as pb_err:
-              logger.error(f"Scheduled playbook '{pb_id}' execution failed: {_unwrap_exception(pb_err)}")
+              logger.error(
+                  f"Scheduled playbook '{target_pb_id}' execution failed: {_unwrap_exception(pb_err)}"
+              )
+
+          await asyncio.gather(*(_run_due_pb(pid) for pid in due_playbook_ids))
       except asyncio.CancelledError:
         logger.info("Markdown Playbook scheduler loop cancelled.")
         break

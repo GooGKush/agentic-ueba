@@ -123,6 +123,18 @@ class TenantConfig(BaseModel):
   fleet_360_ingest_events: bool = Field(
       default_factory=lambda: os.environ.get("FLEET_360_INGEST_EVENTS", "true").lower() in ("true", "1", "yes")
   )
+  max_concurrent_udm_searches: int = Field(
+      default_factory=lambda: int(os.environ.get("MAX_CONCURRENT_UDM_SEARCHES", "6"))
+  )
+  playbook_concurrency: int = Field(
+      default_factory=lambda: int(os.environ.get("PLAYBOOK_CONCURRENCY", "3"))
+  )
+  playbook_query_concurrency: int = Field(
+      default_factory=lambda: int(os.environ.get("PLAYBOOK_QUERY_CONCURRENCY", "3"))
+  )
+  blocking_io_workers: int = Field(
+      default_factory=lambda: int(os.environ.get("BLOCKING_IO_WORKERS", "4"))
+  )
 
   @property
   def mcp_url(self) -> str:

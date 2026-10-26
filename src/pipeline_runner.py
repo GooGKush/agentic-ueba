@@ -8,13 +8,17 @@ and secops-statistical-hunter, renders placeholders deterministically, executes
 queries via Chronicle OneMCP, and evaluates exact statistical metrics in pure Python.
 """
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+import functools
 import json
 import logging
 import math
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+import weakref
 
 import httpx
 from mcp import ClientSession
@@ -45,9 +49,47 @@ class PipelineRunner:
       "robust_threshold": 3.5,
   }
 
+  _SHARED_IO_POOL: Optional[ThreadPoolExecutor] = None
+  _LOOP_SEARCH_SEMAPHORES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Tuple[int, asyncio.Semaphore]]" = (
+      weakref.WeakKeyDictionary()
+  )
+
   def __init__(self, tenant_config: Optional[TenantConfig] = None):
     self.tenant = tenant_config or TenantConfig()
     self.skills_root = get_skills_root()
+    self.max_concurrent_udm_searches = max(
+        1, int(getattr(self.tenant, "max_concurrent_udm_searches", 6))
+    )
+    self.blocking_io_workers = max(
+        1, int(getattr(self.tenant, "blocking_io_workers", 4))
+    )
+
+  @classmethod
+  def get_io_thread_pool(cls, max_workers: int = 4) -> ThreadPoolExecutor:
+    """Returns the shared background ThreadPoolExecutor for synchronous blocking I/O and CPU tasks."""
+    if cls._SHARED_IO_POOL is None:
+      cls._SHARED_IO_POOL = ThreadPoolExecutor(
+          max_workers=max(2, max_workers),
+          thread_name_prefix="secops-ueba-io",
+      )
+    return cls._SHARED_IO_POOL
+
+  async def run_in_io_thread(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Offloads a synchronous blocking function (e.g. urllib ImportEvents, ADC auth, AST parse) to a worker thread."""
+    loop = asyncio.get_running_loop()
+    pool = self.get_io_thread_pool(self.blocking_io_workers)
+    bound = functools.partial(func, *args, **kwargs)
+    return await loop.run_in_executor(pool, bound)
+
+  def _get_udm_search_semaphore(self) -> asyncio.Semaphore:
+    """Returns a per-event-loop semaphore governing concurrent Chronicle `udm_search` calls."""
+    loop = asyncio.get_running_loop()
+    entry = self._LOOP_SEARCH_SEMAPHORES.get(loop)
+    if entry is None or entry[0] != self.max_concurrent_udm_searches:
+      sem = asyncio.Semaphore(self.max_concurrent_udm_searches)
+      self._LOOP_SEARCH_SEMAPHORES[loop] = (self.max_concurrent_udm_searches, sem)
+      return sem
+    return entry[1]
 
   def find_template(self, skill_name: str, template_name: str) -> Path:
     """Locates a .yl2 template file within the canonical skill directory."""
@@ -325,37 +367,39 @@ class PipelineRunner:
     logger.info(f"Executing query over OneMCP: {query_preview}...")
 
     max_attempts = 2
-    for attempt in range(max_attempts):
-      res = await session.call_tool("udm_search", tool_args)
-      if not res.content:
-        return {"stats": [], "events": []}
+    search_sem = self._get_udm_search_semaphore()
+    async with search_sem:
+      for attempt in range(max_attempts):
+        res = await session.call_tool("udm_search", tool_args)
+        if not res.content:
+          return {"stats": [], "events": []}
 
-      raw_text = res.content[0].text if hasattr(res.content[0], "text") else ""
-      if not raw_text or not raw_text.strip():
-        return {"stats": [], "events": []}
+        raw_text = res.content[0].text if hasattr(res.content[0], "text") else ""
+        if not raw_text or not raw_text.strip():
+          return {"stats": [], "events": []}
 
-      is_error_flag = bool(getattr(res, "isError", False))
-      try:
-        parsed = json.loads(raw_text)
-      except Exception as e:
-        logger.warning(f"udm_search returned non-JSON text ({e}): {raw_text[:160]}")
-        parsed = {"raw_text": raw_text, "stats": [], "events": []}
+        is_error_flag = bool(getattr(res, "isError", False))
+        try:
+          parsed = json.loads(raw_text)
+        except Exception as e:
+          logger.warning(f"udm_search returned non-JSON text ({e}): {raw_text[:160]}")
+          parsed = {"raw_text": raw_text, "stats": [], "events": []}
 
-      try:
-        QueryIntegrityGate.verify_backend_response(
-            query,
-            parsed,
-            raw_text=raw_text,
-            is_error_flag=is_error_flag,
-            raise_on_error=True,
-        )
-        return parsed
-      except ChronicleBackendQueryError:
-        if attempt + 1 >= max_attempts:
-          raise
-        logger.warning(
-            f"Retrying udm_search after ChronicleBackendQueryError (attempt {attempt + 1}/{max_attempts})"
-        )
+        try:
+          QueryIntegrityGate.verify_backend_response(
+              query,
+              parsed,
+              raw_text=raw_text,
+              is_error_flag=is_error_flag,
+              raise_on_error=True,
+          )
+          return parsed
+        except ChronicleBackendQueryError:
+          if attempt + 1 >= max_attempts:
+            raise
+          logger.warning(
+              f"Retrying udm_search after ChronicleBackendQueryError (attempt {attempt + 1}/{max_attempts})"
+          )
 
     return {"stats": [], "events": []}
 
