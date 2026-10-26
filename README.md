@@ -1,6 +1,6 @@
 # 🛡️ Agentic UEBA: Autonomous SecOps Threat Hunter & 360° Behavioral Risk Radar
 
-[![Version](https://img.shields.io/badge/version-v2.2.0-blue.svg)](README.md) [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE) [![Unit Tests](https://img.shields.io/badge/unit%20tests-82%2F82%20passing%20(100%25)-brightgreen.svg)](tests/)
+[![Version](https://img.shields.io/badge/version-v2.3.0-blue.svg)](README.md) [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE) [![Unit Tests](https://img.shields.io/badge/unit%20tests-85%2F85%20passing%20(100%25)-brightgreen.svg)](tests/)
 
 **Agentic UEBA** (`secops-agentic-hunter`) is an autonomous, dual-interface threat hunting and behavioral risk service for **Google Security Operations (Chronicle SIEM & SOAR)**. It embeds the canonical **`secops-risk-metrics-multistage`** (`v2.1.0+`) and **`secops-statistical-hunter`** (`v2.8.0+`) skills to provide continuous tenant-wide behavioral baselining, automated SOAR case triage with 6-pillar HTML/SVG Case Wall reporting, and Just-In-Time (JIT) playbook and MCP execution.
 
@@ -145,7 +145,9 @@ curl -X POST "https://<YOUR_SERVICE_URL>/api/v1/radar/fleet-sweep" \
 ```
 
 #### 3. Autonomous Markdown Hunting Playbooks (`/api/v1/playbooks`)
-Point `agentic-ueba` at a public GitHub Markdown URL (e.g., `https://github.com/GooGKush/docs/blob/main/php2shell-ueba-hunting.md`) to automatically normalize the URL to `raw.githubusercontent.com`, extract all multi-stage YARA-L 2.0 `stage` queries, validate them against the Malachite AST validator, schedule periodic searches, chain upstream candidate IPs into seeded follow-up queries, and ingest matches as `PLAYBOOK_BEHAVIORAL_HUNT_MATCH` UDM events via `IngestionService.ImportEvents`:
+Point `agentic-ueba` at a public GitHub Markdown URL (e.g., `https://github.com/GooGKush/docs/blob/main/cloud-threats-ueba-hunting.md`) to automatically normalize the URL to `raw.githubusercontent.com`, extract all multi-stage YARA-L 2.0 `stage` queries, validate them against the Malachite AST validator, schedule periodic searches in parallel waves, and ingest matches as `PLAYBOOK_BEHAVIORAL_HUNT_MATCH` UDM events via `IngestionService.ImportEvents`:
+* **Intra-Playbook Wave Concurrency**: Independent upstream queries execute concurrently (`SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3`) before synchronizing at entity-seeded or Capstone barriers.
+* **UDM `run_id` Tagging & Read-After-Write Indexing Barrier**: Every playbook run generates a unique `run_id` (e.g., `run_cloud_threats_20261026T190000Z_a1b2c3d4`) stamped into `metadata.product_log_id`, `target.resource.attribute.labels["Run ID"]`, and `security_result[0].detection_fields["run_id"]`. Before executing any downstream **Capstone (`PLAYBOOK_BEHAVIORAL_HUNT_MATCH`)** convergence query, `PlaybookRunner` flushes upstream UDM events on the background `secops-ueba-io` worker thread pool and polls Chronicle UDM search (`verify_udm_run_indexed()`) until `indexed_events >= expected_events`, eliminating read-after-write indexing race conditions.
 
 ```bash
 # Register and start a periodic Markdown playbook (every 4 hours)
@@ -222,47 +224,73 @@ Connect any MCP client (Streamable HTTP) to `https://<YOUR_SERVICE_URL>/mcp`. Av
 
 ---
 
-## ☁️ Hosting, Sizing & Scaling Guidelines (Cloud Run / Container)
+## ☁️ Hosting, Sizing & Resource Utilization Guidelines (Cloud Run / Container)
 
 > [!IMPORTANT]
-> **`agentic-ueba` is a stateful singleton daemon and MUST NOT be horizontally scaled (`--min-instances=1 --max-instances=1`).**
+> **`agentic-ueba` is a stateful singleton daemon and MUST NOT be horizontally scaled (`--min-instances=1 --max-instances=1`).** Instead of horizontal replicas, scale **vertically** (`2–4 vCPU`, `2–4 GiB RAM`) and tune the internal async/thread concurrency governors described below.
 
 ### Why Horizontal Scaling (`max-instances > 1`) Must Be Disabled
 1. **In-Process Concurrency Locks & Local Deduplication Ledger**:
-   `WatchdogDaemon` uses in-memory `asyncio.Lock` guards (`_scan_lock`, `_fleet_360_lock`), an in-memory `_in_flight_case_ids` set, and a local atomic JSON ledger (`data/watchdog_state.json`) to track seen SOAR cases and intra-day `BEHAVIORAL_RISK_RADAR_360` UDM emissions. Running multiple container instances would cause replicas to race on the same open SOAR cases (posting duplicate comments to the Case Wall) and ingest duplicate `BEHAVIORAL_RISK_RADAR_360` UDM events into Chronicle.
-2. **Chronicle API Quota & Rate-Limit Protection**:
-   Both the 4-hour fleetwide 360° sweep (`FLEET_360_INTER_QUERY_DELAY_SEC=1.5`) and the bounded case worker pool (`WATCHDOG_WORKER_CONCURRENCY=3`) are paced to respect Chronicle OneMCP `udm_search` QPS limits. Horizontal replicas multiply query concurrency against the same Chronicle tenant.
+   `WatchdogDaemon` uses in-memory `asyncio.Lock` guards (`_scan_lock`, `_fleet_360_lock`, and per-playbook `_playbook_locks[pb_id]`), an in-memory `_in_flight_case_ids` set, and a thread-safe (`threading.RLock`) local atomic JSON ledger (`data/watchdog_state.json`) to track seen SOAR cases, intra-day `BEHAVIORAL_RISK_RADAR_360` emissions, and `PLAYBOOK_BEHAVIORAL_HUNT_MATCH` UDM deduplication. Running multiple container instances would cause replicas to race on the same open SOAR cases (posting duplicate comments to the Case Wall) and ingest duplicate UDM events into Chronicle.
+2. **Global Chronicle API Quota Governor**:
+   All background loops (4-hour Fleet 360° sweeps, SOAR Case Wall workers, parallel Markdown Playbooks, and UDM read-after-write indexing validators) share a single process-wide `asyncio.Semaphore` (`SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6`) inside `PipelineRunner.execute_query_via_mcp()`. Horizontal replicas multiply query concurrency against the same Chronicle tenant and risk triggering `HTTP 429RESOURCE_EXHAUSTED` throttling.
 3. **Background Scheduler Continuity (`--no-cpu-throttling`)**:
-   On Google Cloud Run, if CPU is only allocated during HTTP requests, Cloud Run freezes background `asyncio` tasks (`_run_loop`, `_worker_loop`, and `_fleet_360_loop`) as soon as an HTTP response finishes. You **must** deploy with **CPU always allocated** (`--no-cpu-throttling`) and **`--min-instances=1`**.
+   On Google Cloud Run, if CPU is only allocated during HTTP requests, Cloud Run freezes background `asyncio` tasks (`_run_loop`, `_worker_loop`, `_fleet_360_loop`, and `_playbook_loop`) and `secops-ueba-io` worker threads as soon as an HTTP response finishes. You **must** deploy with **CPU always allocated** (`--no-cpu-throttling`) and **`--min-instances=1`**.
 
-### Recommended Compute Resources
+---
+
+### Hybrid Async + Worker ThreadPool Concurrency Architecture
+To run up to 14 cyclical Markdown hunting playbooks (150+ multi-stage YARA-L 2.0 queries with Capstone UDM indexing barriers) concurrently alongside SOAR Case Wall triage and 360° fleet sweeps without blocking the event loop, `agentic-ueba` separates **async network wait states** from **blocking I/O & CPU work**:
+
+1. **Global Chronicle `udm_search` Semaphore (`SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6`)**:
+   Caps simultaneous in-flight Chronicle `udm_search` calls across all playbooks, UDM `run_id` indexing lag polls, 360° sector sweeps, and Case Wall workers so tenant QPS limits are never breached.
+2. **Parallel Playbook Execution (`SECOPS_PLAYBOOK_CONCURRENCY=3`) & Per-Playbook Locks**:
+   Up to 3 distinct Markdown playbooks execute concurrently. While Playbook A sleeps in `verify_udm_run_indexed()` waiting for Chronicle to index its upstream `PLAYBOOK_BEHAVIORAL_HUNT_MATCH` UDM events before firing its Capstone query, Playbooks B and C execute their upstream waves uninterrupted. Duplicate triggers of the *same* playbook ID immediately return `SKIPPED_CONCURRENT`.
+3. **Intra-Playbook Wave Concurrency (`SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3`)**:
+   Within each playbook, independent upstream queries fan out concurrently in waves before synchronizing at entity-seeded queries (`needs_entity_seeding`) or pre-Capstone UDM flush + `run_id` indexing validation barriers (`is_capstone`).
+4. **Dedicated Blocking I/O & CPU Worker ThreadPool (`SECOPS_BLOCKING_IO_WORKERS=4`)**:
+   Offloads synchronous operations (`chronicle_ingest.import_events` over `urllib.request`, Google ADC OAuth token refreshes, Malachite YARA-L AST parsing/validation, and atomic `watchdog_state.json` disk writes) onto background `secops-ueba-io-*` OS threads via `loop.run_in_executor()`.
+
+---
+
+### Recommended Compute & Resource Utilization Tiers
+
+Choose the sizing profile that matches your active playbook and case triage volume:
+
+| Workload Profile | Active Workloads | vCPU (`--cpu`) | Memory (`--memory`) | Recommended Concurrency Env Vars | Expected Peak Utilization |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Standard Tier**<br>*(Default)* | • Standing SOAR Case Triage (`3` workers)<br>• 4h Fleetwide 360° Sweep (`USER` + `ASSET`)<br>• **1–4** Markdown Hunting Playbooks | **`2 vCPU`** | **`2 GiB`** | `SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6`<br>`SECOPS_PLAYBOOK_CONCURRENCY=2`<br>`SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3`<br>`SECOPS_BLOCKING_IO_WORKERS=4`<br>`WATCHDOG_WORKER_CONCURRENCY=3` | • **CPU**: 0.4–1.3 vCPU (spikes during AST compile & UDM batch serialization)<br>• **RAM**: ~650 MiB–1.1 GiB<br>• **Chronicle Search**: $\le 6$ concurrent queries |
+| **Full Curated Suite Tier**<br>*(12–14 Playbooks)* | • Standing SOAR Case Triage (`3–4` workers)<br>• 4h Fleetwide 360° Sweep (`USER` + `ASSET`)<br>• **All 12–14** Curated Detections & Threat Hunting Playbooks (~153 multi-stage queries + Capstone UDM loopback barriers) | **`4 vCPU`** | **`4 GiB`** | `SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6`<br>`SECOPS_PLAYBOOK_CONCURRENCY=3`<br>`SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3`<br>`SECOPS_BLOCKING_IO_WORKERS=6`<br>`WATCHDOG_WORKER_CONCURRENCY=3` | • **CPU**: 1.2–2.8 vCPU during overlapping playbook waves & 360° sweeps<br>• **RAM**: ~1.2 GiB–2.2 GiB (columnar stats buffers + in-flight UDM batches)<br>• **Chronicle Search**: $\le 6$ concurrent queries |
+
+### Baseline Container Settings (All Tiers)
 | Resource / Setting | Recommended Value | Rationale |
 | :--- | :--- | :--- |
 | **Instances** | `min-instances=1`, `max-instances=1` | Strict singleton to preserve deduplication state and prevent duplicate Case Wall / UDM writes. |
-| **CPU Allocation** | `2 vCPU` (`--cpu=2`) | Handles concurrent async HTTP/MCP streams, AST validation, and SVG/HTML rendering without contention. |
-| **CPU Throttling** | **Always-On** (`--no-cpu-throttling`) | Required so standing 60s case scans and 4h fleet 360° sweeps execute continuously in the background. |
-| **Memory** | `2 GiB` (`--memory=2Gi`) | Ample headroom for Python 3.13, embedded skill catalogs, columnar stats parsing, and sliding-window state. |
-| **Uvicorn Workers** | `1` (Default in `Dockerfile`) | Single-process async event loop so all routes share the same `WatchdogDaemon` locks and state. |
-| **Request Timeout** | `300s` (`--timeout=300`) | Accommodates multi-stage 360° + Tier 2A + Tier 2B synchronous SOAR Playbook investigations. |
+| **CPU Allocation** | `2 vCPU` (Standard) / `4 vCPU` (Full Suite) | Prevents thread-pool starvation between the main `asyncio` loop and `secops-ueba-io` worker threads. |
+| **CPU Throttling** | **Always-On** (`--no-cpu-throttling`) | Required so standing 60s case scans, 4h fleet 360° sweeps, and playbook UDM polling loops never freeze between HTTP requests. |
+| **Memory** | `2 GiB` (Standard) / `4 GiB` (Full Suite) | Headroom for concurrent 1,000-row columnar stats payloads, UDM batch builders, and SVG/HTML Case Wall rendering. |
+| **Uvicorn Workers** | `1` (Default in `Dockerfile`) | Single-process async event loop so all routes share the same `WatchdogDaemon` locks, semaphores, and `WatchdogState`. |
+| **Request Timeout** | `600s` (`--timeout=600`) | Accommodates on-demand synchronous playbook runs (`/api/v1/playbooks/run`) that include pre-Capstone UDM indexing lag retries (up to 60s barrier wait) as well as full 3-stage SOAR JIT investigations. |
+| **Staggered Playbook Schedules** | Offset `interval_seconds` (e.g., `14400`, `14700`, `15000`) | When registering all 12+ Curated Detection playbooks, staggering intervals by 3–5 minutes smooths CPU, memory, and Chronicle `udm_search` consumption across the 4-hour cycle. |
 
-### Example Cloud Run Deployment Command
+### Example Cloud Run Deployment Command (Full Curated Playbook Suite)
 ```bash
 # 1. Stage canonical skills into .build/skills and build via Cloud Build
 gcloud builds submit --config cloudbuild.yaml .
 
-# 2. Deploy as an always-on singleton service
+# 2. Deploy as an always-on singleton service sized for all 12+ playbooks + 360° + Case Wall triage
 gcloud run deploy secops-agentic-hunter \
   --image "gcr.io/${PROJECT_ID}/secops-agentic-hunter:latest" \
   --region us-central1 \
   --platform managed \
   --min-instances=1 \
   --max-instances=1 \
-  --cpu=2 \
-  --memory=2Gi \
+  --cpu=4 \
+  --memory=4Gi \
   --no-cpu-throttling \
-  --timeout=300 \
+  --timeout=600 \
   --concurrency=20 \
-  --set-env-vars="CHRONICLE_PROJECT_ID=gus-sdl,CHRONICLE_CUSTOMER_ID=8cbac5ae-8267-4da7-b405-cdbc6fa3f1d5,CHRONICLE_REGION=us,WATCHDOG_ENABLED=true,FLEET_360_ENABLED=true"
+  --set-env-vars="CHRONICLE_PROJECT_ID=gus-sdl,CHRONICLE_CUSTOMER_ID=8cbac5ae-8267-4da7-b405-cdbc6fa3f1d5,CHRONICLE_REGION=us,WATCHDOG_ENABLED=true,FLEET_360_ENABLED=true,SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6,SECOPS_PLAYBOOK_CONCURRENCY=3,SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3,SECOPS_BLOCKING_IO_WORKERS=6"
 ```
 
 ---
@@ -277,7 +305,11 @@ gcloud run deploy secops-agentic-hunter \
 | `CHRONICLE_MCP_URL` | *(auto-resolved)* | Optional override for `https://chronicle.<region>.rep.googleapis.com/mcp`. |
 | `GEMINI_MODEL` | `gemini-3.1-pro-preview` | Primary Vertex AI Gemini model for ReAct synthesis. |
 | `GEMINI_FALLBACK_MODELS` | `gemini-3-flash-preview,gemini-2.5-pro,gemini-2.5-flash` | Ordered fallback models on quota/availability errors. |
-| `WATCHDOG_ENABLED` | `false` | Auto-starts the standing case scanner and fleet 360° loop on startup when `true`. |
+| `SECOPS_MAX_CONCURRENT_UDM_SEARCHES` | `6` | Global process-wide semaphore capping simultaneous Chronicle `udm_search` calls across all playbooks, UDM indexing validators, 360° sweeps, and case workers. |
+| `SECOPS_PLAYBOOK_CONCURRENCY` | `3` | Maximum number of distinct Markdown playbooks allowed to execute in parallel. |
+| `SECOPS_PLAYBOOK_QUERY_CONCURRENCY` | `3` | Intra-playbook wave concurrency for independent upstream queries prior to seeded or Capstone barriers. |
+| `SECOPS_BLOCKING_IO_WORKERS` | `4` | Worker threads in the `secops-ueba-io` `ThreadPoolExecutor` for offloading synchronous UDM `ImportEvents` ingestion, ADC token refreshes, AST validation, and state saves. |
+| `WATCHDOG_ENABLED` | `false` | Auto-starts the standing case scanner, playbook scheduler, and fleet 360° loop on startup when `true`. |
 | `WATCHDOG_INTERVAL_SECONDS` | `60` | Polling interval (seconds) for open Chronicle SOAR cases. |
 | `WATCHDOG_LIMIT_PER_SCAN` | `5` | Maximum unseen cases enqueued per scan pass. |
 | `WATCHDOG_SCAN_LOOKBACK_HOURS` | `4` | Sliding creation-time horizon (hours) when querying open SOAR cases. |
@@ -317,16 +349,16 @@ agentic_ueba/
 │   ├── strategy_decider.py             # 360° warrant analyzer & Tier 2A -> Tier 2B epistemic pivot router
 │   ├── risk_metrics_engine.py          # 30d UEBA engine, Fleet 360° sweep, & BEHAVIORAL_RISK_RADAR_360 ingestor
 │   ├── stats_hunter_engine.py          # Inline raw-log statistical engine (C2 CV, Fano, Shannon, Markov, Zipf, EWMA, Impossible Travel, Producer-Consumer)
-│   ├── playbook_runner.py              # GitHub Markdown playbook fetcher, AST validator, query chainer, & UDM event builder
-│   ├── pipeline_runner.py              # Template renderer, Malachite AST validator, Data Table bridge, & hybrid engine bridge
+│   ├── playbook_runner.py              # GitHub Markdown playbook fetcher, wave runner, UDM run_id barrier, & Capstone engine
+│   ├── pipeline_runner.py              # Template renderer, Malachite AST validator, global udm_search governor, & IO thread pool
 │   ├── query_integrity_gate.py         # Pre-dispatch AST/entity/slot/Data-Table validator & post-execution backend error gate
 │   ├── dynamic_protocol_adapter.py     # Runtime SKILL.md protocol adapter with reference offloading
 │   ├── federated_bridge.py             # Cross-skill Macro-to-Micro handoff bridge
-│   ├── watchdog.py                     # Standing case scanner, worker pool, 4h Fleet 360° & Markdown playbook scheduler
+│   ├── watchdog.py                     # Standing case scanner, worker pool, 4h Fleet 360° & parallel playbook scheduler
 │   └── formatters/
 │       ├── __init__.py
 │       └── case_wall_card.py           # Chronicle SOAR Case Wall HTML/SVG card formatter & sanitizer
-└── tests/                              # Unit & contract test suite (82 tests)
+└── tests/                              # Unit & contract test suite (85 tests)
     ├── test_engines.py
     ├── test_metric_args.py
     ├── test_playbook_runner.py
@@ -339,7 +371,7 @@ agentic_ueba/
 ## 🧪 Local Development & Testing
 
 ```bash
-# Run the full 69-test unit and schema contract suite
+# Run the full 85-test unit and schema contract suite
 pytest tests/ -q
 
 # Start the server locally on port 8080
