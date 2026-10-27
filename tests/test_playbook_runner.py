@@ -870,18 +870,97 @@ def test_parse_real_shadow_ai_docs_file_if_present():
 
   runner = PlaybookRunner(TenantConfig(project_id="test-proj", customer_id="test-cust"))
   specs = runner.parse_markdown_playbook(real_doc.read_text(encoding="utf-8"))
-  assert len(specs) == 20
+  assert len(specs) == 15
   for spec in specs:
     assert spec.ast_errors == [], f"{spec.query_id} had AST errors: {spec.ast_errors}"
   macro_ids = [s.query_id for s in specs if s.plane == "MACRO_METRICS"]
   raw_ids = [s.query_id for s in specs if s.plane == "RAW_TELEMETRY"]
   capstone_ids = [s.query_id for s in specs if s.is_capstone]
-  assert len(macro_ids) == 13
-  assert len(raw_ids) == 5
-  assert len(capstone_ids) == 2
+  stage_b_loopback_ids = [s.query_id for s in specs if runner._is_stage_b_loopback_query(s)]
+  assert len(macro_ids) == 10
+  assert len(raw_ids) == 2
+  assert len(capstone_ids) == 3
+  assert len(stage_b_loopback_ids) == 2
   for r_spec in specs:
     if r_spec.plane == "RAW_TELEMETRY":
       assert r_spec.default_lookback_days <= 14
+
+
+@pytest.mark.anyio
+async def test_shadow_ai_three_wave_udm_loopback_execution_order(monkeypatch):
+  real_doc = Path("/usr/local/google/home/kushmerek/projects/docs/shadow-ai-agentic-ueba-hunting.md")
+  if not real_doc.is_file():
+    pytest.skip("Local shadow-ai-agentic-ueba-hunting.md not present in this environment")
+
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  risk_eng = RiskMetricsEngine(tenant)
+  runner = PlaybookRunner(tenant_config=tenant, risk_engine=risk_eng)
+
+  wave_trace = []
+  ingested_batches = []
+
+  async def fake_execute(session, query, start_iso, end_iso):
+    if "$indexed_events = count(metadata.id)" in query:
+      total_ingested = sum(len(b) for b in ingested_batches)
+      wave_trace.append(f"VERIFY_UDM:{total_ingested}")
+      return {"stats": [{"run_id": "run_shadow_ai_wave_test", "indexed_events": total_ingested}]}
+    if ":q[0-9]+_query_2a" in query:
+      wave_trace.append("WAVE2_2B")
+      return {"stats": [{"host": "dev-agent-01", "cv": 0.12, "unified_threat_score": 4.8}]}
+    if ":q[0-9]+_query_4a" in query:
+      wave_trace.append("WAVE2_4B")
+      return {"stats": [{"user": "tim.smith", "fano_factor": 6.2, "unified_threat_score": 6.2}]}
+    if ":q[0-9]+_query_[1-9]" in query:
+      wave_trace.append("WAVE3_CAPSTONE_10")
+      return {
+          "stats": [
+              {
+                  "entity": "tim.smith",
+                  "distinct_scenarios_matched": 3,
+                  "capstone_threat_norm_sq": 64.0,
+                  "unified_threat_score": 9.5,
+              }
+          ]
+      }
+    wave_trace.append("WAVE1_UPSTREAM")
+    return {"stats": [{"user": "tim.smith", "unified_threat_score": 4.5}]}
+
+  def fake_ingest(events):
+    ingested_batches.append(list(events))
+    wave_trace.append(f"FLUSH_UDM:{len(events)}")
+    return {"status": "SUCCESS", "events_ingested": len(events), "batches": 1}
+
+  monkeypatch.setattr(risk_eng.runner, "execute_query_via_mcp", fake_execute)
+  monkeypatch.setattr(risk_eng, "ingest_udm_events", fake_ingest)
+
+  res = await runner.execute_playbook(
+      session=AsyncMock(),
+      source=str(real_doc),
+      playbook_id="shadow-ai-agentic-ueba",
+      run_id="run_shadow_ai_wave_test",
+      query_concurrency=4,
+      udm_validation_poll_sec=0.0,
+      inter_query_delay_sec=0.0,
+  )
+  assert res["status"] == "SUCCESS"
+  assert res["queries_discovered"] == 15
+  assert res["queries_executed"] == 15
+  # Verify all 12 Wave 1 queries run BEFORE Flush 1 -> Wave 2 (2B, 4B) -> Flush 2 -> Wave 3 (Query 10)
+  first_flush_idx = wave_trace.index("FLUSH_UDM:12")
+  assert wave_trace[:first_flush_idx] == ["WAVE1_UPSTREAM"] * 12
+  assert wave_trace[first_flush_idx:] == [
+      "FLUSH_UDM:12",
+      "VERIFY_UDM:12",
+      "WAVE2_2B",
+      "WAVE2_4B",
+      "FLUSH_UDM:2",
+      "VERIFY_UDM:14",
+      "WAVE3_CAPSTONE_10",
+      "FLUSH_UDM:2",
+  ]
+  # Verify reports are returned in document order q01..q15
+  returned_qids = [q["query_id"][:3] for q in res["queries"]]
+  assert returned_qids == [f"q{i:02d}" for i in range(1, 16)]
 
 
 @pytest.mark.anyio
