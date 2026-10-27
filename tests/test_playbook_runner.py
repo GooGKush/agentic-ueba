@@ -1137,6 +1137,48 @@ condition:
   assert "re.regex(security_result.rule_name, `^serial\\-3000\\-pb:`)" in executed_capstone_sql
 
 
+def test_all_curated_playbooks_three_wave_ast_and_outcome_compliance():
+  import re
+  docs_dir = Path("/usr/local/google/home/kushmerek/projects/docs")
+  if not docs_dir.is_dir():
+    pytest.skip("docs repo not present")
+  runner = PlaybookRunner()
+  curated_playbooks = [
+      "shadow-ai-agentic-ueba-hunting.md",
+      "chrome-enterprise-premium-ueba-hunting.md",
+      "cloud-threats-ueba-hunting.md",
+      "windows-threats-ueba-hunting.md",
+      "linux-threats-ueba-hunting.md",
+      "macos-threats-ueba-hunting.md",
+      "composite-rules-ueba-hunting.md",
+      "indicator-prioritization-ueba-hunting.md",
+      "non-prioritized-ioc-matching-ueba-hunting.md",
+      "mandiant-hunting-ueba-hunting.md",
+      "risk-analytics-ueba-hunting.md",
+      "vendor-alerts-ueba-hunting.md",
+      "third-party-vendor-alerts-ueba-hunting.md",
+  ]
+  for fname in curated_playbooks:
+    p = docs_dir / fname
+    assert p.is_file(), f"Missing playbook {fname}"
+    specs = runner.parse_markdown_playbook(p.read_text(encoding="utf-8"))
+    assert len(specs) >= 7, f"Unexpected query count in {fname}"
+    w1 = [s for s in specs if s.execution_wave == 1]
+    w2 = [s for s in specs if s.execution_wave == 2 and s.is_udm_gated]
+    w3 = [s for s in specs if s.execution_wave == 3 and s.is_capstone and not s.is_udm_gated]
+    assert len(w1) >= 4, f"{fname} missing Wave 1 queries"
+    assert len(w2) >= 1, f"{fname} missing Wave 2 UDM-gated Stage B queries"
+    assert len(w3) == 1, f"{fname} should have exactly 1 Wave 3 Unified Capstone query"
+    for s in specs:
+      assert s.ast_errors == [], f"{fname} {s.query_id} has AST errors: {s.ast_errors}"
+      parts = re.split(r"\boutcome:\s*", s.raw_query)[1:]
+      for part in parts:
+        block = re.split(r"(?:\bcondition:|\border:|\})", part)[0]
+        vars_defined = re.findall(r"^\s*(\$[a-zA-Z0-9_]+)\s*=", block, re.MULTILINE)
+        assert len(vars_defined) <= 20, f"{fname} {s.query_id} exceeds 20 outcome vars ({len(vars_defined)})"
+
+
+
 
 
 
