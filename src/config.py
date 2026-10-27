@@ -124,16 +124,38 @@ class TenantConfig(BaseModel):
       default_factory=lambda: os.environ.get("FLEET_360_INGEST_EVENTS", "true").lower() in ("true", "1", "yes")
   )
   max_concurrent_udm_searches: int = Field(
-      default_factory=lambda: int(os.environ.get("MAX_CONCURRENT_UDM_SEARCHES", "6"))
+      default_factory=lambda: int(
+          os.environ.get("SECOPS_MAX_CONCURRENT_UDM_SEARCHES")
+          or os.environ.get("MAX_CONCURRENT_UDM_SEARCHES", "6")
+      )
   )
   playbook_concurrency: int = Field(
-      default_factory=lambda: int(os.environ.get("PLAYBOOK_CONCURRENCY", "3"))
+      default_factory=lambda: int(
+          os.environ.get("SECOPS_PLAYBOOK_CONCURRENCY")
+          or os.environ.get("PLAYBOOK_CONCURRENCY", "6")
+      )
   )
   playbook_query_concurrency: int = Field(
-      default_factory=lambda: int(os.environ.get("PLAYBOOK_QUERY_CONCURRENCY", "3"))
+      default_factory=lambda: int(
+          os.environ.get("SECOPS_PLAYBOOK_QUERY_CONCURRENCY")
+          or os.environ.get("PLAYBOOK_QUERY_CONCURRENCY", "3")
+      )
   )
   blocking_io_workers: int = Field(
-      default_factory=lambda: int(os.environ.get("BLOCKING_IO_WORKERS", "4"))
+      default_factory=lambda: int(
+          os.environ.get("SECOPS_BLOCKING_IO_WORKERS")
+          or os.environ.get("BLOCKING_IO_WORKERS", "4")
+      )
+  )
+  udm_validation_max_attempts: int = Field(
+      default_factory=lambda: int(
+          os.environ.get("SECOPS_UDM_VALIDATION_MAX_ATTEMPTS", "45")
+      )
+  )
+  udm_validation_poll_sec: float = Field(
+      default_factory=lambda: float(
+          os.environ.get("SECOPS_UDM_VALIDATION_POLL_SEC", "30.0")
+      )
   )
 
   @property

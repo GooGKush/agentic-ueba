@@ -807,5 +807,258 @@ async def test_subthreading_io_offload_and_parallel_playbook_wave_concurrency(tm
   assert all(name.startswith("secops-ueba-io") for name in ingest_thread_names)
 
 
+def test_option2_upstream_candidate_users_seeding_and_telemetry_physics_clamp():
+  runner = PlaybookRunner(TenantConfig(project_id="test-proj", customer_id="test-cust"))
+  user_seeded_query = """
+stage stage1_hourly_events {
+    metadata.event_type = "RESOURCE_WRITTEN"
+    /* UPSTREAM_CANDIDATE_USERS */
+    (principal.user.userid = "sa-app@proj.iam.gserviceaccount.com" or principal.user.userid = "sa-worker@proj.iam.gserviceaccount.com")
+    principal.user.userid = $user
+    $user != ""
+  match:
+    $user by 1h
+  outcome:
+    $obs = count(metadata.id)
+}
+"""
+  assert PlaybookRunner._is_seeded_query(user_seeded_query) is True
+
+  substituted = PlaybookRunner.prepare_seeded_query(
+      user_seeded_query,
+      candidate_entities=["sa-shadow-ai@prod.iam.gserviceaccount.com", "alice@corp.local"],
+      unscope_to_fleet=False,
+  )
+  assert substituted is not None
+  assert "UPSTREAM_CANDIDATE_USERS" not in substituted
+  assert "sa-app@proj.iam.gserviceaccount.com" not in substituted
+  assert (
+      '(principal.user.userid = "sa-shadow-ai@prod.iam.gserviceaccount.com" or principal.user.userid = "alice@corp.local")'
+      in substituted
+  )
+
+  unscoped = PlaybookRunner.prepare_seeded_query(
+      user_seeded_query,
+      candidate_entities=[],
+      unscope_to_fleet=True,
+  )
+  assert unscoped is not None
+  assert "UPSTREAM_CANDIDATE_USERS" not in unscoped
+  assert "sa-app@proj.iam.gserviceaccount.com" not in unscoped
+
+  # Verify Telemetry Physics window clamping on RAW_TELEMETRY vs MACRO_METRICS specs
+  specs = runner.parse_markdown_playbook(SAMPLE_PLAYBOOK_MD)
+  raw_spec, macro_spec = specs[0], specs[1]
+  assert raw_spec.plane == "RAW_TELEMETRY"
+  assert macro_spec.plane == "MACRO_METRICS"
+  assert PlaybookRunner.resolve_effective_lookback_days(raw_spec, lookback_days_override=35) == 14
+  assert PlaybookRunner.resolve_effective_lookback_days(macro_spec, lookback_days_override=35) == 35
+
+  # Verify new v2.1.3 / v2.8.3 effective Z extraction fields
+  z_ewma, f_ewma = PlaybookRunner.extract_row_effective_z({"ewma_velocity_score": 5.4})
+  assert (z_ewma, f_ewma) == (5.4, "ewma_velocity_score")
+  z_pcr, f_pcr = PlaybookRunner.extract_row_effective_z({"pcr_z_score": 4.2})
+  assert (z_pcr, f_pcr) == (4.2, "pcr_z_score")
+  z_norm, f_norm = PlaybookRunner.extract_row_effective_z({"threat_vector_norm_sq": 36.0})
+  assert (z_norm, f_norm) == (6.0, "threat_vector_norm_sq")
+
+
+def test_parse_real_shadow_ai_docs_file_if_present():
+  real_doc = Path("/usr/local/google/home/kushmerek/projects/docs/shadow-ai-agentic-ueba-hunting.md")
+  if not real_doc.is_file():
+    pytest.skip("Local shadow-ai-agentic-ueba-hunting.md not present in this environment")
+
+  runner = PlaybookRunner(TenantConfig(project_id="test-proj", customer_id="test-cust"))
+  specs = runner.parse_markdown_playbook(real_doc.read_text(encoding="utf-8"))
+  assert len(specs) == 20
+  for spec in specs:
+    assert spec.ast_errors == [], f"{spec.query_id} had AST errors: {spec.ast_errors}"
+  macro_ids = [s.query_id for s in specs if s.plane == "MACRO_METRICS"]
+  raw_ids = [s.query_id for s in specs if s.plane == "RAW_TELEMETRY"]
+  capstone_ids = [s.query_id for s in specs if s.is_capstone]
+  assert len(macro_ids) == 13
+  assert len(raw_ids) == 5
+  assert len(capstone_ids) == 2
+  for r_spec in specs:
+    if r_spec.plane == "RAW_TELEMETRY":
+      assert r_spec.default_lookback_days <= 14
+
+
+@pytest.mark.anyio
+async def test_federated_bridge_bilateral_exploit_and_shadow_ai(monkeypatch):
+  from src.federated_bridge import FederatedBridge
+
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  bridge = FederatedBridge(tenant)
+
+  async def fake_360(session, username, lookback_days):
+    return {
+        "entity": username,
+        "calibrated_risk_index": 78,
+        "top_z_score": 4.5,
+        "top_sector": "Web",
+    }
+
+  async def fake_markov(session, entity, lookback_days):
+    assert lookback_days <= 14
+    return {
+        "entity": entity,
+        "calibrated_risk_index": 84,
+        "top_z_score": 5.2,
+    }
+
+  monkeypatch.setattr(bridge.risk_engine, "run_360_behavioral_radar", fake_360)
+  monkeypatch.setattr(bridge.stats_engine, "run_markov_transition_rarity", fake_markov)
+
+  res = await bridge.run_two_phase_chained_hunt(
+      session=AsyncMock(),
+      username="web-prod-01",
+      macro_vector="http2shell",
+      lookback_days=30,
+  )
+  assert res["status"] == "CHAINED_THREAT_CONFIRMED"
+  assert res["primary_vector"] == "web_exploit"
+  assert res["is_chained_threat"] is True
+  assert res["combined_norm_sq"] == round(4.5**2 + 5.2**2, 2)
+  assert res["loopback_eligible"] is True
+
+
+@pytest.mark.anyio
+async def test_300_of_3000_partial_index_gate_and_cross_playbook_tag_isolation(tmp_path, monkeypatch):
+  capstone_md = """# High-Volume Serial Playbook
+
+### 1. Upstream Search (Produces 3,000 Events)
+
+```yara
+// Goal: Upstream volumetric user login baseline.
+stage stage1_upstream {
+    metadata.event_type = "USER_LOGIN"
+    principal.user.userid = $user
+    $user != ""
+  match:
+    $user by 1d
+  outcome:
+    $obs = count(metadata.id)
+    $z_score = max(metrics.auth_attempts_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        target.user.userid: principal.user.userid
+    ))
+}
+$user = $stage1_upstream.user
+match:
+  $user
+outcome:
+  $z_score = max($stage1_upstream.z_score)
+condition:
+  $z_score >= 3.0
+```
+
+### 2. Downstream UDM Loopback Capstone Search
+
+```yara
+// Goal: Downstream UDM loopback convergence query.
+stage stage1_loopback {
+    metadata.event_type = "GENERIC_EVENT"
+    metadata.product_event_type = "PLAYBOOK_BEHAVIORAL_HUNT_MATCH"
+    $entity = principal.user.userid
+    $entity != ""
+  match:
+    $entity
+  outcome:
+    $capstone_threat_score = max(security_result.confidence_score)
+}
+$entity = $stage1_loopback.entity
+match:
+  $entity
+outcome:
+  $capstone_threat_score = max($stage1_loopback.capstone_threat_score)
+condition:
+  $capstone_threat_score >= 3.0
+```
+"""
+  md_file = tmp_path / "serial-3000-playbook.md"
+  md_file.write_text(capstone_md, encoding="utf-8")
+
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  risk_eng = RiskMetricsEngine(tenant)
+  runner = PlaybookRunner(tenant_config=tenant, risk_engine=risk_eng)
+
+  upstream_rows = [{"user": f"user_{i}@corp.local", "z_score": 4.2} for i in range(3000)]
+  capstone_executed = False
+  executed_capstone_sql = ""
+
+  # Case 1: Only 300 of 3,000 events become visible before max_attempts expires -> MUST block Search 2
+  partial_counts = [100, 300, 300]
+
+  async def fake_execute_partial(session, query, start_iso, end_iso):
+    nonlocal capstone_executed
+    if "$indexed_events = count(metadata.id)" in query:
+      cnt = partial_counts.pop(0) if partial_counts else 300
+      return {"stats": [{"run_id": "run_test_3000", "indexed_events": cnt}]}
+    if "PLAYBOOK_BEHAVIORAL_HUNT_MATCH" in query:
+      capstone_executed = True
+      return {"stats": []}
+    return {"stats": upstream_rows}
+
+  monkeypatch.setattr(risk_eng.runner, "execute_query_via_mcp", fake_execute_partial)
+  monkeypatch.setattr(
+      risk_eng,
+      "ingest_udm_events",
+      lambda evs: {"status": "SUCCESS", "events_ingested": len(evs), "batches": 6},
+  )
+
+  res_partial = await runner.execute_playbook(
+      session=AsyncMock(),
+      source=str(md_file),
+      playbook_id="serial-3000-pb",
+      run_id="run_serial_3000_partial",
+      udm_validation_max_attempts=3,
+      udm_validation_poll_sec=0.0,
+      inter_query_delay_sec=0.0,
+      # Verify intra-day dedup callback is bypassed so all 3,000 upstream events are emitted for this run_id
+      should_emit_fn=lambda *args: False,
+  )
+  assert capstone_executed is False
+  assert res_partial["udm_sync_validation"]["status"] == "PARTIAL_TIMEOUT"
+  assert res_partial["udm_sync_validation"]["expected_events"] == 3000
+  assert res_partial["udm_sync_validation"]["indexed_events"] == 300
+  assert res_partial["queries"][1]["status"] == "SKIPPED_INCOMPLETE_UDM_SYNC"
+
+  # Case 2: Indexing progresses 300 -> 1800 -> 3000 -> Search 2 runs with strict run_id + playbook_id tags
+  full_counts = [300, 1800, 3000]
+
+  async def fake_execute_full(session, query, start_iso, end_iso):
+    nonlocal capstone_executed, executed_capstone_sql
+    if "$indexed_events = count(metadata.id)" in query:
+      cnt = full_counts.pop(0) if full_counts else 3000
+      return {"stats": [{"run_id": "run_serial_3000_complete", "indexed_events": cnt}]}
+    if "PLAYBOOK_BEHAVIORAL_HUNT_MATCH" in query:
+      capstone_executed = True
+      executed_capstone_sql = query
+      return {"stats": [{"entity": "user_0@corp.local", "capstone_threat_score": 5.5}]}
+    return {"stats": upstream_rows}
+
+  monkeypatch.setattr(risk_eng.runner, "execute_query_via_mcp", fake_execute_full)
+  res_full = await runner.execute_playbook(
+      session=AsyncMock(),
+      source=str(md_file),
+      playbook_id="serial-3000-pb",
+      run_id="run_serial_3000_complete",
+      udm_validation_max_attempts=5,
+      udm_validation_poll_sec=0.0,
+      inter_query_delay_sec=0.0,
+  )
+  assert capstone_executed is True
+  assert res_full["udm_sync_validation"]["status"] == "VERIFIED"
+  assert res_full["udm_sync_validation"]["attempts"] == 3
+  assert res_full["udm_sync_validation"]["indexed_events"] == 3000
+  assert res_full["queries"][1]["status"] == "SUCCESS"
+  # Verify both run_id and playbook_id stream-isolation filters were injected automatically
+  assert 'metadata.product_log_id = "run_serial_3000_complete"' in executed_capstone_sql
+  assert "re.regex(security_result.rule_name, `^serial\\-3000\\-pb:`)" in executed_capstone_sql
+
+
+
+
 
 

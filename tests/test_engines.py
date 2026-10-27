@@ -2556,3 +2556,59 @@ async def _async_v212_v282_skill_alignment_and_score_extraction(monkeypatch):
         entity_type="ASSET",
     )
     assert sh_res["top_z_score"] == 4.2
+
+
+def test_bilateral_ueba_harness_and_telemetry_physics_guardrail():
+  """Verify Telemetry Physics 14d raw ceiling and Bilateral UEBA Harness routing."""
+  from datetime import datetime
+  from src.autonomous_hunter import AutonomousHunterEngine
+  from src.models import JITHuntRequest
+  from src.strategy_decider import StrategyDecider
+
+  # 1. Telemetry Physics Guardrail: raw UDM lookback is clamped to <= 14 days (never 30d)
+  assert StatsHunterEngine.enforce_telemetry_physics_window(30) == 14
+  assert StatsHunterEngine.enforce_telemetry_physics_window(7) == 7
+  sh_engine = StatsHunterEngine()
+  start_iso, end_iso = sh_engine._iso_window(30)
+  dt_start = datetime.strptime(start_iso, "%Y-%m-%dT%H:%M:%SZ")
+  dt_end = datetime.strptime(end_iso, "%Y-%m-%dT%H:%M:%SZ")
+  assert (dt_end - dt_start).days == 14
+
+  # 2. Bilateral UEBA Harness routing for http2shell / web-to-shell exploit inquiries
+  ctx_http2shell = {
+      "case_title": "HTTP2Shell Exploit Investigation",
+      "alerts": ["Web-to-Shell RCE Suspected"],
+      "case_description": "Use UEBA to detect http2shell exploit chain on web server",
+      "entity_type": "ASSET",
+      "primary_entity": "web-prod-01",
+      "investigation_tier": "TIER_2_DEEP_DIVE",
+  }
+  directive = StrategyDecider._deterministic_reasoner(ctx_http2shell)
+  assert directive.selected_skill == "secops-risk-metrics-multistage"
+  assert directive.model_name == "DUAL_SECTOR_FUSION_3STAGE"
+  assert directive.fusion_metrics == ["http_queries_fail", "file_executions_total"]
+  cand_models = {c.model_name for c in directive.candidate_hypotheses}
+  assert "MARKOV_TRANSITION_RARITY" in cand_models
+  assert "SHANNON_CHARACTER_ENTROPY" in cand_models
+  assert "C2_BEACONING_JITTER" in cand_models
+
+  # 3. Producer-Consumer Byte Ratio Inversion routing
+  skill, query, model = StrategyDecider.decide(
+      case_title="Workstation Producer-Consumer Role Inversion",
+      alert_name="Net Producer Asymmetry",
+      alert_desc="Endpoint pcr_z_score breach",
+      entity_type="ASSET",
+  )
+  assert skill == "secops-statistical-hunter"
+  assert query == "producer_consumer_inversion"
+  assert model == "PRODUCER_CONSUMER_RATIO_INVERSION"
+
+  # 4. AutonomousHunterEngine bilateral skill resolution
+  hunter = AutonomousHunterEngine()
+  req_bilateral = JITHuntRequest(
+      target_entity="web-prod-01",
+      entity_type="ASSET",
+      alert_name="HTTP2Shell Web-to-Shell Exploit Chain",
+  )
+  assert hunter.resolve_skill_selection(req_bilateral) == "bilateral"
+
