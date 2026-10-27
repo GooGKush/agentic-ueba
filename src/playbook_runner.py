@@ -67,7 +67,7 @@ class PlaybookQuerySpec:
     self.execution_wave = (
         int(execution_wave)
         if execution_wave is not None
-        else (3 if is_capstone else (2 if is_udm_gated else 1))
+        else (2 if is_udm_gated else (3 if is_capstone else 1))
     )
     self.entity_type_hint = entity_type_hint
     self.ast_errors = ast_errors
@@ -474,6 +474,16 @@ class PlaybookRunner:
       query_id = f"q{idx:02d}_{slug_short}"
 
       ast_errors = self.runner.validate_ast(query_text)
+      header_blob = f"{query_id} {section} {goal}".lower()
+      is_udm_gated = bool(
+          is_capstone
+          and "capstone" not in header_blob
+          and re.search(
+              r"(?:query_[1-9][0-9]*[ab]\b|stage1_upstream_)",
+              query_text,
+              re.IGNORECASE,
+          )
+      )
       specs.append(
           PlaybookQuerySpec(
               query_id=query_id,
@@ -488,6 +498,7 @@ class PlaybookRunner:
               entity_type_hint=entity_type_hint,
               ast_errors=ast_errors,
               is_capstone=is_capstone,
+              is_udm_gated=is_udm_gated,
           )
       )
 
