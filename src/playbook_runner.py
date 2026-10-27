@@ -50,6 +50,8 @@ class PlaybookQuerySpec:
       entity_type_hint: str,
       ast_errors: List[str],
       is_capstone: bool = False,
+      is_udm_gated: bool = False,
+      execution_wave: Optional[int] = None,
   ):
     self.query_id = query_id
     self.index = index
@@ -61,6 +63,12 @@ class PlaybookQuerySpec:
     self.default_lookback_days = lookback_days if (lookback_days := default_lookback_days) else 1
     self.is_seeded = is_seeded
     self.is_capstone = is_capstone
+    self.is_udm_gated = is_udm_gated
+    self.execution_wave = (
+        int(execution_wave)
+        if execution_wave is not None
+        else (3 if is_capstone else (2 if is_udm_gated else 1))
+    )
     self.entity_type_hint = entity_type_hint
     self.ast_errors = ast_errors
 
@@ -75,6 +83,8 @@ class PlaybookQuerySpec:
         "default_lookback_days": self.default_lookback_days,
         "is_seeded": self.is_seeded,
         "is_capstone": self.is_capstone,
+        "is_udm_gated": self.is_udm_gated,
+        "execution_wave": self.execution_wave,
         "entity_type_hint": self.entity_type_hint,
         "ast_valid": len(self.ast_errors) == 0,
         "ast_errors": self.ast_errors,
@@ -325,11 +335,11 @@ class PlaybookRunner:
       return 35
 
     combined = f"{goal} {model} {query}".lower()
-    if "playbook_behavioral_hunt_match" in combined:
-      return 7
     if any(k in combined for k in ("5m", "bailout", "fano", "burst", "1h")):
       if "by 1d" not in query:
         return 1
+    if "playbook_behavioral_hunt_match" in combined:
+      return 7
     if any(k in combined for k in ("zipf", "markov", "hurdle", "mad", "poisson_rare", "beta_binomial", "by 1d")):
       return 7
     return 1
@@ -381,6 +391,22 @@ class PlaybookRunner:
       return True
     combined = f"{section} {goal}".lower()
     return "capstone" in combined and "convergence" in combined and "loopback" in combined
+
+  @staticmethod
+  def _is_stage_b_loopback_query(spec: PlaybookQuerySpec) -> bool:
+    """Returns True if `spec` is an inline Stage B UDM-Loopback query (Wave 2) rather than a final Capstone rollup (Wave 3)."""
+    if not spec.is_capstone:
+      return False
+    header_blob = f"{spec.query_id} {spec.section} {spec.goal}".lower()
+    if "capstone" in header_blob:
+      return False
+    return bool(
+        re.search(
+            r"(?:query_[1-9][0-9]*[ab]\b|stage1_upstream_)",
+            spec.raw_query,
+            re.IGNORECASE,
+        )
+    )
 
   def parse_markdown_playbook(self, markdown_text: str) -> List[PlaybookQuerySpec]:
     """Extracts and validates all multi-stage YARA-L 2.0 queries from a Markdown document."""
@@ -1135,6 +1161,17 @@ class PlaybookRunner:
     )
     specs = await self.runner.run_in_io_thread(self.parse_markdown_playbook, md_text)
     has_capstone = any(s.is_capstone for s in specs)
+    spec_order_map = {s.query_id: s.index for s in specs}
+
+    # Schedule execution in 3 waves when inline UDM-Loopback Stage B queries (e.g. 2B, 4B) exist:
+    # Wave 1: Independent/seeded upstream queries (`not s.is_capstone`)
+    # Wave 2: Inline Stage B UDM-Loopback queries (`_is_stage_b_loopback_query(s)`)
+    # Wave 3: Final Capstone rollup queries (`s.is_capstone and not _is_stage_b_loopback_query(s)`)
+    if any(self._is_stage_b_loopback_query(s) for s in specs):
+      wave1_specs = [s for s in specs if not s.is_capstone]
+      wave2_specs = [s for s in specs if s.is_capstone and self._is_stage_b_loopback_query(s)]
+      wave3_specs = [s for s in specs if s.is_capstone and not self._is_stage_b_loopback_query(s)]
+      specs = wave1_specs + wave2_specs + wave3_specs
 
     query_reports: List[Dict[str, Any]] = []
     udm_events_to_ingest: List[Dict[str, Any]] = []
@@ -1146,6 +1183,9 @@ class PlaybookRunner:
     total_suppressed = 0
     total_udm_generated = 0
     upstream_udm_generated = 0
+    flushed_upstream_udm = 0
+    wave2_flushed = False
+    wave3_flushed = False
     queries_executed = 0
     queries_skipped = 0
     accumulated_ingested = 0
@@ -1154,7 +1194,8 @@ class PlaybookRunner:
     last_udm_sync_validation: Optional[Dict[str, Any]] = None
 
     async def _flush_pending_udm_events() -> None:
-      nonlocal accumulated_ingested, accumulated_batches, ingestion_error
+      nonlocal accumulated_ingested, accumulated_batches, ingestion_error, flushed_upstream_udm
+      flushed_upstream_udm = upstream_udm_generated
       if not ingest_events or not udm_events_to_ingest:
         return
       pending = list(udm_events_to_ingest)
@@ -1181,13 +1222,14 @@ class PlaybookRunner:
       matched_entities: List[Dict[str, Any]] = []
       emitted_for_query = 0
       suppressed_for_query = 0
+      is_final_capstone = spec.is_capstone and not self._is_stage_b_loopback_query(spec)
 
       for row in rows:
         entity_id, entity_type = self.extract_row_entity(row, spec.entity_type_hint)
         effective_z, score_field = self.extract_row_effective_z(row)
         if entity_id and entity_id != "unknown_entity":
           current_candidates.append(entity_id)
-          if not spec.is_capstone:
+          if not is_final_capstone:
             entity_query_hits.setdefault(entity_id, []).append({
                 "query_id": spec.query_id,
                 "section": spec.section,
@@ -1200,7 +1242,7 @@ class PlaybookRunner:
         total_matches += 1
         # When a playbook has a downstream `run_id`-scoped Capstone query, never suppress
         # upstream events via intra-day deduplication so the current `run_id` batch is complete.
-        bypass_intraday_dedup = has_capstone and scope_capstone_to_run_id and not spec.is_capstone
+        bypass_intraday_dedup = has_capstone and scope_capstone_to_run_id and not is_final_capstone
         if should_emit_fn is not None and not bypass_intraday_dedup:
           if not should_emit_fn(bucket_date, pb_id, spec.query_id, entity_id, effective_z):
             total_suppressed += 1
@@ -1219,7 +1261,7 @@ class PlaybookRunner:
         )
         udm_events_to_ingest.append(udm_event)
         total_udm_generated += 1
-        if not spec.is_capstone:
+        if not is_final_capstone:
           upstream_udm_generated += 1
         cri_score = udm_event["security_result"][0]["risk_score"]
         total_emitted += 1
@@ -1353,24 +1395,43 @@ class PlaybookRunner:
           max(datetime.now(timezone.utc), stamp_dt) + timedelta(minutes=2)
       ).strftime("%Y-%m-%dT%H:%M:%SZ")
       if spec.is_capstone:
-        if udm_events_to_ingest:
-          await _flush_pending_udm_events()
+        is_stage_b_loopback = self._is_stage_b_loopback_query(spec)
+        if is_stage_b_loopback and not wave2_flushed:
+          wave2_flushed = True
+          if udm_events_to_ingest:
+            await _flush_pending_udm_events()
+          else:
+            flushed_upstream_udm = upstream_udm_generated
+        elif not is_stage_b_loopback and not wave3_flushed:
+          wave3_flushed = True
+          if udm_events_to_ingest:
+            await _flush_pending_udm_events()
+          else:
+            flushed_upstream_udm = upstream_udm_generated
+
+        expected_for_wave = flushed_upstream_udm
         if validate_udm_before_capstone:
           if not ingest_events:
             capstone_sync_validation = {
                 "status": "INGESTION_DISABLED",
                 "run_id": eff_run_id,
-                "expected_events": upstream_udm_generated,
+                "expected_events": expected_for_wave,
                 "indexed_events": 0,
                 "verified": False,
                 "attempts": 0,
                 "elapsed_sec": 0.0,
             }
+          elif (
+              last_udm_sync_validation is not None
+              and last_udm_sync_validation.get("verified") is True
+              and last_udm_sync_validation.get("expected_events") == expected_for_wave
+          ):
+            capstone_sync_validation = dict(last_udm_sync_validation)
           else:
             capstone_sync_validation = await self.verify_udm_run_indexed(
                 session=session,
                 run_id=eff_run_id,
-                expected_events=upstream_udm_generated,
+                expected_events=expected_for_wave,
                 start_iso=start_iso,
                 end_iso=capstone_end_iso,
                 max_attempts=eff_val_max_attempts,
@@ -1380,7 +1441,7 @@ class PlaybookRunner:
           last_udm_sync_validation = capstone_sync_validation
 
           if require_complete_udm_sync:
-            if scope_capstone_to_run_id and upstream_udm_generated <= 0:
+            if scope_capstone_to_run_id and expected_for_wave <= 0:
               queries_skipped += 1
               query_reports.append({
                   "query_id": spec.query_id,
@@ -1500,6 +1561,7 @@ class PlaybookRunner:
         )
 
     await _flush_pending_udm_events()
+    query_reports.sort(key=lambda r: spec_order_map.get(r.get("query_id", ""), 9999))
 
     if not ingest_events:
       ingestion_result: Dict[str, Any] = {
