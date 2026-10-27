@@ -27,9 +27,24 @@ class StatsHunterEngine:
   """Executes ad-hoc raw UDM multi-stage statistical pipelines."""
 
   SKILL_NAME = "secops-statistical-hunter"
+  # Strict Telemetry Physics Guardrail: raw UDM statistical hunts are bounded to <= 14 days
+  # (30-day baselines over high-volume telemetry belong strictly to secops-risk-metrics-multistage).
+  MAX_RAW_LOOKBACK_DAYS = 14
 
   def __init__(self, tenant_config: Optional[TenantConfig] = None):
     self.runner = PipelineRunner(tenant_config)
+
+  @classmethod
+  def enforce_telemetry_physics_window(cls, lookback_days: int) -> int:
+    """Clamps raw UDM lookback windows to MAX_RAW_LOOKBACK_DAYS (14d) per the Telemetry Physics Guardrail."""
+    days = max(1, int(lookback_days or 7))
+    if days > cls.MAX_RAW_LOOKBACK_DAYS:
+      logger.info(
+          f"Telemetry Physics Guardrail: clamping raw UDM lookback_days={days} to {cls.MAX_RAW_LOOKBACK_DAYS}d "
+          "(30d baselines belong strictly to secops-risk-metrics-multistage)."
+      )
+      return cls.MAX_RAW_LOOKBACK_DAYS
+    return days
 
   def _get_stats_hunter_builder(self) -> Any:
     """Imports multistage_query_builder from secops-statistical-hunter without namespace collision."""
@@ -49,10 +64,11 @@ class StatsHunterEngine:
 
   def _iso_window(self, lookback_days: int, is_entity_graph: bool = False) -> Tuple[str, str]:
     """Generates strict ISO 8601 UTC start and end timestamps (shifts end_dt back 48h for D-2 Entity Graph queries)."""
+    bounded_days = self.enforce_telemetry_physics_window(lookback_days)
     end_dt = datetime.now(timezone.utc)
     if is_entity_graph:
       end_dt = end_dt - timedelta(hours=48)
-    start_dt = end_dt - timedelta(days=lookback_days)
+    start_dt = end_dt - timedelta(days=bounded_days)
     return (
         start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
         end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -586,7 +602,8 @@ class StatsHunterEngine:
         for k in ("DERIVED_CONTEXT", "GLOBAL_THREAT_INTEL", "GLOBAL_CONTEXT", "WHOIS", "ASSET_AGE", "FILE_PREVALENCE", "DOMAIN_PREVALENCE")
     )
     ent_lower = "user" if entity_type.upper() == "USER" else ("ip" if entity_type.upper() == "IP" else "host")
-    window_hours = float(max(1, lookback_days) * 24)
+    bounded_days = self.enforce_telemetry_physics_window(lookback_days)
+    window_hours = float(bounded_days * 24)
     rendered = router.build_query(
         archetype=arch_up,
         tier=tier,
@@ -596,7 +613,7 @@ class StatsHunterEngine:
     )
     if "DERIVED_CONTEXT" in rendered or "GLOBAL_CONTEXT" in rendered:
       is_ecg = True
-    start_iso, end_iso = self._iso_window(lookback_days, is_entity_graph=is_ecg)
+    start_iso, end_iso = self._iso_window(bounded_days, is_entity_graph=is_ecg)
     rendered = self.runner.scope_query_to_entity(rendered, entity, entity_type=entity_type)
     resp = await self.runner.execute_query_via_mcp(session, rendered, start_iso, end_iso)
     rows = self.runner.parse_stats_response(resp)

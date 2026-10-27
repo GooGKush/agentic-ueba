@@ -337,13 +337,23 @@ class AutonomousHunterEngine:
 
   def resolve_skill_selection(self, req: JITHuntRequest) -> str:
     """Selects canonical skill dynamically based on alert physics if 'auto'."""
+    if req.skill in ("bilateral", "both", "bilateral-ueba"):
+      return "bilateral"
     if req.skill in ("risk-metrics", "secops-risk-metrics-multistage"):
       return "secops-risk-metrics-multistage"
     if req.skill in ("stats-hunter", "secops-statistical-hunter"):
       return "secops-statistical-hunter"
 
-    # Contextual heuristic based on alert name and description
-    context_str = f"{req.alert_name or ''} {req.alert_description or ''}".lower()
+    # Contextual heuristic based on alert name, description, and query directive
+    context_str = f"{req.alert_name or ''} {req.alert_description or ''} {req.query or ''}".lower()
+
+    # Open-ended exploit / CTI / Shadow AI / Bilateral UEBA indicators
+    bilateral_indicators = [
+        "http2shell", "web-to-shell", "web to shell", "webshell", "exploit chain",
+        "bilateral", "shadow ai", "agentic ai",
+    ]
+    if any(k in context_str for k in bilateral_indicators):
+      return "bilateral"
     
     # Raw process/command/beaconing indicators route to statistical hunter
     stats_indicators = [
@@ -1146,12 +1156,19 @@ class AutonomousHunterEngine:
     )
 
     skill_name = self.resolve_skill_selection(req)
-    persona = self.adapter.build_jit_persona(
-        skill_name=skill_name,
-        project_id=tenant.project_id,
-        customer_id=tenant.customer_id,
-        region=tenant.region,
-    )
+    if skill_name == "bilateral":
+      persona = self.adapter.build_bilateral_jit_persona(
+          project_id=tenant.project_id,
+          customer_id=tenant.customer_id,
+          region=tenant.region,
+      )
+    else:
+      persona = self.adapter.build_jit_persona(
+          skill_name=skill_name,
+          project_id=tenant.project_id,
+          customer_id=tenant.customer_id,
+          region=tenant.region,
+      )
 
     headers = tenant.get_auth_headers()
     custom_timeout = httpx.Timeout(30.0, read=120.0, write=120.0, pool=120.0)

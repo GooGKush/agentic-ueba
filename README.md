@@ -1,8 +1,8 @@
 # 🛡️ Agentic UEBA: Autonomous SecOps Threat Hunter & 360° Behavioral Risk Radar
 
-[![Version](https://img.shields.io/badge/version-v2.3.0-blue.svg)](README.md) [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE) [![Unit Tests](https://img.shields.io/badge/unit%20tests-85%2F85%20passing%20(100%25)-brightgreen.svg)](tests/)
+[![Version](https://img.shields.io/badge/version-v2.3.0-blue.svg)](README.md) [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE) [![Unit Tests](https://img.shields.io/badge/unit%20tests-91%2F91%20passing%20(100%25)-brightgreen.svg)](tests/)
 
-**Agentic UEBA** (`secops-agentic-hunter`) is an autonomous, dual-interface threat hunting and behavioral risk service for **Google Security Operations (Chronicle SIEM & SOAR)**. It embeds the canonical **`secops-risk-metrics-multistage`** (`v2.1.0+`) and **`secops-statistical-hunter`** (`v2.8.0+`) skills to provide continuous tenant-wide behavioral baselining, automated SOAR case triage with 6-pillar HTML/SVG Case Wall reporting, and Just-In-Time (JIT) playbook and MCP execution.
+**Agentic UEBA** (`secops-agentic-hunter`) is an autonomous, dual-interface threat hunting and behavioral risk service for **Google Security Operations (Chronicle SIEM & SOAR)**. It embeds the canonical **`secops-risk-metrics-multistage`** (`v2.1.3+`) and **`secops-statistical-hunter`** (`v2.8.3+`) skills as a unified **Bilateral UEBA Harness** to provide continuous tenant-wide behavioral baselining, automated SOAR case triage with 6-pillar HTML/SVG Case Wall reporting, and Just-In-Time (JIT) playbook and MCP execution.
 
 ---
 
@@ -145,9 +145,15 @@ curl -X POST "https://<YOUR_SERVICE_URL>/api/v1/radar/fleet-sweep" \
 ```
 
 #### 3. Autonomous Markdown Hunting Playbooks (`/api/v1/playbooks`)
-Point `agentic-ueba` at a public GitHub Markdown URL (e.g., `https://github.com/GooGKush/docs/blob/main/cloud-threats-ueba-hunting.md`) to automatically normalize the URL to `raw.githubusercontent.com`, extract all multi-stage YARA-L 2.0 `stage` queries, validate them against the Malachite AST validator, schedule periodic searches in parallel waves, and ingest matches as `PLAYBOOK_BEHAVIORAL_HUNT_MATCH` UDM events via `IngestionService.ImportEvents`:
+Point `agentic-ueba` at a public GitHub Markdown URL (e.g., `https://github.com/GooGKush/docs/blob/main/shadow-ai-agentic-ueba-hunting.md`) to automatically normalize the URL to `raw.githubusercontent.com`, extract all multi-stage YARA-L 2.0 `stage` queries, validate them against the Malachite AST validator, schedule periodic searches in parallel waves, and ingest matches as `PLAYBOOK_BEHAVIORAL_HUNT_MATCH` UDM events via `IngestionService.ImportEvents`:
 * **Intra-Playbook Wave Concurrency**: Independent upstream queries execute concurrently (`SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3`) before synchronizing at entity-seeded or Capstone barriers.
-* **UDM `run_id` Tagging & Read-After-Write Indexing Barrier**: Every playbook run generates a unique `run_id` (e.g., `run_cloud_threats_20261026T190000Z_a1b2c3d4`) stamped into `metadata.product_log_id`, `target.resource.attribute.labels["Run ID"]`, and `security_result[0].detection_fields["run_id"]`. Before executing any downstream **Capstone (`PLAYBOOK_BEHAVIORAL_HUNT_MATCH`)** convergence query, `PlaybookRunner` flushes upstream UDM events on the background `secops-ueba-io` worker thread pool and polls Chronicle UDM search (`verify_udm_run_indexed()`) until `indexed_events >= expected_events`, eliminating read-after-write indexing race conditions.
+* **Three Chaining Modes & UDM Indexing Latency**:
+  1. **Option 1 — In-DAG Piecewise Unification (0s wait)**: Joins a 30-day `metrics.*` stage and a raw UDM stage inside a single YARA-L 2.0 DAG.
+  2. **Option 2 — In-Memory Upstream Candidate Seeding (`/* UPSTREAM_CANDIDATE_IPS */` / `/* UPSTREAM_CANDIDATE_USERS */`, 0s wait)**: Passes candidate entities extracted from Query $N$ in memory directly into Query $N+1$ without waiting for Chronicle UDM indexing.
+  3. **Option 3 — Native UDM Loopback & Read-After-Write Indexing Barrier (`PLAYBOOK_BEHAVIORAL_HUNT_MATCH`, 2–22.5m wait)**: Every playbook run generates a globally unique `run_id` (`run_<playbook_id>_<YYYYMMDDTHHMMSSZ>_<uuid8>`) stamped into `metadata.product_log_id`, `metadata.ingestion_labels`, `target.resource.attribute.labels["Run ID"]`, and `security_result[0].detection_fields["run_id"]`, alongside `security_result[0].rule_name = "<playbook_id>:<query_id>"`. Before executing any downstream **Capstone (`PLAYBOOK_BEHAVIORAL_HUNT_MATCH`)** query:
+     - `PlaybookRunner` flushes all upstream UDM events in 500-event batches on the `secops-ueba-io` worker thread pool and clears the in-memory payload buffer.
+     - It then polls Chronicle UDM search (`verify_udm_run_indexed()`, default `45 attempts × 30s = 22.5 minutes`) scoped strictly to `metadata.product_log_id = "<run_id>"` and `re.regex(security_result.rule_name, "^<playbook_id>:")` until **`indexed_events >= expected_events`**.
+     - If only a subset of events has been indexed when the wait budget expires (e.g., `300` of `3,000` events), the downstream Capstone query is blocked (`SKIPPED_INCOMPLETE_UDM_SYNC`) so it never executes prematurely on partial data.
 
 ```bash
 # Register and start a periodic Markdown playbook (every 4 hours)
@@ -240,16 +246,18 @@ Connect any MCP client (Streamable HTTP) to `https://<YOUR_SERVICE_URL>/mcp`. Av
 ---
 
 ### Hybrid Async + Worker ThreadPool Concurrency Architecture
-To run up to 14 cyclical Markdown hunting playbooks (150+ multi-stage YARA-L 2.0 queries with Capstone UDM indexing barriers) concurrently alongside SOAR Case Wall triage and 360° fleet sweeps without blocking the event loop, `agentic-ueba` separates **async network wait states** from **blocking I/O & CPU work**:
+To run up to 14 cyclical Markdown hunting playbooks (150+ multi-stage YARA-L 2.0 queries with 2–22.5 minute Capstone UDM indexing barriers) concurrently alongside SOAR Case Wall triage and 360° fleet sweeps without blocking the event loop or starving worker slots, `agentic-ueba` separates **async network wait states** from **blocking I/O & CPU work**:
 
 1. **Global Chronicle `udm_search` Semaphore (`SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6`)**:
    Caps simultaneous in-flight Chronicle `udm_search` calls across all playbooks, UDM `run_id` indexing lag polls, 360° sector sweeps, and Case Wall workers so tenant QPS limits are never breached.
-2. **Parallel Playbook Execution (`SECOPS_PLAYBOOK_CONCURRENCY=3`) & Per-Playbook Locks**:
-   Up to 3 distinct Markdown playbooks execute concurrently. While Playbook A sleeps in `verify_udm_run_indexed()` waiting for Chronicle to index its upstream `PLAYBOOK_BEHAVIORAL_HUNT_MATCH` UDM events before firing its Capstone query, Playbooks B and C execute their upstream waves uninterrupted. Duplicate triggers of the *same* playbook ID immediately return `SKIPPED_CONCURRENT`.
+2. **Parallel Playbook Execution (`SECOPS_PLAYBOOK_CONCURRENCY=6`) & Per-Playbook Locks**:
+   Up to 6 distinct Markdown playbooks execute concurrently. Because Chronicle UDM indexing (`ImportEvents` $\rightarrow$ Normalization $\rightarrow$ Indexing $\rightarrow$ Enrichment $\rightarrow$ F1/Mindmeld Stats store) typically takes **2 to 20 minutes**, a playbook waiting at its Option 3 Capstone barrier (`verify_udm_run_indexed()`) spends >99% of that window asynchronously sleeping (`await asyncio.sleep(30)`) while holding **zero** `udm_search` semaphore slots. Setting `SECOPS_PLAYBOOK_CONCURRENCY=6` (or `8` for 12+ playbooks) ensures that 3–4 playbooks parked in a 15-minute UDM indexing wait never starve other playbooks from running their upstream waves. Duplicate triggers of the *same* `playbook_id` immediately return `SKIPPED_CONCURRENT`.
 3. **Intra-Playbook Wave Concurrency (`SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3`)**:
-   Within each playbook, independent upstream queries fan out concurrently in waves before synchronizing at entity-seeded queries (`needs_entity_seeding`) or pre-Capstone UDM flush + `run_id` indexing validation barriers (`is_capstone`).
-4. **Dedicated Blocking I/O & CPU Worker ThreadPool (`SECOPS_BLOCKING_IO_WORKERS=4`)**:
-   Offloads synchronous operations (`chronicle_ingest.import_events` over `urllib.request`, Google ADC OAuth token refreshes, Malachite YARA-L AST parsing/validation, and atomic `watchdog_state.json` disk writes) onto background `secops-ueba-io-*` OS threads via `loop.run_in_executor()`.
+   Within each playbook, independent upstream queries fan out concurrently in waves before synchronizing at entity-seeded queries (`is_seeded`) or pre-Capstone UDM flush + `run_id` indexing validation barriers (`is_capstone`).
+4. **Dedicated Blocking I/O & CPU Worker ThreadPool (`SECOPS_BLOCKING_IO_WORKERS=4` to `6`)**:
+   Offloads synchronous operations (`chronicle_ingest.import_events` 500-event batch uploads over `urllib.request`, Google ADC OAuth token refreshes, Malachite YARA-L AST parsing/validation, and atomic `watchdog_state.json` disk writes) onto background `secops-ueba-io-*` OS threads via `loop.run_in_executor()`.
+5. **Pre-Barrier Buffer Release (Memory Hygiene for 3,000–10,000 Row Hunts)**:
+   When an upstream wave produces thousands of outlier rows (e.g., 3,000 events $\approx$ 12–15 MiB of structured UDM JSON), `_flush_pending_udm_events()` ships the 500-event batches to Chronicle `ImportEvents` and immediately calls `udm_events_to_ingest.clear()` *before* entering the 22.5-minute `verify_udm_run_indexed()` polling loop—keeping resident RAM flat while playbooks wait for UDM indexing.
 
 ---
 
@@ -259,26 +267,26 @@ Choose the sizing profile that matches your active playbook and case triage volu
 
 | Workload Profile | Active Workloads | vCPU (`--cpu`) | Memory (`--memory`) | Recommended Concurrency Env Vars | Expected Peak Utilization |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Standard Tier**<br>*(Default)* | • Standing SOAR Case Triage (`3` workers)<br>• 4h Fleetwide 360° Sweep (`USER` + `ASSET`)<br>• **1–4** Markdown Hunting Playbooks | **`2 vCPU`** | **`2 GiB`** | `SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6`<br>`SECOPS_PLAYBOOK_CONCURRENCY=2`<br>`SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3`<br>`SECOPS_BLOCKING_IO_WORKERS=4`<br>`WATCHDOG_WORKER_CONCURRENCY=3` | • **CPU**: 0.4–1.3 vCPU (spikes during AST compile & UDM batch serialization)<br>• **RAM**: ~650 MiB–1.1 GiB<br>• **Chronicle Search**: $\le 6$ concurrent queries |
-| **Full Curated Suite Tier**<br>*(12–14 Playbooks)* | • Standing SOAR Case Triage (`3–4` workers)<br>• 4h Fleetwide 360° Sweep (`USER` + `ASSET`)<br>• **All 12–14** Curated Detections & Threat Hunting Playbooks (~153 multi-stage queries + Capstone UDM loopback barriers) | **`4 vCPU`** | **`4 GiB`** | `SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6`<br>`SECOPS_PLAYBOOK_CONCURRENCY=3`<br>`SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3`<br>`SECOPS_BLOCKING_IO_WORKERS=6`<br>`WATCHDOG_WORKER_CONCURRENCY=3` | • **CPU**: 1.2–2.8 vCPU during overlapping playbook waves & 360° sweeps<br>• **RAM**: ~1.2 GiB–2.2 GiB (columnar stats buffers + in-flight UDM batches)<br>• **Chronicle Search**: $\le 6$ concurrent queries |
+| **Standard Tier**<br>*(Default)* | • Standing SOAR Case Triage (`3` workers)<br>• 4h Fleetwide 360° Sweep (`USER` + `ASSET`)<br>• **1–4** Markdown Hunting Playbooks | **`2 vCPU`** | **`2 GiB`** | `SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6`<br>`SECOPS_PLAYBOOK_CONCURRENCY=4`<br>`SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3`<br>`SECOPS_BLOCKING_IO_WORKERS=4`<br>`SECOPS_UDM_VALIDATION_MAX_ATTEMPTS=45`<br>`SECOPS_UDM_VALIDATION_POLL_SEC=30` | • **CPU**: 0.4–1.3 vCPU (spikes during AST compile & 500-event UDM batch serialization)<br>• **RAM**: ~650 MiB–1.2 GiB<br>• **Chronicle Search**: $\le 6$ concurrent queries |
+| **Full Curated Suite / High-Volume Tier**<br>*(12–14 Playbooks / 3,000+ Row Batches)* | • Standing SOAR Case Triage (`3–4` workers)<br>• 4h Fleetwide 360° Sweep (`USER` + `ASSET`)<br>• **All 12–14** Curated Detections & Threat Hunting Playbooks (~160+ multi-stage queries + Option 3 Capstone UDM loopback barriers) | **`4 vCPU`** | **`4 GiB`** | `SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6`<br>`SECOPS_PLAYBOOK_CONCURRENCY=6`<br>`SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3`<br>`SECOPS_BLOCKING_IO_WORKERS=6`<br>`SECOPS_UDM_VALIDATION_MAX_ATTEMPTS=45`<br>`SECOPS_UDM_VALIDATION_POLL_SEC=30` | • **CPU**: 1.2–2.8 vCPU during overlapping playbook waves, 3,000-row UDM batch flushes, & 360° sweeps<br>• **RAM**: ~1.2 GiB–2.4 GiB (10,000-row columnar stats buffers + concurrent 500-event `ImportEvents` chunks)<br>• **Chronicle Search**: $\le 6$ concurrent queries |
 
-### Baseline Container Settings (All Tiers)
+### Baseline Container Settings & Timeout Guidance (All Tiers)
 | Resource / Setting | Recommended Value | Rationale |
 | :--- | :--- | :--- |
-| **Instances** | `min-instances=1`, `max-instances=1` | Strict singleton to preserve deduplication state and prevent duplicate Case Wall / UDM writes. |
-| **CPU Allocation** | `2 vCPU` (Standard) / `4 vCPU` (Full Suite) | Prevents thread-pool starvation between the main `asyncio` loop and `secops-ueba-io` worker threads. |
-| **CPU Throttling** | **Always-On** (`--no-cpu-throttling`) | Required so standing 60s case scans, 4h fleet 360° sweeps, and playbook UDM polling loops never freeze between HTTP requests. |
-| **Memory** | `2 GiB` (Standard) / `4 GiB` (Full Suite) | Headroom for concurrent 1,000-row columnar stats payloads, UDM batch builders, and SVG/HTML Case Wall rendering. |
-| **Uvicorn Workers** | `1` (Default in `Dockerfile`) | Single-process async event loop so all routes share the same `WatchdogDaemon` locks, semaphores, and `WatchdogState`. |
-| **Request Timeout** | `600s` (`--timeout=600`) | Accommodates on-demand synchronous playbook runs (`/api/v1/playbooks/run`) that include pre-Capstone UDM indexing lag retries (up to 60s barrier wait) as well as full 3-stage SOAR JIT investigations. |
-| **Staggered Playbook Schedules** | Offset `interval_seconds` (e.g., `14400`, `14700`, `15000`) | When registering all 12+ Curated Detection playbooks, staggering intervals by 3–5 minutes smooths CPU, memory, and Chronicle `udm_search` consumption across the 4-hour cycle. |
+| **Instances** | `min-instances=1`, `max-instances=1` | Strict singleton to preserve deduplication state, per-playbook locks, and prevent duplicate Case Wall / UDM writes. |
+| **CPU Allocation** | `2 vCPU` (Standard) / `4 vCPU` (Full Suite) | Prevents thread-pool starvation between the main `asyncio` loop and `secops-ueba-io` worker threads during multi-batch `ImportEvents` uploads. |
+| **CPU Throttling** | **Always-On** (`--no-cpu-throttling`) | **Mandatory**: Required so standing 60s case scans, 4h fleet 360° sweeps, and 2–22.5 minute background UDM indexing barrier polls never freeze between HTTP requests. |
+| **Memory** | `2 GiB` (Standard) / `4 GiB` (Full Suite) | Headroom for concurrent 3,000–10,000 row columnar stats payloads, 500-event UDM batch builders, and SVG/HTML Case Wall rendering without OOM kills. |
+| **Uvicorn Workers** | `1` (Default in `Dockerfile`) | **Must remain `1`**: Single-process async event loop so all HTTP/MCP routes and background loops share the same `WatchdogDaemon` locks, semaphores, and `WatchdogState`. Never pass `--workers > 1` to `uvicorn`. |
+| **HTTP Request Timeout** | **`3600s` (`--timeout=3600`)** | **Critical for Option 3 UDM Loopback Playbooks**: Chronicle UDM indexing typically takes **2–20 minutes** after `ImportEvents`. A 10-minute (`600s`) HTTP timeout will sever synchronous `POST /api/v1/playbooks/run` or MCP `run_markdown_playbook` calls mid-barrier. Set `--timeout=3600` (Cloud Run's 60-minute max) for synchronous runs, and prefer **scheduled background execution** (`POST /api/v1/playbooks` with `"run_immediately": false`), which runs inside `_playbook_loop` and is completely independent of HTTP request timeouts. |
+| **Staggered Playbook Schedules** | Offset `interval_seconds` (e.g., `14400`, `14700`, `15000`) | When registering 12+ playbooks, staggering intervals by 3–5 minutes prevents simultaneous 3,000-row `ImportEvents` bursts and spreads UDM indexing barrier polls evenly across the 4-hour cycle. |
 
 ### Example Cloud Run Deployment Command (Full Curated Playbook Suite)
 ```bash
 # 1. Stage canonical skills into .build/skills and build via Cloud Build
 gcloud builds submit --config cloudbuild.yaml .
 
-# 2. Deploy as an always-on singleton service sized for all 12+ playbooks + 360° + Case Wall triage
+# 2. Deploy as an always-on singleton service with 3600s timeout and 6 playbook slots
 gcloud run deploy secops-agentic-hunter \
   --image "gcr.io/${PROJECT_ID}/secops-agentic-hunter:latest" \
   --region us-central1 \
@@ -288,9 +296,9 @@ gcloud run deploy secops-agentic-hunter \
   --cpu=4 \
   --memory=4Gi \
   --no-cpu-throttling \
-  --timeout=600 \
+  --timeout=3600 \
   --concurrency=20 \
-  --set-env-vars="CHRONICLE_PROJECT_ID=gus-sdl,CHRONICLE_CUSTOMER_ID=8cbac5ae-8267-4da7-b405-cdbc6fa3f1d5,CHRONICLE_REGION=us,WATCHDOG_ENABLED=true,FLEET_360_ENABLED=true,SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6,SECOPS_PLAYBOOK_CONCURRENCY=3,SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3,SECOPS_BLOCKING_IO_WORKERS=6"
+  --set-env-vars="CHRONICLE_PROJECT_ID=gus-sdl,CHRONICLE_CUSTOMER_ID=8cbac5ae-8267-4da7-b405-cdbc6fa3f1d5,CHRONICLE_REGION=us,WATCHDOG_ENABLED=true,FLEET_360_ENABLED=true,SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6,SECOPS_PLAYBOOK_CONCURRENCY=6,SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3,SECOPS_BLOCKING_IO_WORKERS=6,SECOPS_UDM_VALIDATION_MAX_ATTEMPTS=45,SECOPS_UDM_VALIDATION_POLL_SEC=30"
 ```
 
 ---
@@ -306,9 +314,11 @@ gcloud run deploy secops-agentic-hunter \
 | `GEMINI_MODEL` | `gemini-3.1-pro-preview` | Primary Vertex AI Gemini model for ReAct synthesis. |
 | `GEMINI_FALLBACK_MODELS` | `gemini-3-flash-preview,gemini-2.5-pro,gemini-2.5-flash` | Ordered fallback models on quota/availability errors. |
 | `SECOPS_MAX_CONCURRENT_UDM_SEARCHES` | `6` | Global process-wide semaphore capping simultaneous Chronicle `udm_search` calls across all playbooks, UDM indexing validators, 360° sweeps, and case workers. |
-| `SECOPS_PLAYBOOK_CONCURRENCY` | `3` | Maximum number of distinct Markdown playbooks allowed to execute in parallel. |
+| `SECOPS_PLAYBOOK_CONCURRENCY` | `6` | Maximum number of distinct Markdown playbooks allowed to execute in parallel (sized so playbooks parked in 2–22.5m UDM indexing barriers do not starve other playbooks). |
 | `SECOPS_PLAYBOOK_QUERY_CONCURRENCY` | `3` | Intra-playbook wave concurrency for independent upstream queries prior to seeded or Capstone barriers. |
-| `SECOPS_BLOCKING_IO_WORKERS` | `4` | Worker threads in the `secops-ueba-io` `ThreadPoolExecutor` for offloading synchronous UDM `ImportEvents` ingestion, ADC token refreshes, AST validation, and state saves. |
+| `SECOPS_BLOCKING_IO_WORKERS` | `4` | Worker threads in the `secops-ueba-io` `ThreadPoolExecutor` for offloading synchronous UDM `ImportEvents` ingestion (`6` recommended for Full Suite Tier). |
+| `SECOPS_UDM_VALIDATION_MAX_ATTEMPTS` | `45` | Maximum polling attempts in `verify_udm_run_indexed()` before blocking a downstream Capstone query (`45 × 30s = 22.5 minutes`). |
+| `SECOPS_UDM_VALIDATION_POLL_SEC` | `30.0` | Seconds between UDM indexing validation probes (`verify_udm_run_indexed()`). |
 | `WATCHDOG_ENABLED` | `false` | Auto-starts the standing case scanner, playbook scheduler, and fleet 360° loop on startup when `true`. |
 | `WATCHDOG_INTERVAL_SECONDS` | `60` | Polling interval (seconds) for open Chronicle SOAR cases. |
 | `WATCHDOG_LIMIT_PER_SCAN` | `5` | Maximum unseen cases enqueued per scan pass. |
@@ -358,7 +368,7 @@ agentic_ueba/
 │   └── formatters/
 │       ├── __init__.py
 │       └── case_wall_card.py           # Chronicle SOAR Case Wall HTML/SVG card formatter & sanitizer
-└── tests/                              # Unit & contract test suite (85 tests)
+└── tests/                              # Unit & contract test suite (91 tests)
     ├── test_engines.py
     ├── test_metric_args.py
     ├── test_playbook_runner.py
@@ -371,7 +381,7 @@ agentic_ueba/
 ## 🧪 Local Development & Testing
 
 ```bash
-# Run the full 85-test unit and schema contract suite
+# Run the full 91-test unit and schema contract suite
 pytest tests/ -q
 
 # Start the server locally on port 8080

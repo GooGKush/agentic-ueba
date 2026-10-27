@@ -94,8 +94,30 @@ class PlaybookRunner:
       "product_event_type": "PLAYBOOK_BEHAVIORAL_HUNT_MATCH",
   }
 
-  # Example placeholder IPs used in documentation for chained follow-up queries
+  # Example placeholder IPs and user/SA entities used in documentation for Option 2 chained follow-up queries
   SEED_PLACEHOLDER_IPS = ("10.0.0.50", "192.168.1.100")
+  SEED_PLACEHOLDER_VALUES = (
+      "10.0.0.50",
+      "192.168.1.100",
+      "user@example.com",
+      "admin@example.com",
+      "sa-app@proj.iam.gserviceaccount.com",
+      "sa-worker@proj.iam.gserviceaccount.com",
+  )
+
+  # Strict Telemetry Physics Guardrail: raw UDM statistical hunts are bounded to <= 14 days
+  MAX_RAW_TELEMETRY_LOOKBACK_DAYS = 14
+  _METRICS_CALL_RE = re.compile(r"^[ \t]*(?!//).*?\bmetrics\.[a-zA-Z0-9_]+\s*\(", re.MULTILINE)
+
+  # Default UDM Loopback indexing wait budget (45 attempts * 30s = 22.5 minutes) to accommodate
+  # Chronicle SIEM UDM indexing latency (typically 2-20 minutes for ImportEvents).
+  DEFAULT_UDM_VALIDATION_MAX_ATTEMPTS = 45
+  DEFAULT_UDM_VALIDATION_POLL_SEC = 30.0
+
+  @classmethod
+  def _has_metrics_call(cls, query: str) -> bool:
+    """Returns True only if the query invokes a pre-computed `metrics.<fn>(...)` expression outside comments."""
+    return bool(cls._METRICS_CALL_RE.search(query))
 
   def __init__(
       self,
@@ -295,10 +317,10 @@ class PlaybookRunner:
       return "IP"
     return "ASSET"
 
-  @staticmethod
-  def _infer_lookback_days(query: str, goal: str, model: str) -> int:
+  @classmethod
+  def _infer_lookback_days(cls, query: str, goal: str, model: str) -> int:
     """Infers the optimal lookback window in days for a multi-stage query."""
-    if "metrics." in query:
+    if cls._has_metrics_call(query):
       # 30-day rolling metrics require a 35-day window to populate all 30 historical buckets
       return 35
 
@@ -313,21 +335,52 @@ class PlaybookRunner:
     return 1
 
   @classmethod
+  def resolve_effective_lookback_days(
+      cls, spec: PlaybookQuerySpec, lookback_days_override: Optional[int] = None
+  ) -> int:
+    """Resolves lookback days for a playbook query while enforcing the Telemetry Physics Guardrail.
+
+    Raw UDM statistical hunter queries (`RAW_TELEMETRY`) are clamped to <= 14 days even when a
+    wider `lookback_days_override` (e.g., 30d/35d) is passed, preventing 1M row scan cap timeouts.
+    """
+    lb = (
+        int(lookback_days_override)
+        if lookback_days_override is not None
+        else spec.default_lookback_days
+    )
+    lb = max(1, lb)
+    if spec.plane == "RAW_TELEMETRY" and lb > cls.MAX_RAW_TELEMETRY_LOOKBACK_DAYS:
+      logger.info(
+          f"Telemetry Physics Guardrail: clamping RAW_TELEMETRY query '{spec.query_id}' "
+          f"lookback from {lb}d to {cls.MAX_RAW_TELEMETRY_LOOKBACK_DAYS}d."
+      )
+      return cls.MAX_RAW_TELEMETRY_LOOKBACK_DAYS
+    return lb
+
+  @classmethod
   def _is_seeded_query(cls, query: str) -> bool:
-    """Returns True if the query contains documentation example seed IPs or a seed replacement marker."""
-    if any(ip in query for ip in cls.SEED_PLACEHOLDER_IPS):
+    """Returns True if the query contains Option 2 upstream candidate seed markers or placeholder entities."""
+    if any(val in query for val in cls.SEED_PLACEHOLDER_VALUES):
+      return True
+    if re.search(
+        r"/\*\s*UPSTREAM_CANDIDATE_(?:IPS|USERS|ENTITIES|HOSTS|SAS)\s*\*/",
+        query,
+        re.IGNORECASE,
+    ):
       return True
     if re.search(r"//\s*Replace with candidate", query, re.IGNORECASE):
       return True
     return False
 
-  @staticmethod
-  def _is_capstone_query(query: str, section: str = "", goal: str = "") -> bool:
+  @classmethod
+  def _is_capstone_query(cls, query: str, section: str = "", goal: str = "") -> bool:
     """Returns True if the query aggregates UDM loopback PLAYBOOK_BEHAVIORAL_HUNT_MATCH events."""
-    if "PLAYBOOK_BEHAVIORAL_HUNT_MATCH" in query:
+    if cls._has_metrics_call(query):
+      return False
+    if re.search(r'^[ \t]*(?!//).*?"PLAYBOOK_BEHAVIORAL_HUNT_MATCH"', query, re.MULTILINE):
       return True
     combined = f"{section} {goal}".lower()
-    return "capstone" in combined and "convergence" in combined
+    return "capstone" in combined and "convergence" in combined and "loopback" in combined
 
   def parse_markdown_playbook(self, markdown_text: str) -> List[PlaybookQuerySpec]:
     """Extracts and validates all multi-stage YARA-L 2.0 queries from a Markdown document."""
@@ -371,19 +424,20 @@ class PlaybookRunner:
       )
       goal = goal_match.group(1).strip() if goal_match else section
       is_capstone = self._is_capstone_query(query_text, section, goal)
+      has_metrics = self._has_metrics_call(query_text)
       model = (
           model_match.group(1).strip()
           if model_match
           else (
               "CAPSTONE_UDM_LOOPBACK_CONVERGENCE"
               if is_capstone
-              else ("MACRO_30D_METRICS" if "metrics." in query_text else "RAW_STATISTICAL_HUNTER")
+              else ("MACRO_30D_METRICS" if has_metrics else "RAW_STATISTICAL_HUNTER")
           )
       )
       plane = (
           "UDM_LOOPBACK_CONVERGENCE"
           if is_capstone
-          else ("MACRO_METRICS" if "metrics." in query_text else "RAW_TELEMETRY")
+          else ("MACRO_METRICS" if has_metrics else "RAW_TELEMETRY")
       )
       lookback_days = self._infer_lookback_days(query_text, goal, model)
       is_seeded = self._is_seeded_query(query_text)
@@ -420,7 +474,11 @@ class PlaybookRunner:
       candidate_entities: Sequence[str],
       unscope_to_fleet: bool = False,
   ) -> Optional[str]:
-    """Substitutes upstream candidate IPs/hosts into a seeded query or unscopes it to fleetwide.
+    """Substitutes upstream candidate IPs/users/hosts into a seeded query or unscopes it to fleetwide.
+
+    Supports Option 2 Upstream Candidate Seeding (`/* UPSTREAM_CANDIDATE_IPS */`,
+    `/* UPSTREAM_CANDIDATE_USERS */`, `/* UPSTREAM_CANDIDATE_ENTITIES */`) across IP, user,
+    and service-account placeholder expressions.
 
     Returns:
       Modified query string ready for execution, or None if the query should be skipped
@@ -432,26 +490,46 @@ class PlaybookRunner:
       if val and val not in clean_candidates and not any(ch in val for ch in ('"', "\\", "\n")):
         clean_candidates.append(val)
 
+    placeholder_alts = "|".join(re.escape(v) for v in cls.SEED_PLACEHOLDER_VALUES)
     seed_pattern = re.compile(
-        r"^[ \t]*\((?:[a-zA-Z0-9_$.]+\s*=\s*\"(?:10\.0\.0\.50|192\.168\.1\.100)\"(?:\s+or\s+)?)+[ \t]*\)[ \t]*\r?\n?",
+        r"(?:^[ \t]*/\*\s*UPSTREAM_CANDIDATE_[A-Z_]+\s*\*/[ \t]*\r?\n)?"
+        rf"^[ \t]*\((?:[a-zA-Z0-9_$.]+\s*=\s*\"(?:{placeholder_alts})\"(?:\s+or\s+)?)+[ \t]*\)[ \t]*\r?\n?",
+        re.MULTILINE,
+    )
+    marker_only_pattern = re.compile(
+        r"^[ \t]*/\*\s*UPSTREAM_CANDIDATE_([A-Z_]+)\s*\*/[ \t]*\r?\n?",
         re.MULTILINE,
     )
 
     if clean_candidates:
-      # Extract field name used in the placeholder expression (e.g. principal.asset.ip)
+      # Extract field name used in the placeholder expression (e.g. principal.asset.ip or principal.user.userid)
       field_match = re.search(
-          r"\(([a-zA-Z0-9_$.]+)\s*=\s*\"10\.0\.0\.50\"",
+          rf"\(([a-zA-Z0-9_$.]+)\s*=\s*\"(?:{placeholder_alts})\"",
           query_text,
       )
-      field_name = field_match.group(1) if field_match else "principal.asset.ip"
-      or_clauses = " or ".join(f'{field_name} = "{ip}"' for ip in clean_candidates[:25])
+      if field_match:
+        field_name = field_match.group(1)
+      else:
+        marker_match = marker_only_pattern.search(query_text)
+        marker_kind = marker_match.group(1).upper() if marker_match else "IPS"
+        if marker_kind in ("USERS", "SAS"):
+          field_name = "principal.user.userid"
+        elif marker_kind == "HOSTS":
+          field_name = "principal.hostname"
+        else:
+          field_name = "principal.asset.ip" if "metrics." in query_text else "principal.ip"
+
+      or_clauses = " or ".join(f'{field_name} = "{ent}"' for ent in clean_candidates[:25])
       replacement_line = f"    ({or_clauses})\n"
       if seed_pattern.search(query_text):
         return seed_pattern.sub(replacement_line, query_text, count=1)
+      if marker_only_pattern.search(query_text):
+        return marker_only_pattern.sub(replacement_line, query_text, count=1)
 
     if unscope_to_fleet:
-      # Remove placeholder filter line so the query evaluates across the entire fleet
-      return seed_pattern.sub("", query_text)
+      # Remove placeholder filter line and marker comment so the query evaluates across the entire fleet
+      unscoped = seed_pattern.sub("", query_text)
+      return marker_only_pattern.sub("", unscoped)
 
     return None
 
@@ -469,41 +547,63 @@ class PlaybookRunner:
       cls,
       query_text: str,
       run_id: str,
-      scope_to_run_id: bool = False,
+      scope_to_run_id: bool = True,
+      playbook_id: Optional[str] = None,
   ) -> str:
-    """Aligns a Capstone UDM Loopback query with the current execution's `run_id`.
+    """Aligns a Capstone UDM Loopback query with the current execution's `run_id` and `playbook_id`.
 
     - Always substitutes explicit `{{RUN_ID}}` or `RUN_ID_PLACEHOLDER` tokens if present.
-    - When `scope_to_run_id=True`, injects `metadata.product_log_id = "<run_id>"` into
+    - When `playbook_id` is provided, injects `re.regex(security_result.rule_name, `^<playbook_id>:`)`
+      into Stage 1 so concurrent or historical runs of other playbooks never pollute this stream.
+    - When `scope_to_run_id=True` (default), injects `metadata.product_log_id = "<run_id>"` into
       Stage 1 so the Capstone query strictly evaluates UDM loopback events emitted during
       the current playbook run.
     """
     safe_run_id = re.sub(r'["\\\n\r]', "", str(run_id).strip())
+    safe_pb_id = re.sub(r'["\\\n\r`]', "", str(playbook_id or "").strip())
     updated = query_text.replace("{{RUN_ID}}", safe_run_id).replace(
         "RUN_ID_PLACEHOLDER", safe_run_id
     )
-    if not scope_to_run_id or not safe_run_id:
-      return updated
-    if f'metadata.product_log_id = "{safe_run_id}"' in updated:
-      return updated
 
     target_line = 'metadata.product_event_type = "PLAYBOOK_BEHAVIORAL_HUNT_MATCH"'
-    if target_line in updated:
-      return updated.replace(
+    injections: List[str] = []
+    if (
+        scope_to_run_id
+        and safe_run_id
+        and f'metadata.product_log_id = "{safe_run_id}"' not in updated
+    ):
+      injections.append(f'    metadata.product_log_id = "{safe_run_id}"')
+
+    if safe_pb_id:
+      escaped_pb = re.escape(safe_pb_id)
+      pb_rule_filter = f"re.regex(security_result.rule_name, `^{escaped_pb}:`)"
+      if pb_rule_filter not in updated and f'"{safe_pb_id}:' not in updated:
+        injections.append(f"    {pb_rule_filter}")
+
+    if injections and target_line in updated:
+      joined_injections = "\n".join(injections)
+      updated = updated.replace(
           target_line,
-          f'{target_line}\n    metadata.product_log_id = "{safe_run_id}"',
+          f"{target_line}\n{joined_injections}",
           1,
       )
     return updated
 
   @classmethod
-  def build_udm_run_validation_query(cls, run_id: str) -> str:
+  def build_udm_run_validation_query(
+      cls, run_id: str, playbook_id: Optional[str] = None
+  ) -> str:
     """Builds a lightweight UDM query to validate how many events for `run_id` are indexed."""
     safe_run_id = re.sub(r'["\\\n\r]', "", str(run_id).strip())
+    safe_pb_id = re.sub(r'["\\\n\r`]', "", str(playbook_id or "").strip())
+    pb_line = ""
+    if safe_pb_id:
+      pb_line = f"re.regex(security_result.rule_name, `^{re.escape(safe_pb_id)}:`)\n"
     return (
         'metadata.event_type = "GENERIC_EVENT"\n'
         f'metadata.product_event_type = "{cls.PLAYBOOK_EVENT_METADATA["product_event_type"]}"\n'
         f'metadata.product_log_id = "{safe_run_id}"\n'
+        f"{pb_line}"
         "$run_id = metadata.product_log_id\n"
         "match:\n"
         "  $run_id\n"
@@ -518,15 +618,15 @@ class PlaybookRunner:
       expected_events: int,
       start_iso: str,
       end_iso: str,
-      max_attempts: int = 5,
-      poll_interval_sec: float = 2.0,
+      max_attempts: int = DEFAULT_UDM_VALIDATION_MAX_ATTEMPTS,
+      poll_interval_sec: float = DEFAULT_UDM_VALIDATION_POLL_SEC,
+      playbook_id: Optional[str] = None,
   ) -> Dict[str, Any]:
-    """Polls Chronicle UDM search to verify that `expected_events` for `run_id` are indexed.
+    """Polls Chronicle UDM search to verify that all `expected_events` for `run_id` are indexed.
 
-    Because Chronicle ImportEvents is asynchronous, there can be a brief indexing lag between
-    ingestion returning HTTP 200 and the events becoming visible to downstream UDM queries.
-    This barrier validates that the expected number of upstream UDM loopback records from
-    the current `run_id` have landed before a dependent Capstone query runs.
+    Because Chronicle ImportEvents is asynchronous (typically taking 2-20 minutes for UDM
+    indexing), this barrier polls until `indexed_events >= expected_events` so a downstream
+    Capstone query never starts prematurely on a partially indexed batch (e.g. 300 of 3,000 events).
     """
     if expected_events <= 0:
       return {
@@ -539,7 +639,7 @@ class PlaybookRunner:
           "elapsed_sec": 0.0,
       }
 
-    validation_query = self.build_udm_run_validation_query(run_id)
+    validation_query = self.build_udm_run_validation_query(run_id, playbook_id=playbook_id)
     attempts = 0
     indexed_events = 0
     last_error: Optional[str] = None
@@ -644,6 +744,7 @@ class PlaybookRunner:
         "unified_threat_score",
         "piecewise_threat_score",
         "capstone_threat_score",
+        "composite_threat_score",
         "z_score",
         "personal_z",
         "m_z_score",
@@ -655,7 +756,18 @@ class PlaybookRunner:
         "markov_threat_score",
         "zipf_rarity_score",
         "cusum_drift_score",
+        "cusum_drift",
         "shannon_entropy_score",
+        "ewma_velocity_score",
+        "velocity_score",
+        "pcr_z_score",
+        "macd_momentum_score",
+        "circadian_threat_score",
+        "hourly_z",
+        "shielded_z",
+        "sensitivity_excess",
+        "upper_tail_z",
+        "diversity_ratio",
         "anomaly_score",
         "delta_z",
         "recon_score",
@@ -677,6 +789,7 @@ class PlaybookRunner:
     squared_z_fields = (
         "capstone_threat_norm_sq",
         "composite_threat_norm_sq",
+        "threat_vector_norm_sq",
         "d_vs_fleet_sq",
         "poisson_z_sq",
     )
@@ -787,6 +900,11 @@ class PlaybookRunner:
             "event_type": self.PLAYBOOK_EVENT_METADATA["event_type"],
             "product_event_type": self.PLAYBOOK_EVENT_METADATA["product_event_type"],
             "description": summary_text,
+            "ingestion_labels": [
+                {"key": "run_id", "value": eff_run_id},
+                {"key": "playbook_id", "value": playbook_id},
+                {"key": "query_id", "value": spec.query_id},
+            ],
         },
         "observer": {
             "hostname": "secops-agentic-playbook-hunter",
@@ -962,10 +1080,11 @@ class PlaybookRunner:
       run_id: Optional[str] = None,
       ingest_events: bool = True,
       unscope_seeded_to_fleet: bool = False,
-      scope_capstone_to_run_id: bool = False,
+      scope_capstone_to_run_id: bool = True,
       validate_udm_before_capstone: bool = True,
-      udm_validation_max_attempts: int = 5,
-      udm_validation_poll_sec: float = 2.0,
+      require_complete_udm_sync: bool = True,
+      udm_validation_max_attempts: Optional[int] = None,
+      udm_validation_poll_sec: Optional[float] = None,
       query_concurrency: Optional[int] = None,
       inter_query_delay_sec: float = 1.0,
       lookback_days_override: Optional[int] = None,
@@ -981,6 +1100,28 @@ class PlaybookRunner:
 
     pb_id = playbook_id or self.derive_playbook_id(source)
     eff_run_id = run_id or self.generate_run_id(pb_id, stamp_dt)
+    eff_val_max_attempts = (
+        int(udm_validation_max_attempts)
+        if udm_validation_max_attempts is not None
+        else int(
+            getattr(
+                self.tenant,
+                "udm_validation_max_attempts",
+                self.DEFAULT_UDM_VALIDATION_MAX_ATTEMPTS,
+            )
+        )
+    )
+    eff_val_poll_sec = (
+        float(udm_validation_poll_sec)
+        if udm_validation_poll_sec is not None
+        else float(
+            getattr(
+                self.tenant,
+                "udm_validation_poll_sec",
+                self.DEFAULT_UDM_VALIDATION_POLL_SEC,
+            )
+        )
+    )
     eff_query_concurrency = max(
         1,
         int(
@@ -993,6 +1134,7 @@ class PlaybookRunner:
         source, http_client=http_client
     )
     specs = await self.runner.run_in_io_thread(self.parse_markdown_playbook, md_text)
+    has_capstone = any(s.is_capstone for s in specs)
 
     query_reports: List[Dict[str, Any]] = []
     udm_events_to_ingest: List[Dict[str, Any]] = []
@@ -1056,7 +1198,10 @@ class PlaybookRunner:
             })
 
         total_matches += 1
-        if should_emit_fn is not None:
+        # When a playbook has a downstream `run_id`-scoped Capstone query, never suppress
+        # upstream events via intra-day deduplication so the current `run_id` batch is complete.
+        bypass_intraday_dedup = has_capstone and scope_capstone_to_run_id and not spec.is_capstone
+        if should_emit_fn is not None and not bypass_intraday_dedup:
           if not should_emit_fn(bucket_date, pb_id, spec.query_id, entity_id, effective_z):
             total_suppressed += 1
             suppressed_for_query += 1
@@ -1138,11 +1283,7 @@ class PlaybookRunner:
           async def _run_wave_item(
               w_idx: int, w_spec: PlaybookQuerySpec
           ) -> Tuple[PlaybookQuerySpec, int, Optional[List[Dict[str, Any]]], Optional[str]]:
-            lb = (
-                int(lookback_days_override)
-                if lookback_days_override is not None
-                else w_spec.default_lookback_days
-            )
+            lb = self.resolve_effective_lookback_days(w_spec, lookback_days_override)
             s_iso = (stamp_dt - timedelta(days=max(1, lb))).strftime("%Y-%m-%dT%H:%M:%SZ")
             async with query_sem:
               if w_idx > 0 and inter_query_delay_sec > 0:
@@ -1200,11 +1341,7 @@ class PlaybookRunner:
         previous_candidates = []
         continue
 
-      lb_days = (
-          int(lookback_days_override)
-          if lookback_days_override is not None
-          else spec.default_lookback_days
-      )
+      lb_days = self.resolve_effective_lookback_days(spec, lookback_days_override)
       start_dt = stamp_dt - timedelta(days=max(1, lb_days))
       start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -1212,6 +1349,9 @@ class PlaybookRunner:
       # flush all upstream playbook match UDM events AND verify they are indexed in Chronicle UDM
       # before running the Capstone query.
       capstone_sync_validation: Optional[Dict[str, Any]] = None
+      capstone_end_iso = (
+          max(datetime.now(timezone.utc), stamp_dt) + timedelta(minutes=2)
+      ).strftime("%Y-%m-%dT%H:%M:%SZ")
       if spec.is_capstone:
         if udm_events_to_ingest:
           await _flush_pending_udm_events()
@@ -1232,11 +1372,48 @@ class PlaybookRunner:
                 run_id=eff_run_id,
                 expected_events=upstream_udm_generated,
                 start_iso=start_iso,
-                end_iso=run_timestamp_iso,
-                max_attempts=udm_validation_max_attempts,
-                poll_interval_sec=udm_validation_poll_sec,
+                end_iso=capstone_end_iso,
+                max_attempts=eff_val_max_attempts,
+                poll_interval_sec=eff_val_poll_sec,
+                playbook_id=pb_id,
             )
           last_udm_sync_validation = capstone_sync_validation
+
+          if require_complete_udm_sync:
+            if scope_capstone_to_run_id and upstream_udm_generated <= 0:
+              queries_skipped += 1
+              query_reports.append({
+                  "query_id": spec.query_id,
+                  "section": spec.section,
+                  "goal": spec.goal,
+                  "plane": spec.plane,
+                  "is_capstone": True,
+                  "status": "SKIPPED_NO_UPSTREAM_UDM_EVENTS",
+                  "matches_found": 0,
+                  "udm_sync_validation": capstone_sync_validation,
+              })
+              previous_candidates = []
+              continue
+            if not capstone_sync_validation.get("verified", False):
+              logger.warning(
+                  f"Playbook '{pb_id}' Capstone query '{spec.query_id}' blocked: UDM sync incomplete "
+                  f"(indexed={capstone_sync_validation.get('indexed_events')}/"
+                  f"expected={capstone_sync_validation.get('expected_events')}, "
+                  f"status={capstone_sync_validation.get('status')})."
+              )
+              queries_skipped += 1
+              query_reports.append({
+                  "query_id": spec.query_id,
+                  "section": spec.section,
+                  "goal": spec.goal,
+                  "plane": spec.plane,
+                  "is_capstone": True,
+                  "status": "SKIPPED_INCOMPLETE_UDM_SYNC",
+                  "matches_found": 0,
+                  "udm_sync_validation": capstone_sync_validation,
+              })
+              previous_candidates = []
+              continue
 
       query_to_run = spec.raw_query
       if spec.is_capstone:
@@ -1244,6 +1421,7 @@ class PlaybookRunner:
             query_to_run,
             run_id=eff_run_id,
             scope_to_run_id=scope_capstone_to_run_id,
+            playbook_id=pb_id,
         )
       if spec.is_seeded:
         prepared = self.prepare_seeded_query(
@@ -1267,13 +1445,14 @@ class PlaybookRunner:
       if queries_executed > 0 and inter_query_delay_sec > 0:
         await asyncio.sleep(inter_query_delay_sec)
 
+      effective_end_iso = capstone_end_iso if spec.is_capstone else run_timestamp_iso
       try:
         async with query_sem:
           raw_resp = await self.runner.execute_query_via_mcp(
               session=session,
               query=query_to_run,
               start_iso=start_iso,
-              end_iso=run_timestamp_iso,
+              end_iso=effective_end_iso,
           )
         queries_executed += 1
         rows = self.runner.parse_stats_response(raw_resp)

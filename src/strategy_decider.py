@@ -479,6 +479,12 @@ class StrategyDecider:
     elif any(kw in text_corpus for kw in fam_spec.get("keywords", set())):
       score += 0.22
       reasons.append(f"AlertSignal({primary_family})(+0.22)")
+    elif primary_family in ("Web", "Endpoint", "Egress") and re.search(
+        r"\b(http2shell|web[-\s]+to[-\s]+shell|webshell|rce|exploit\s+chain|bilateral\s+ueba|shadow\s+ai|agentic\s+ai)\b",
+        text_corpus,
+    ):
+      score += 0.30
+      reasons.append(f"BilateralHarnessSignal({primary_family})(+0.30)")
 
     # 3. Epistemic Pivot Signal (+0.15 when prior Tier 2A refuted H1 OR confirmed an outlier warranting 2nd-order progression)
     if is_pivot and (target_z >= 2.0 or len(outlier_sectors) >= 1 or variance_masked or dormant_awakening):
@@ -1497,15 +1503,22 @@ Choose the metric(s) that match the actual situation in the case and Tier 1 360�
    - `RARE_DESTINATION_ECG_3STAGE` / `FUSION_RARE_DESTINATION_3STAGE` (`directive_query`: `"dynamic_metric"`): Use when investigating DNS volume (`dns_queries_total`, `dns_queries_fail` keyed on `network.dns.questions.name`) or outbound bytes (`network_bytes_outbound`) to low-prevalence destinations (`DERIVED_CONTEXT`).
    - `HYBRID_METRIC_DERIVED_FILE_PREVALENCE_2STAGE` vs `HYBRID_METRIC_FLEET_PREVALENCE_2STAGE` (`directive_query`: `"dynamic_metric"`): Use `HYBRID_METRIC_DERIVED_FILE_PREVALENCE_2STAGE` (`file_executions_total`) to filter to rare binaries (dropping rollout binaries), or `HYBRID_METRIC_FLEET_PREVALENCE_2STAGE` to normalize a surge against an enterprise rollout (Patch Tuesday Shield).
 
-2. **Engine: `secops-statistical-hunter` (Raw Telemetry Micro-Math)**
+2. **Engine: `secops-statistical-hunter` (Bounded-Window Raw Telemetry Micro-Math)**
    - `C2_BEACONING_JITTER` (`directive_query`: `"c2_jitter"`): Use when Egress is an outlier or alert indicates periodic robotic callback (CV <= 0.20).
    - `POISSON_BURST_CLUSTERING` (`directive_query`: `"poisson_burst"`): Use when Auth failures pulse in high-dispersion waves (Fano > 4.0).
    - `ELEPHANT_FLOW_CONCENTRATION` (`directive_query`: `"elephant_flow"`): Use when mass data extraction or heavy Pareto/Gini concentration is suspected.
    - `PRIVILEGED_LATERAL_EXPANSION` (`directive_query`: `"lateral_expansion"`): Use when an account expands login breadth to unseen hosts.
-   - `MARKOV_TRANSITION_RARITY` (`directive_query`: `"markov_transition"`): Use for suspicious parent-child process execution lineage (LotL).
+   - `MARKOV_TRANSITION_RARITY` (`directive_query`: `"markov_transition"`): Use for suspicious parent-child process execution lineage (LotL, web-to-shell `http2shell`).
    - `SHANNON_CHARACTER_ENTROPY` (`directive_query`: `"shannon_entropy"`): Use for Base64/obfuscated command lines or DGA queries.
    - `ZIPFIAN_PROCESS_RARITY` (`directive_query`: `"zipfian_rarity"`): Use for rare long-tail binary execution on endpoints.
    - `EWMA_BURST_VELOCITY` (`directive_query`: `"ewma_burst"`): Use for intraday kinetic rate bursts.
+   - `IMPOSSIBLE_TRAVEL_GEO_VELOCITY` (`directive_query`: `"impossible_travel"`): Use for geographic velocity (>800 km/h) across authentication events.
+   - `PRODUCER_CONSUMER_RATIO_INVERSION` (`directive_query`: `"producer_consumer_inversion"`): Use when a client workstation / endpoint inverts its normal consumer byte ratio into a net data producer.
+
+### BILATERAL UEBA HARNESS & TELEMETRY PHYSICS GUARDRAIL:
+- Never declare UEBA a poor fit for an exploit, vulnerability, CTI report, or detection gap (e.g., `http2shell`, web-to-shell, living-off-the-land, Shadow AI) because `metrics.*` is bucketed `by 1d`.
+- Pair 30-day Macro Plane (`secops-risk-metrics-multistage`, `by 1d` `metrics.*` baselines, multi-sector fusion, CUSUM drift, Entity Graph prevalence) with bounded-window Micro Plane (`secops-statistical-hunter`, `1h`–`24h` or `7d`–`14d` raw UDM structural models like `MARKOV_TRANSITION_RARITY`, `SHANNON_CHARACTER_ENTROPY`, `C2_BEACONING_JITTER`, `EWMA_BURST_VELOCITY`).
+- NEVER use `secops-statistical-hunter` for 30-day volumetric baselines over high-volume logs (VPC flow logs, DNS, HTTP, Auth, or Process counts).
 
 Provide:
 1. The primary hypothesis to execute (`hypothesis_h0`, `hypothesis_h1`, `evidentiary_defense` citing specific Tier 1 Z-scores and UDM touchpoints, and `confidence_score` between 0.0 and 1.0).
@@ -2581,6 +2594,107 @@ Output valid JSON matching this schema:
           flight_card_title=f"Elephant Flow Concentration: `{target_entity}`",
       )
       return cls._finalize_directive_with_confidence(directive, ctx, [], executed_signatures, empty_families)
+
+    # 11b. Producer-Consumer Byte Ratio Inversion (Workstation / Endpoint Role Inversion)
+    if re.search(r"\b(producer[-\s]+consumer|role\s+inversion|pcr_z_score|producer_ratio|net\s+producer)\b", text_corpus):
+      defense = (
+          f"Case telemetry on `{target_entity}` indicates a client/endpoint role inversion (`PRODUCER_CONSUMER_RATIO_INVERSION`), "
+          "where a historically net-consumer asset shifts to a net outbound byte producer."
+      )
+      cands = [
+          CandidateHypothesis(
+              hypothesis_title="30-Day Macro Outbound vs Inbound Byte Fusion (`network_bytes_outbound` + `network_bytes_inbound`)",
+              selected_skill="secops-risk-metrics-multistage",
+              model_name="DUAL_SECTOR_FUSION_3STAGE",
+              directive_query="sector_fusion",
+              target_metric="network_bytes_outbound",
+              fusion_metrics=["network_bytes_outbound", "network_bytes_inbound"],
+              hypothesis_h0="Outbound and inbound byte volumes remain within the asset's 30-day macro baseline.",
+              hypothesis_h1="30-day macro `network_bytes_outbound` diverges sharply from `network_bytes_inbound`.",
+              evidentiary_defense="Pairs bounded-window PCR role inversion with 30-day `metrics.*` byte baselines per the Bilateral UEBA Harness.",
+              confidence_score=0.81,
+          ),
+      ]
+      directive = StrategyDirective(
+          selected_skill="secops-statistical-hunter",
+          model_name="PRODUCER_CONSUMER_RATIO_INVERSION",
+          directive_query="producer_consumer_inversion",
+          target_entity=target_entity,
+          entity_type=entity_type,
+          target_metric="network_bytes_outbound",
+          investigation_tier=tier,
+          threat_summary=f"Producer-Consumer byte ratio inversion detected on `{target_entity}`.",
+          hypothesis_h0="Endpoint maintains normal client consumer-to-producer byte symmetry.",
+          hypothesis_h1="Endpoint inverted its historical role into a net outbound data producer (staging/exfiltration server).",
+          selection_rationale=defense,
+          evidentiary_defense=defense,
+          flight_card_title=f"Producer-Consumer Ratio Inversion: `{target_entity}`",
+      )
+      return cls._finalize_directive_with_confidence(directive, ctx, cands, executed_signatures, empty_families)
+
+    # 11c. Bilateral UEBA Harness: Web-to-Shell Exploit / CTI / Shadow AI / Multi-Horizon Detection Gaps
+    if re.search(r"\b(http2shell|web[-\s]+to[-\s]+shell|webshell|rce|exploit\s+chain|bilateral\s+ueba|shadow\s+ai|agentic\s+ai)\b", text_corpus):
+      is_shadow_ai = bool(re.search(r"\b(shadow\s+ai|agentic\s+ai)\b", text_corpus))
+      macro_metric = "http_queries_total" if is_shadow_ai else "http_queries_fail"
+      fusion_pair = [macro_metric, "network_bytes_outbound"] if is_shadow_ai else ["http_queries_fail", "file_executions_total"]
+      defense = (
+          f"Bilateral UEBA Harness engaged for `{target_entity}`: pairs 30-day Macro Plane (`secops-risk-metrics-multistage` "
+          f"`DUAL_SECTOR_FUSION_3STAGE` across `{fusion_pair[0]}` + `{fusion_pair[1]}`) with bounded-window Micro Plane "
+          "(`secops-statistical-hunter` `MARKOV_TRANSITION_RARITY`, `SHANNON_CHARACTER_ENTROPY`, and `C2_BEACONING_JITTER`) "
+          "and `PlaybookRunner` loopback (`PLAYBOOK_BEHAVIORAL_HUNT_MATCH`)."
+      )
+      cands = [
+          CandidateHypothesis(
+              hypothesis_title="Micro Plane: Bounded-Window Markov 2-Gram Process Lineage (`MARKOV_TRANSITION_RARITY`)",
+              selected_skill="secops-statistical-hunter",
+              model_name="MARKOV_TRANSITION_RARITY",
+              directive_query="markov_transition",
+              target_metric="file_executions_total",
+              hypothesis_h0="Process parent-child spawns match standard daemon/worker lineage.",
+              hypothesis_h1="Web/application daemon or autonomous agent spawned rare shell/interpreter children (`MARKOV_2GRAM_TRANSITION_RARITY`).",
+              evidentiary_defense="Supplies bounded-window parent-to-child process lineage that daily `metrics.*` counters cannot measure.",
+              confidence_score=0.86,
+          ),
+          CandidateHypothesis(
+              hypothesis_title="Micro Plane: Bounded-Window CLI/URI Shannon Entropy (`SHANNON_CHARACTER_ENTROPY`)",
+              selected_skill="secops-statistical-hunter",
+              model_name="SHANNON_CHARACTER_ENTROPY",
+              directive_query="shannon_entropy",
+              target_metric="file_executions_total",
+              hypothesis_h0="Command-line and URI arguments conform to normal character distribution.",
+              hypothesis_h1="High character-class Shannon entropy indicating encoded exploit payloads or API token strings.",
+              evidentiary_defense="Evaluates bounded-window character entropy over `target.process.command_line` / `target.url`.",
+              confidence_score=0.83,
+          ),
+          CandidateHypothesis(
+              hypothesis_title="Micro Plane: Bounded-Window Outbound Callback Jitter (`C2_BEACONING_JITTER`)",
+              selected_skill="secops-statistical-hunter",
+              model_name="C2_BEACONING_JITTER",
+              directive_query="c2_jitter",
+              target_metric="network_bytes_outbound",
+              hypothesis_h0="Outbound connections follow irregular human-driven arrival intervals.",
+              hypothesis_h1="Sub-hour low-jitter periodic callback or autonomous agent polling loop ($CV \\le 0.20$).",
+              evidentiary_defense="Measures sub-hour inter-arrival timing regularity over a bounded window.",
+              confidence_score=0.80,
+          ),
+      ]
+      directive = StrategyDirective(
+          selected_skill="secops-risk-metrics-multistage",
+          model_name="DUAL_SECTOR_FUSION_3STAGE",
+          directive_query="sector_fusion",
+          target_entity=target_entity,
+          entity_type=entity_type,
+          target_metric=fusion_pair[0],
+          fusion_metrics=fusion_pair,
+          investigation_tier=tier,
+          threat_summary=f"Bilateral UEBA Harness investigation on `{target_entity}` combining 30d Macro Fusion (`{fusion_pair[0]}` + `{fusion_pair[1]}`) and Micro structural models.",
+          hypothesis_h0=f"30-day macro baselines across `{fusion_pair[0]}` and `{fusion_pair[1]}` and short-window process/network structures are nominal.",
+          hypothesis_h1=f"Multi-horizon exploit or autonomous agent signature spanning 30d macro `{fusion_pair[0]}` + `{fusion_pair[1]}` deformation and bounded-window micro anomalies.",
+          selection_rationale=defense,
+          evidentiary_defense=defense,
+          flight_card_title=f"Bilateral UEBA Harness ({fusion_pair[0]} × {fusion_pair[1]}): `{target_entity}`",
+      )
+      return cls._finalize_directive_with_confidence(directive, ctx, cands, executed_signatures, empty_families)
 
     # 12. User Entity / General Insider Threat / Baseline Drift
     if entity_type in ("USER", "USER_ID", "EMAIL") or re.search(r"\b(insider|lateral|exfiltration|data\s+hoarding|unusual\s+access|privilege\s+surge)\b", text_corpus):

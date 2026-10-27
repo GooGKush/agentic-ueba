@@ -131,3 +131,49 @@ def test_native_secops_zero_bigquery_backend_attribution():
   assert "native SecOps pre-computed roll-up pipelines" in cleaned
   assert "native SecOps backend" in cleaned
 
+
+def test_bilateral_ueba_harness_protocol_and_persona():
+  """Verify Bilateral UEBA Harness & Telemetry Physics Guardrail are loaded into JIT personas."""
+  skills_root = get_skills_root()
+  adapter = DynamicProtocolAdapter(skills_root)
+
+  risk_persona = adapter.build_jit_persona(
+      skill_name="secops-risk-metrics-multistage",
+      project_id="test-project",
+      customer_id="test-customer",
+      region="us",
+  )
+  assert "BILATERAL UEBA HARNESS & TELEMETRY PHYSICS GUARDRAIL" in risk_persona
+  assert "Never Declare UEBA a Poor Fit" in risk_persona
+  assert "consultative/mitre-attack-killchain.md" in risk_persona
+  assert "The Bilateral UEBA Harness & Telemetry Physics Guardrail" in risk_persona
+  assert "CTI & Threat Report Mapping" in risk_persona
+  assert "360° Entity Behavioral Risk Radar & Multi-Sector Threat Fusion" in risk_persona
+  raw_risk_md = (adapter.get_skill_path("secops-risk-metrics-multistage") / "SKILL.md").read_text()
+  assert "clearance question" not in adapter.adapt_skill_text(raw_risk_md)
+
+  stats_persona = adapter.build_jit_persona(
+      skill_name="secops-statistical-hunter",
+      project_id="test-project",
+      customer_id="test-customer",
+      region="us",
+  )
+  assert "BILATERAL UEBA HARNESS & TELEMETRY PHYSICS GUARDRAIL" in stats_persona
+  assert "The Bilateral UEBA Harness & Telemetry Physics Guardrail" in stats_persona
+  assert "Bilateral UEBA Harness Co-Execution" in stats_persona
+  assert "Template-First Formulation Directive" in stats_persona
+  assert "6 Mandatory Root Outcome Variables Protocol" in stats_persona
+  assert "Strict Visual Axis-Type Isolation" in stats_persona
+
+  bilateral_persona = adapter.build_bilateral_jit_persona(
+      project_id="test-project",
+      customer_id="test-customer",
+      region="us",
+  )
+  assert "HEMISPHERE 1: MACRO PLANE (secops-risk-metrics-multistage)" in bilateral_persona
+  assert "HEMISPHERE 2: MICRO PLANE (secops-statistical-hunter)" in bilateral_persona
+  assert "PLAYBOOK_BEHAVIORAL_HUNT_MATCH" in bilateral_persona
+  assert "CTI & Threat Report Mapping" in bilateral_persona
+  assert "Bilateral UEBA Harness Co-Execution" in bilateral_persona
+
+
