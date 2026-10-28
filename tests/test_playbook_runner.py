@@ -1145,6 +1145,7 @@ def test_all_curated_playbooks_three_wave_ast_and_outcome_compliance():
   runner = PlaybookRunner()
   curated_playbooks = [
       "shadow-ai-agentic-ueba-hunting.md",
+      "insider-risk-dlp-ueba-hunting.md",
       "chrome-enterprise-premium-ueba-hunting.md",
       "cloud-threats-ueba-hunting.md",
       "windows-threats-ueba-hunting.md",
