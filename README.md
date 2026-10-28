@@ -1,92 +1,233 @@
-# 🛡️ Agentic UEBA: Autonomous SecOps Threat Hunter & 360° Behavioral Risk Radar
+# 🛡️ Agentic UEBA: Autonomous SecOps Threat Hunter, 360° Behavioral Risk Radar & Multi-Wave Stage-Expansion Engine
 
-[![Version](https://img.shields.io/badge/version-v2.3.0-blue.svg)](README.md) [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE) [![Unit Tests](https://img.shields.io/badge/unit%20tests-91%2F91%20passing%20(100%25)-brightgreen.svg)](tests/)
+[![Version](https://img.shields.io/badge/version-v2.3.0-blue.svg)](README.md) [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE) [![Unit Tests](https://img.shields.io/badge/unit%20tests-94%2F94%20passing%20(100%25)-brightgreen.svg)](tests/)
 
-**Agentic UEBA** (`secops-agentic-hunter`) is an autonomous, dual-interface threat hunting and behavioral risk service for **Google Security Operations (Chronicle SIEM & SOAR)**. It embeds the canonical **`secops-risk-metrics-multistage`** (`v2.1.3+`) and **`secops-statistical-hunter`** (`v2.8.3+`) skills as a unified **Bilateral UEBA Harness** to provide continuous tenant-wide behavioral baselining, automated SOAR case triage with 6-pillar HTML/SVG Case Wall reporting, and Just-In-Time (JIT) playbook and MCP execution.
+**Agentic UEBA** (`secops-agentic-hunter`) is an autonomous, dual-interface threat hunting, behavioral baselining, and **multi-wave query orchestration service** for **Google Security Operations (Chronicle SIEM & SOAR)**.
+
+It embeds the canonical **`secops-risk-metrics-multistage`** (`v2.1.4+`) and **`secops-statistical-hunter`** (`v2.8.3+`) skills as a unified **Bilateral UEBA Harness**, acting as the stateful connective tissue across time:
+* **Macro + Micro Multi-Horizon Fusion**: Combines 30-day pre-computed `metrics.*` baselines (38 Malachite catalog metrics and 11 MITRE ATT&CK kill-chain archetypes) with bounded (`<= 14d`) raw-telemetry statistical and structural models (23 canonical raw UDM archetypes including Markov 2-gram process lineage, Shannon character entropy, C2 beaconing jitter, Poisson/Fano burst dispersion, Zipfian binary rarity, EWMA burst velocity, geodesic impossible travel, and producer-consumer byte inversion).
+* **Multi-Wave Search Stage Expansion (`Stage A -> UDM -> Stage B -> Capstone`)**: Overcomes Chronicle YARA-L 2.0's single-query compiler ceiling (`<= 2` raw UDM event stages and `<= 20` outcome variables per stage) by chaining searches across **in-memory entity seeding**, **SecOps Data Tables (`%ueba_hunt_bridge`)**, and **read-after-write verified UDM loopback barriers (`PLAYBOOK_BEHAVIORAL_HUNT_MATCH`)**—expanding complex threat runbooks into **4 to 6+ effective analytical stages** over time.
+* **Autonomous SOAR Triage & Dual Control Plane**: Continuously sweeps fleetwide `USER` and `ASSET` populations (`BEHAVIORAL_RISK_RADAR_360`), triages open SOAR cases with sanitized 6-pillar HTML/SVG Case Wall cards, and exposes **14 HTTP REST endpoints** alongside **22 Model Context Protocol (`/mcp`) tools**.
 
 ---
 
 ## 🚀 Core Capabilities & Operational Modes
 
-`agentic-ueba` operates across four integrated workflows:
+`agentic-ueba` operates across five integrated workflows backed by shared execution and integrity guardrails:
 
 ### 1. Standing Fleetwide 360° Behavioral Risk Radar & UDM Event Ingestor
 Every **4 hours** (`FLEET_360_INTERVAL_SECONDS=14400`), `WatchdogDaemon` executes a deterministic **Mode A** (today's UTC bucket vs. 30-day baseline) fleetwide sweep across the tenant's entire `USER` and `ASSET` populations via `RiskMetricsEngine.run_fleet_360_sweep()`:
-* **$O(1)$ Fleetwide Query Complexity**: Evaluates all entities in 6 decoupled multi-stage YARA-L 2.0 sector queries per entity type:
+* **`O(1)` Fleetwide Query Complexity**: Evaluates all entities in 6 decoupled multi-stage YARA-L 2.0 sector queries per entity type:
   * **`USER` Sectors (6)**: `Auth`, `Cloud` (4-family CRUD across read/write/create/delete), `Workspace`, `Egress`, `DNS`, and `Web`.
   * **`ASSET` Sectors (6)**: `Auth`, `Egress`, `DNS`, `Web`, `Flows`, and `Alerts`.
 * **Euclidean Threat Distance & Calibrated Risk Index (CRI)**: Computes multi-sector Euclidean distance $D = \sqrt{\sum \max(0, Z_i)^2}$ and Sigmoid-normalized $\text{CRI} \in [0, 100]$.
-* **Intra-Day Deduplication (`WatchdogState.should_emit_fleet_360`)**: Tracks emitted `(bucket_date, entity_type, entity_id)` tuples in `data/watchdog_state.json`. An outlier entity ($\ge 1$ sector with $Z \ge 3.0\sigma$) is emitted at most once per UTC day unless:
+* **Intra-Day Escalation Deduplication (`WatchdogState.should_emit_fleet_360`)**: Tracks emitted `(bucket_date, entity_type, entity_id)` tuples in `data/watchdog_state.json`. An outlier entity ($\ge 1$ sector with $Z \ge 3.0\sigma$) is emitted at most once per UTC day unless:
   1. A **new behavioral sector** breaches $\ge 3.0\sigma$ later in the day, or
   2. Its composite Euclidean distance $D$ **escalates by $\ge +2.0\sigma$**.
-* **Native Chronicle UDM Ingestion (`BEHAVIORAL_RISK_RADAR_360`)**: Builds one structured UDM event per outlier entity (`RiskMetricsEngine.build_360_outlier_udm_event()`) and ingests it directly into Chronicle via `IngestionService.ImportEvents` (`scripts.chronicle_ingest.import_events`):
+* **Native Chronicle UDM Ingestion (`BEHAVIORAL_RISK_RADAR_360`)**: Emits one structured UDM event per outlier entity (`RiskMetricsEngine.build_360_outlier_udm_event()`) into Chronicle via `IngestionService.ImportEvents`:
   * **Unbundled Roll-Up Labels (`target.resource.attribute.labels`)**: `Hunt Campaign ID`, `Evaluated Day`, `Composite CRI`, `Composite D`, `Peak Vector`, `Peak CRI`, `Peak Z`, and `Breached Vectors`.
   * **Composite Roll-Up (`security_result[0]`)**: `rule_type = "COMPOSITE_360"`, `risk_score = <Composite CRI>`, `severity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW"`.
-  * **Per-Vector Entries (`security_result[1..N]`)**: One `rule_type = "SECTOR_VECTOR"` entry per non-zero vector sorted descending by $Z$-score, with `threat_name = "<SECTOR>"`, native integer `risk_score = <Vector CRI>`, native float `confidence_score = <Vector Z>`, and `threat_status = "ACTIVE" | "CLEARED"`—enabling direct numeric YARA-L 2.0 rules and SIEM dashboards without regex or string parsing.
+  * **Per-Vector Entries (`security_result[1..N]`)**: One `rule_type = "SECTOR_VECTOR"` entry per non-zero vector sorted descending by $Z$-score, with `threat_name = "<SECTOR>"`, native integer `risk_score = <Vector CRI>`, native float `confidence_score = <Vector Z>`, and `threat_status = "ACTIVE" | "CLEARED"`—enabling direct numeric YARA-L 2.0 rules and SIEM dashboards without regex parsing.
 
 ---
 
-### 2. Autonomous SOAR Case Scanner, 3-Stage Investigation & Case Wall Triager
-Every **60 seconds** (`WATCHDOG_INTERVAL_SECONDS=60`), `WatchdogDaemon` polls open Chronicle SOAR cases (`list_cases`), filters out previously triaged cases via `WatchdogState`, extracts the primary entity (`USER`, `ASSET`, or `IP`) from raw alert connector telemetry (`get_connector_event`), and dispatches unseen cases to a bounded async worker pool (`WATCHDOG_WORKER_CONCURRENCY=3`):
+### 2. Multi-Wave Markdown Hunting Playbooks & `A -> UDM -> B -> Capstone` Stage Expansion (`PlaybookRunner`)
+Chronicle YARA-L 2.0 enforces a strict compiler cap of **at most 2 raw UDM event stages per query** (`SourceCount["udm"] <= 2`) and **at most 20 outcome variables per stage**. Sophisticated threat runbooks—such as Shadow AI & Agentic Tooling, Insider Risk + Chrome DLP, Web-to-Shell exploit chains (`php2shell`), and the 12 UEBA Curated Detection packs (15 playbooks / 215+ multi-stage queries in `GooGKush/docs`)—often require **4 to 6+ analytical stages** spanning 30-day baselines, sub-hour timing dispersion, DLP/process pivots, cross-scenario fusion, and raw forensic event decoration.
+
+`PlaybookRunner` parses Markdown runbooks directly from GitHub (`blob`/`raw` URLs, local `file://` paths, or batch discovery via `PlaybookRunner.discover_repo_markdown_urls()`), caches Markdown content using HTTP `ETag` (`If-None-Match` $\rightarrow$ `304 Not Modified`) and SHA-256 digests with offline fallback, AST-validates every `stage` query, and executes runbooks across **three complementary multi-query chaining modes**:
+* **Option 1 — In-DAG Piecewise Unification (`0s` indexing wait)**: Joins a cold-start (`1d–7d`) raw telemetry stage with a mature (`8d–30d`) pre-computed `metrics.*` stage inside a single YARA-L 2.0 DAG when raw UDM stage count remains $\le 2$.
+* **Option 2 — In-Memory Upstream Candidate Seeding (`0s` indexing wait)**: Extracts anomalous `IP`, `USER`, `HOST`, or `SA` entities from upstream Query $N$ in memory and injects up to 25 literal candidates directly into downstream `/* UPSTREAM_CANDIDATE_IPS */` (`USERS`, `HOSTS`, `SAS`, `ENTITIES`) filter slots—chaining queries immediately without waiting for UDM ingestion.
+* **Option 3 — 3-Wave Cyclical UDM Loopback (`Stage A -> UDM -> Stage B -> Capstone`, `2–22.5m` async barriers)**:
+  * **Wave 1 (`execution_wave = 1`, Upstream & `Stage A` Queries)**: Independent and Option 1/2 queries execute in parallel waves (`SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3`). Matched outliers are staged as `PLAYBOOK_BEHAVIORAL_HUNT_MATCH` UDM events stamped with a globally unique `run_id` (`metadata.product_log_id = "<run_id>"` and `security_result[0].rule_name = "<playbook_id>:<query_id>"`). *(When a `run_id`-scoped downstream loopback stage exists, intra-day deduplication is intentionally bypassed on upstream waves so every run's `run_id` batch is 100% complete.)*
+  * **Barrier #1 $\rightarrow$ Wave 2 (`execution_wave = 2`, `Stage A -> UDM -> Stage B` Expansion)**: Flushes Wave 1 events in 500-event chunks on `secops-ueba-io` worker threads, clears resident RAM buffers, and polls `verify_udm_run_indexed()` (`45 × 30s = 22.5m` budget) until `indexed_events >= wave1_expected`. Wave 2 `Stage B` queries (e.g., `Query 2B`, `4B`, `6B`) read `Stage A`'s indexed `PLAYBOOK_BEHAVIORAL_HUNT_MATCH` events in Stage 1 (consuming only 1 raw UDM stage) and join them against fresh raw UDM telemetry in Stage 2 (e.g., hourly connection gap $\text{CV}$, Fano burst factor, or Chrome `sensitiveDataEvent` clipboard pastes)—expanding a detection line to **4+ stages across two queries** (`2A` [2 stages] $\rightarrow$ UDM $\rightarrow$ `2B` [2 stages]).
+  * **Barrier #2 $\rightarrow$ Wave 3 (`execution_wave = 3`, Unified 3-Stage Capstone & Forensic Bridge)**: Flushes Wave 2 findings under the *same* `run_id`, verifies cumulative `wave1 + wave2` UDM indexing (reusing cached sync in `0s` if Wave 2 emitted 0 new events, or blocking with `SKIPPED_INCOMPLETE_UDM_SYNC` if partial), auto-injects `run_id` + `^<playbook_id>:` regex stream isolation (`prepare_capstone_query()`), computes multi-scenario Euclidean L2 convergence ($\sum Z_i^2 \ge 25.0$ across $\ge 2$ distinct scenarios), and bridges back to raw UDM telemetry for forensic context.
+  * **Programmatic Entity Convergence (`converge_playbook_entities`)**: Alongside YARA-L Capstone queries, `PlaybookRunner` computes deterministic cross-query convergence across all non-Capstone waves (`>= 2` distinct `query_id` hits on the same entity $\rightarrow$ $Z_{\text{combined}} = \sqrt{\sum Z_i^2}$ with `CRI >= 65`), emitting `rule_type = "PLAYBOOK_CAPSTONE_CONVERGENCE"` UDM events and restoring canonical document order (`q01..qN`) in the run report.
+
+---
+
+### 3. Autonomous SOAR Case Scanner, Bilateral UEBA Harness & Confidence-Gated 3-Stage Investigation
+Every **60 seconds** (`WATCHDOG_INTERVAL_SECONDS=60`), `WatchdogDaemon` polls open Chronicle SOAR cases (`list_cases`), filters seen cases via `WatchdogState`, extracts primary and companion entities (`USER`, `ASSET`, `IP`) from raw alert connector telemetry (`get_connector_event`), and dispatches unseen cases to a bounded async worker pool (`WATCHDOG_WORKER_CONCURRENCY=3`):
 * **Stage 1 — Tier 1 360° Behavioral Risk Radar**: Profiles the entity across all 6 behavioral sectors over a 14-day window (`run_360_behavioral_radar()`), extracting per-sector `$z`, `$obs`, `$avg`, and `$std`. Automatically resolves corporate email addresses (`*@*`, excluding GCP service accounts) to their canonical UDM `user.userid`.
-* **Stage 2 — Warrant & Insight Synthesis (`StrategyDecider.analyze_360_insights`)**: Synthesizes active spikes ($Z \ge 2.0$), sub-threshold sectors ($1.25 \le Z < 2.0$), variance-masked sectors ($1.25 \le Z < 3.0$ where $\sigma \ge \max(1.5\mu, 5.0)$), dormant baseline awakenings ($\text{obs} > 0, \mu < 1.0, Z \ge 1.5$), matched MITRE ATT&CK `KillChainArchetype` topologies, and cross-entity bridges (`USER` $\leftrightarrow$ `ASSET`/`IP`).
-* **Stage 3 — Tier 2A Primary Hunt & Tier 2B Bidirectional Epistemic Pivot**:
-  * **Tier 2A (Alert-Contextual Deep Dive)**: Executes the mathematical model best suited to the triggering alert and 360° radar topology (or runs a bounded Gemini ReAct loop for open-ended hypotheses).
-  * **Tier 2B (Agent-Guided Secondary UEBA Investigation)**: When warranted by the 360° radar insights or Tier 2A outcome (`ACUTE_OUTLIER`, `CLEAN_OR_SUBTHRESHOLD`, `SPARSE_BASELINE`, `FLEET_WAVE`), automatically pivots to a second-order investigation:
-    * *Confirmed Outliers (`ACUTE_OUTLIER`)* $\rightarrow$ Pivots to kill-chain progression (`KillChainArchetype` multi-stage fusion across 8 MITRE ATT&CK chains, Workspace 3-Stage Triad decomposition, Cloud Repository Scope & caller IP attribution, or Rare Destination Entity Context Graph enrichment).
-    * *Refuted / Masked Hypotheses (`CLEAN_OR_SUBTHRESHOLD` / `SPARSE_BASELINE`)* $\rightarrow$ Pivots across mathematical assumptions (4-Stage Non-Parametric `MAD` for heavy-tailed variance masking, `TWO_PART_HURDLE` for dormant baseline awakenings, Cloud `fail`-mode access-denied recon, `MACD_MOMENTUM_VELOCITY`, `CIRCADIAN_VON_MISES`, or Cross-Entity `USER` $\leftrightarrow$ `ASSET` bridges).
-* **Case Wall Injection (`CaseWallCardFormatter`)**: Renders a sanitized, SOAR-compatible HTML/SVG 6-pillar forensic triage card and posts it directly to the Chronicle SOAR Case Wall via `create_case_comment`.
+* **Stage 2 — Warrant, Insight & Confidence Scoring (`StrategyDecider`)**:
+  * Synthesizes active spikes ($Z \ge 2.0$), multi-spoke sub-threshold convergence ($1.25 \le Z < 2.0$, $D \ge 2.0$), variance-masked sectors ($1.25 \le Z < 3.0$ where $\sigma \ge \max(1.5\mu, 5.0)$), dormant baseline awakenings ($\text{obs} > 0, \mu < 1.0, Z \ge 1.5$), matched topologies across **11 MITRE ATT&CK `KillChainArchetype`s** and **38 Malachite catalog metrics**, and cross-entity bridges (`USER` $\leftrightarrow$ `ASSET`/`IP`).
+  * Scores competing `H0` vs. `H1` hypotheses on `[0.00, 1.00]` (`score_hypothesis_confidence`), enforcing `AUTO_EXECUTE` confidence gates (`0.75` for Tier 2A, `0.80` for Tier 2B pivots), zero-telemetry dampeners (`max 0.35` when a spoke has 0 observed events), and duplicate-signature vetoes.
+* **Stage 3 — Tier 2A Primary Hunt, Bilateral Sieve & Tier 2B Bidirectional Epistemic Pivot**:
+  * **Tier 2A (Alert-Contextual & Bilateral Hunt)**: Supports `"auto"`, `"risk-metrics"`, `"stats-hunter"`, and **`"bilateral"`** skill modes (`DynamicProtocolAdapter.build_bilateral_jit_persona()`), backed by deterministic template pipelines or a Vertex AI Gemini ReAct loop armed with 3 Python Hybrid Engine tools (`compile_ueba_pipeline`, `score_cri`, `format_triage_report`).
+  * **`FederatedBridge` Two-Phase Macro $\rightarrow$ Micro Sieve**: Automatically chains 30-day `metrics.*` / 360° macro anomalies (`CRI >= 46`) into bounded (`<= 14d`) `StatsHunterEngine` micro-telemetry drill-downs (Markov 2-gram process transitions for `http2shell`/web-to-shell, C2 jitter + rare process surges for Shadow AI/beaconing, Fano burst clustering for auth/cloud surges) and fuses joint L2 scores.
+  * **Tier 2B (Secondary Epistemic Pivot, up to `MAX_SECONDARY_HUNTS = 2`)**: Pivots automatically based on Tier 1 warrants and Tier 2A outcomes (`ACUTE_OUTLIER`, `CLEAN_OR_SUBTHRESHOLD`, `SPARSE_BASELINE`, `FLEET_WAVE`):
+    * *Confirmed Outliers (`ACUTE_OUTLIER`)* $\rightarrow$ Pivots to kill-chain progression across **11 MITRE ATT&CK `KillChainArchetype` pipelines**, Workspace 3-Stage Part-of-the-Whole Triad decomposition, Cloud Repository Scope & caller IP attribution, Failure Ratio / Alert Surges, **SecOps Data Table Bridging (`%ueba_hunt_bridge.<column>`)**, or Rare Destination Entity Context Graph enrichment.
+    * *Refuted / Masked Hypotheses (`CLEAN_OR_SUBTHRESHOLD` / `SPARSE_BASELINE`)* $\rightarrow$ Pivots across mathematical assumptions: 4-Stage Non-Parametric `MAD` for heavy-tailed variance masking, `TWO_PART_HURDLE` for dormant baseline awakenings, Cloud `fail`-mode access-denied recon, `MACD_MOMENTUM_VELOCITY`, `CIRCADIAN_VON_MISES`, or Cross-Entity `USER` $\leftrightarrow$ `ASSET`/`IP` bridges.
+* **Case Wall Injection (`CaseWallCardFormatter`)**: Renders a sanitized, SOAR-compatible HTML + inline 6-spoke SVG forensic triage card (enforcing zero-BigQuery-backend terminology sanitization) and posts it to the Chronicle SOAR Case Wall via `create_case_comment`.
 
 ---
 
-### 3. Chronicle SOAR Playbook Gateway (REST Webhook)
-Chronicle SOAR Playbooks can invoke `agentic-ueba` synchronously via a standard **HTTP Request** action block against `POST /api/v1/hunt/jit`:
-* Executes the full 3-stage investigation for the target entity and case.
-* Posts the HTML/SVG forensic triage card to the Case Wall (when `post_to_case_wall: true`).
-* Records the case in `WatchdogState` so the standing background scanner does not duplicate the triage.
-* Returns a machine-readable `JITHuntResponse` JSON payload (`triage.verdict`, `triage.calibrated_risk_index`, `triage.recommended_action`, `triage.entities_to_quarantine`, `triage.tags`, and `clean_hand_off`) for downstream playbook conditional branching and automated containment.
+### 4. Chronicle SOAR Playbook Gateway & REST Control Plane (`14 HTTP Endpoints`)
+Chronicle SOAR Playbooks and automation pipelines invoke `agentic-ueba` synchronously or asynchronously over HTTP:
+* `POST /api/v1/hunt/jit` runs the full 3-stage entity investigation, posts the HTML/SVG card to the Case Wall, records the case in `WatchdogState` to prevent duplicate background triage, and returns a machine-readable `JITHuntResponse` + `CleanHandOffPayload` (`triage.verdict`, `triage.calibrated_risk_index`, `triage.recommended_action`, `triage.entities_to_quarantine`, `triage.tags`) for SOAR conditional branching.
+* Dedicated endpoints manage on-demand 360° fleet sweeps (`/api/v1/radar/fleet-sweep`), scheduled/ad-hoc Markdown playbooks (`/api/v1/playbooks*`), and Watchdog/ledger inspection (`/api/v1/watchdog/*`, `/api/v1/cases/*`).
 
 ---
 
-### 4. Model Context Protocol (FastMCP Server)
-Exposes `/mcp` (Streamable HTTP / SSE) with **18 MCP tools** for Agent-to-Agent (A2A) orchestration, Gemini CLI / IDE integration, and interactive analyst workflows.
+### 5. Model Context Protocol Server (`/mcp` — `22 MCP Tools`)
+Exposes `/mcp` (Streamable HTTP / SSE) with **22 MCP tools** spanning autonomous entity/case orchestration, scheduled & ad-hoc Markdown runbook execution, AST-validated YARA-L 2.0 hybrid compilation, federated cross-skill handoffs, and 12 specialized macro/micro statistical hunters.
 
 ---
 
-## 🏗️ Architecture & Execution Flow
+### 🛡️ Cross-Cutting Safety & Execution Guardrails
+* **Telemetry Physics & Window Guardrail**: Strictly enforces the boundary between **Macro Baselines** (`35d` window over pre-computed `metrics.*` daily rollups in `RiskMetricsEngine`) and **Micro / Raw Telemetry** (hard-clamped to `<= 14d` via `StatsHunterEngine.enforce_telemetry_physics_window()` and `1d` / `7d` via `PlaybookRunner.resolve_effective_lookback_days()` so raw high-volume `NETWORK_CONNECTION`, `NETWORK_DNS`, `NETWORK_HTTP`, `USER_LOGIN`, or `PROCESS_LAUNCH` scans never hit Chronicle's 1M-row scan cap). Automatically shifts Entity Context Graph (`DERIVED_CONTEXT` / `GLOBAL_CONTEXT`) query windows back `48h` (`D-2`) when required.
+* **Two-Layer `QueryIntegrityGate`**:
+  1. **Pre-Dispatch Gate (`verify_pre_dispatch`)**: Blocks empty queries, unresolved `{{placeholder}}` slots, Malachite YARA-L AST syntax errors, bare `%data_table` references missing `.column_name` accessors, unscoped non-fleet single-entity queries (`UNSCOPED_ENTITY_QUERY`), and preflight-to-execution query drift.
+  2. **Post-Execution Gate (`verify_backend_response`)**: Inspects Chronicle OneMCP payloads for backend compiler/gRPC/`INVALID_ARGUMENT` errors and raises `ChronicleBackendQueryError` so failed queries never masquerade as `0.00σ` clean hunts.
+
+---
+
+## 🏗️ System Architecture
 
 ```mermaid
 flowchart TD
-    subgraph Triggers ["1. Invocation Interfaces"]
-        T1["Standing Watchdog Loop<br/>(60s Case Poll / 4h Fleet 360° Sweep)"]
-        T2["Chronicle SOAR Playbook<br/>(POST /api/v1/hunt/jit)"]
-        T3["MCP Client / Peer Agent<br/>(Streamable HTTP /mcp)"]
+    subgraph Surfaces ["1. Invocation & Scheduling Surfaces"]
+        S1["Watchdog Daemon (60s Case Poll & 4h Fleet 360 Sweep)"]
+        S2["SOAR Playbook Webhook (POST /api/v1/hunt/jit)"]
+        S3["Markdown Playbook API & Cron (/api/v1/playbooks)"]
+        S4["FastMCP Server (/mcp - 22 Agent & Analyst Tools)"]
     end
 
-    subgraph Engine ["2. Autonomous Hunter & Strategy Decider"]
-        T1 & T2 & T3 --> R1["Tier 1: 6-Sector 360° Behavioral Radar<br/>(USER & ASSET 30d Baselines)"]
-        R1 --> W["360° Warrant & Insight Analyzer<br/>(Variance Masking, Dormant Awakening, Kill-Chain Match)"]
-        W --> R2A["Tier 2A: Primary Alert-Contextual Hunt<br/>(Risk Metrics / Statistical Hunter / Gemini ReAct)"]
-        R2A --> R2B{"Tier 2B Secondary<br/>Pivot Warranted?"}
-        R2B -- "Yes (Confirm / Pivot)" --> P2B["Tier 2B: Bidirectional Epistemic Pivot<br/>(KillChainArchetype, 4-Stage MAD, Hurdle, Triad, Cross-Entity)"]
-        R2B -- "No" --> OUT["Post-Data Outcome & CRI Synthesis"]
-        P2B --> OUT
+    subgraph Orchestrators ["2. Dual Stateful Orchestration Planes"]
+        direction LR
+        subgraph EntityPlane ["Entity & SOAR Case Plane (AutonomousHunter)"]
+            E1["Tier 1: 6-Sector 360 Radar & Email-to-UID Resolution"]
+            E2["StrategyDecider: Warrant Analyzer & Confidence Gate (0.75 / 0.80)"]
+            E3["Tier 2A Primary Hunt & FederatedBridge Macro-to-Micro Sieve"]
+            E4{"Tier 2B Epistemic Pivot Warranted? (Max 2)"}
+            E5["Tier 2B Pivot: 11 KillChains, 4-Stage MAD, Hurdle, Triad, Cross-Entity"]
+            E1 --> E2 --> E3 --> E4
+            E4 -- "Yes" --> E5
+        end
+
+        subgraph PlaybookPlane ["Multi-Wave Runbook Plane (PlaybookRunner)"]
+            P1["GitHub / Local Markdown Fetcher (ETag & SHA-256 Cache)"]
+            P2["Wave 1: Parallel Upstream & Stage A + Option 2 RAM Seeding"]
+            P3["Barrier 1: 500-Event ImportEvents + verify_udm_run_indexed"]
+            P4["Wave 2: Stage B Expansion (Stage A UDM + Fresh Raw UDM)"]
+            P5["Barrier 2: Cumulative run_id Sync + Wave 3 3-Stage Capstone"]
+            P1 --> P2 --> P3 --> P4 --> P5
+        end
     end
 
-    subgraph Outputs ["3. Chronicle SIEM & SOAR Outputs"]
-        OUT --> CW["Chronicle SOAR Case Wall<br/>(6-Pillar HTML/SVG Triage Card via create_case_comment)"]
-        OUT --> PB["Playbook JSON Response<br/>(Verdict, CRI, Entities to Quarantine, Tags)"]
-        T1 --> UDM["Chronicle SIEM Ingestion<br/>(BEHAVIORAL_RISK_RADAR_360 via events:import)"]
+    subgraph Harness ["3. Bilateral UEBA Harness & Integrity Gates"]
+        H1["RiskMetricsEngine (secops-risk-metrics-multistage: 30d metrics.*, 38 Metrics)"]
+        H2["StatsHunterEngine (secops-statistical-hunter: <=14d Raw UDM, 23 Archetypes)"]
+        H3["DynamicProtocolAdapter + Vertex AI Gemini ReAct (3 Hybrid Tools)"]
+        QG["QueryIntegrityGate (AST, Slot, Entity, %DataTable & Backend Error QA)"]
+        GOV["Concurrency Governor (Semaphore=6 udm_search + secops-ueba-io ThreadPool)"]
     end
+
+    subgraph SecOps ["4. Google SecOps (Chronicle SIEM & SOAR)"]
+        SIEM_Q["Chronicle OneMCP udm_search & %ueba_hunt_bridge Data Tables"]
+        SIEM_ING["IngestionService.ImportEvents (BEHAVIORAL_RISK_RADAR_360 & PLAYBOOK_BEHAVIORAL_HUNT_MATCH)"]
+        SOAR_CW["SOAR Case Wall (6-Pillar HTML/SVG Card) & JITHuntResponse JSON"]
+    end
+
+    S1 & S2 & S4 --> E1
+    S1 --> H1
+    S3 & S4 --> P1
+
+    E3 & E5 --> H1 & H2 & H3
+    E4 -- "No" --> SOAR_CW
+    E5 --> SOAR_CW
+    P2 & P4 & P5 --> H1 & H2
+
+    H1 & H2 & H3 --> QG --> GOV --> SIEM_Q
+    S1 & P3 & P5 --> SIEM_ING
+    SIEM_ING -. "Indexed UDM Loopback (run_id + playbook_id)" .-> P4
+    SIEM_ING -. "Cumulative Wave 1 + Wave 2 Loopback" .-> P5
 ```
+
+---
+
+## ⏱️ Multi-Query Orchestration & Stage Expansion Over Time
+
+A single Chronicle YARA-L 2.0 multi-stage query can reference at most **2 raw UDM event stages** (`SourceCount["udm"] <= 2`). When an analytical workflow needs more stages—or must correlate signals across **seconds, minutes, hours, and 30-day baselines**—`agentic-ueba` coordinates multiple queries over time while preserving strict tenant QPS bounds and run isolation:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Sched as "Watchdog / API Caller"
+    participant PR as "PlaybookRunner / AutonomousHunter"
+    participant Gate as "QueryIntegrityGate & Governor (Sem=6)"
+    participant SIEM as "Chronicle udm_search & %ueba_hunt_bridge"
+    participant Ingest as "Chronicle ImportEvents (io-threads)"
+
+    Sched->>PR: Trigger Runbook or Entity Hunt (allocates unique run_id)
+
+    rect rgb(235, 245, 255)
+    Note over PR,SIEM: Phase 1 (t = 0s .. +45s): Wave 1 Parallel Stage A + In-Memory Seeded Chains (0s Indexing Wait)
+    par Independent & Option 1 Piecewise Queries (Concurrency = 3)
+        PR->>Gate: Dispatch Stage A / Macro+Micro DAG (2A, 4A, 6A, Q1, Q3...)
+        Gate->>SIEM: udm_search (35d metrics.* or <=14d bounded raw UDM)
+        SIEM-->>PR: Outlier rows ($entity, $z_score, forensic fields)
+    and Option 2 Upstream Candidate Seeding (0s Wait)
+        PR->>Gate: Inject <=25 RAM entities into /* UPSTREAM_CANDIDATE_* */
+        Gate->>SIEM: udm_search (targeted micro-telemetry drill-down)
+        SIEM-->>PR: Confirmed micro-stage rows (or write %ueba_hunt_bridge)
+    end
+    end
+
+    rect rgb(255, 246, 230)
+    Note over PR,Ingest: Synchronization Barrier #1 (t = +1m .. +22.5m): Wave 1 Flush & Read-After-Write Verification
+    PR->>Ingest: Flush Wave 1 PLAYBOOK_BEHAVIORAL_HUNT_MATCH (500-event chunks, clear RAM)
+    loop Poll every 30s (up to 45 attempts, 0 semaphore slots held during sleep)
+        PR->>Gate: verify_udm_run_indexed(product_log_id = run_id, rule_name ^= playbook_id:)
+        Gate->>SIEM: Count indexed UDM events for run_id
+        SIEM-->>PR: indexed_count >= N1 (Wave 1 100% searchable)
+    end
+    end
+
+    rect rgb(235, 252, 240)
+    Note over PR,SIEM: Phase 2 (Wave 2): Stage A -> UDM -> Stage B Expansion (4+ Effective Stages Across 2 Queries)
+    PR->>Gate: Dispatch Stage B (2B, 4B, 6B: Stage 1 reads 2A UDM + Stage 2 joins fresh raw UDM)
+    Gate->>SIEM: udm_search (bypasses 2-raw-stage YARA-L compiler cap)
+    SIEM-->>PR: Expanded multi-stage detections (stamped with same run_id)
+    end
+
+    rect rgb(255, 246, 230)
+    Note over PR,Ingest: Synchronization Barrier #2: Cumulative Wave 1 + Wave 2 Sync (0s fast-path if N2 == 0)
+    PR->>Ingest: Flush Wave 2 UDM matches & clear buffer
+    PR->>Gate: verify_udm_run_indexed(expected = N1 + N2)
+    Gate->>SIEM: Confirm cumulative N1 + N2 events indexed
+    SIEM-->>PR: Sync verified (or block Capstone if incomplete)
+    end
+
+    rect rgb(245, 238, 255)
+    Note over PR,Ingest: Phase 3 (Wave 3): Unified 3-Stage Capstone Convergence & Forensic Bridge
+    PR->>Gate: Dispatch Capstone (auto-scoped to run_id + ^playbook_id:)
+    Gate->>SIEM: Stage 1-2 Euclidean L2 Fusion (sum(Z^2) >= 25, >=2 scenarios) + Stage 3 Raw Telemetry Bridge
+    SIEM-->>PR: High-conviction multi-domain threat verdicts
+    PR->>Ingest: Emit Capstone & programmatic PLAYBOOK_CAPSTONE_CONVERGENCE UDM events
+    end
+
+    PR-->>Sched: Ordered Run Report (q01..qN) / Case Wall 6-Pillar HTML+SVG Card
+```
+
+### Multi-Query Execution & Chaining Matrix
+
+| Pattern | Mechanism | Inter-Query Latency | Effective Stage Depth | Primary Use Case |
+| :--- | :--- | :--- | :--- | :--- |
+| **Option 1: In-DAG Piecewise** | Single YARA-L 2.0 query joining `metrics.*` (`8d–30d`) + raw UDM (`1d–7d`) | **`0s`** | 2–3 stages ($\le 2$ raw UDM) | Cold-start + mature 30-day baseline unification in one pass. |
+| **Option 2: In-Memory Candidate Seeding** | Python extracts upstream entities into `/* UPSTREAM_CANDIDATE_IPS\|USERS\|HOSTS\|SAS */` | **`0s`** *(intra-run)* | 4+ stages across 2 queries | Fast macro-to-micro entity filtering ($\le 25$ candidates) with zero UDM indexing wait. |
+| **Option 3 (Wave 2): `Stage A -> UDM -> Stage B`** | `Stage A` emits `PLAYBOOK_BEHAVIORAL_HUNT_MATCH` $\rightarrow$ Barrier #1 $\rightarrow$ `Stage B` joins `Stage A` UDM + fresh raw UDM | **`2–22.5m`** *(async sleep)* | **4+ stages** across `A` + `B` | Breaking the 2-raw-stage ceiling for high-cardinality cohorts ($> 25$ entities) or multi-pivot chains (`2A -> 2B`, `4A -> 4B`, `6A -> 6B`). |
+| **Option 3 (Wave 3): Unified 3-Stage Capstone** | Barrier #2 verifies `N1 + N2` $\rightarrow$ fuses Wave 1 + Wave 2 UDM (`sum(Z^2) >= 25.0`, `>= 2` scenarios) + raw forensic stage | **`0s–22.5m`** *(0s if `N2 = 0`)* | **6+ cumulative stages** (`A -> B -> Capstone`) | Cross-scenario L2 risk convergence plus raw command-line / DLP / network decoration. |
+| **JIT Tiered & Data Table Progression** | `Tier 1 (360°)` $\rightarrow$ `Tier 2A` $\rightarrow$ `FederatedBridge` $\rightarrow$ `Tier 2B` + `%ueba_hunt_bridge.<col>` | **`~10–45s`** *(live case)* / persistent table | Up to 4 sequential live queries + persistent table | Interactive SOAR case triage, hypothesis refutation pivots, and cross-hunt Data Table materialization. |
+| **Longitudinal Fleet & Scheduled Cycles** | Standing `4h` `BEHAVIORAL_RISK_RADAR_360` sweeps + staggered periodic runbooks | **Every `4h`** *(configurable)* | Continuous multi-day time series | Tracking slow multi-day drift, intra-day Euclidean $D$ escalations (`+2.0σ`), and historical SIEM rules. |
 
 ---
 
 ## 🔌 How to Invoke `agentic-ueba`
 
-### A. REST API Endpoints
+### A. REST API Endpoints (`14 Routes`)
 
 #### 1. SOAR Playbook JIT Investigation (`POST /api/v1/hunt/jit`)
+Supports `"skill": "auto" | "risk-metrics" | "stats-hunter" | "bilateral"`:
 ```bash
 curl -X POST "https://<YOUR_SERVICE_URL>/api/v1/hunt/jit" \
   -H "Content-Type: application/json" \
@@ -144,85 +285,79 @@ curl -X POST "https://<YOUR_SERVICE_URL>/api/v1/radar/fleet-sweep" \
   }'
 ```
 
-#### 3. Autonomous Markdown Hunting Playbooks (`/api/v1/playbooks`)
-Point `agentic-ueba` at a public GitHub Markdown URL (e.g., `https://github.com/GooGKush/docs/blob/main/shadow-ai-agentic-ueba-hunting.md`) to automatically normalize the URL to `raw.githubusercontent.com`, extract all multi-stage YARA-L 2.0 `stage` queries, validate them against the Malachite AST validator, schedule periodic searches in parallel waves, and ingest matches as `PLAYBOOK_BEHAVIORAL_HUNT_MATCH` UDM events via `IngestionService.ImportEvents`:
-* **Intra-Playbook Wave Concurrency**: Independent upstream queries execute concurrently (`SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3`) before synchronizing at entity-seeded or Capstone barriers.
-* **Three Chaining Modes & UDM Indexing Latency**:
-  1. **Option 1 — In-DAG Piecewise Unification (0s wait)**: Joins a 30-day `metrics.*` stage and a raw UDM stage inside a single YARA-L 2.0 DAG.
-  2. **Option 2 — In-Memory Upstream Candidate Seeding (`/* UPSTREAM_CANDIDATE_IPS */` / `/* UPSTREAM_CANDIDATE_USERS */`, 0s wait)**: Passes candidate entities extracted from Query $N$ in memory directly into Query $N+1$ without waiting for Chronicle UDM indexing.
-  3. **Option 3 — Native UDM Loopback & Read-After-Write Indexing Barrier (`PLAYBOOK_BEHAVIORAL_HUNT_MATCH`, 2–22.5m wait)**: Every playbook run generates a globally unique `run_id` (`run_<playbook_id>_<YYYYMMDDTHHMMSSZ>_<uuid8>`) stamped into `metadata.product_log_id`, `metadata.ingestion_labels`, `target.resource.attribute.labels["Run ID"]`, and `security_result[0].detection_fields["run_id"]`, alongside `security_result[0].rule_name = "<playbook_id>:<query_id>"`. Before executing any downstream **Capstone (`PLAYBOOK_BEHAVIORAL_HUNT_MATCH`)** query:
-     - `PlaybookRunner` flushes all upstream UDM events in 500-event batches on the `secops-ueba-io` worker thread pool and clears the in-memory payload buffer.
-     - It then polls Chronicle UDM search (`verify_udm_run_indexed()`, default `45 attempts × 30s = 22.5 minutes`) scoped strictly to `metadata.product_log_id = "<run_id>"` and `re.regex(security_result.rule_name, "^<playbook_id>:")` until **`indexed_events >= expected_events`**.
-     - If only a subset of events has been indexed when the wait budget expires (e.g., `300` of `3,000` events), the downstream Capstone query is blocked (`SKIPPED_INCOMPLETE_UDM_SYNC`) so it never executes prematurely on partial data.
+#### 3. Multi-Wave Markdown Hunting Playbooks (`/api/v1/playbooks`)
+Point `agentic-ueba` at any GitHub Markdown playbook URL (e.g., `shadow-ai-agentic-ueba-hunting.md`, `insider-risk-dlp-ueba-hunting.md`, `php2shell-ueba-hunting.md`, or any of the 12 Curated Detections UEBA packs in `GooGKush/docs`) or a `file://` path to normalize the source, AST-validate all multi-stage `stage` queries, schedule periodic 3-wave runs (`Wave 1 -> Barrier #1 -> Wave 2 Stage B -> Barrier #2 -> Wave 3 Capstone`), and ingest matches as `PLAYBOOK_BEHAVIORAL_HUNT_MATCH` UDM events:
 
 ```bash
-# Register and start a periodic Markdown playbook (every 4 hours)
+# Register and start a periodic 3-wave Markdown playbook (every 4 hours)
 curl -X POST "https://<YOUR_SERVICE_URL>/api/v1/playbooks" \
   -H "Content-Type: application/json" \
   -d '{
-    "playbook_id": "php2shell-ueba",
-    "url": "https://github.com/GooGKush/docs/blob/main/php2shell-ueba-hunting.md",
+    "playbook_id": "shadow-ai-ueba",
+    "url": "https://github.com/GooGKush/docs/blob/main/shadow-ai-agentic-ueba-hunting.md",
     "interval_seconds": 14400,
     "ingest_events": true,
-    "run_immediately": true
+    "run_immediately": false
   }'
 
-# Inspect registered playbooks and recent run summaries
+# Inspect registered playbooks, AST query inventory, and recent run summaries
 curl "https://<YOUR_SERVICE_URL>/api/v1/playbooks"
 
-# Trigger an on-demand single pass
+# Trigger an on-demand single pass (with optional lookback override clamped by Telemetry Physics)
 curl -X POST "https://<YOUR_SERVICE_URL>/api/v1/playbooks/run" \
   -H "Content-Type: application/json" \
-  -d '{"playbook_id": "php2shell-ueba", "ingest_events": true}'
+  -d '{"playbook_id": "shadow-ai-ueba", "ingest_events": true}'
 
-# Pause or stop a scheduled playbook
+# Pause or remove a scheduled playbook
 curl -X POST "https://<YOUR_SERVICE_URL>/api/v1/playbooks/stop" \
   -H "Content-Type: application/json" \
-  -d '{"playbook_id": "php2shell-ueba", "delete": false}'
+  -d '{"playbook_id": "shadow-ai-ueba", "delete": false}'
 ```
 
-#### 4. Watchdog Control & Case Activity Ledger
+#### 4. Complete HTTP Endpoint Reference
 | Method | Path | Description |
 | :--- | :--- | :--- |
 | `GET` | `/healthz` | Cloud Run liveness/readiness check (reports default tenant & watchdog state). |
+| `POST` | `/api/v1/hunt/jit` | Executes a synchronous 3-stage JIT entity/case investigation (`auto`, `risk-metrics`, `stats-hunter`, `bilateral`). |
+| `POST` | `/api/v1/radar/fleet-sweep` | Triggers an on-demand Mode A fleetwide 360° radar sweep (`USER`, `ASSET`) and optional UDM ingestion. |
 | `GET` | `/api/v1/watchdog/status` | Returns runtime status, queue depth, active workers, 360° sweep stats, and registered playbooks. |
 | `POST` | `/api/v1/watchdog/start` | Starts the background case-polling loop, worker pool, 4h fleet 360° scheduler, and playbook scheduler. |
-| `POST` | `/api/v1/watchdog/stop` | Cleanly cancels background polling and worker tasks. |
+| `POST` | `/api/v1/watchdog/stop` | Cleanly cancels background polling, fleet sweep, playbook scheduler, and worker tasks. |
 | `POST` | `/api/v1/watchdog/reset-state` | Clears seen cases and intra-day deduplication state in `data/watchdog_state.json`. |
 | `POST` | `/api/v1/cases/scan` | Triggers an immediate single scan pass over open SOAR cases (`{"limit": 5}`). |
 | `GET` | `/api/v1/cases/activity` | Returns triaged case ledger filtered by `?timeframe=24h` (`1h`, `24h`, `7d`, `all`) and optional `?tag=RISK:CRITICAL,SECOND_ORDER_HUNT`. |
-| `POST` | `/api/v1/playbooks` | Registers, AST-validates, and schedules a Markdown hunting playbook from a GitHub URL or file path. |
-| `GET` | `/api/v1/playbooks` | Lists registered Markdown playbooks, query inventory, schedule state, and recent run history. |
-| `POST` | `/api/v1/playbooks/run` | Executes an on-demand single pass of a registered or ad-hoc Markdown playbook. |
+| `POST` | `/api/v1/playbooks` | Registers, AST-validates, and schedules a Markdown hunting playbook from a GitHub URL or `file://` path. |
+| `GET` | `/api/v1/playbooks` | Lists registered Markdown playbooks, query wave/chaining inventory, schedule state, and recent run history. |
+| `POST` | `/api/v1/playbooks/run` | Executes an on-demand 3-wave pass of a registered or ad-hoc Markdown playbook. |
 | `POST` | `/api/v1/playbooks/stop` | Pauses (`delete: false`) or removes (`delete: true`) a registered Markdown playbook. |
 | `DELETE` | `/api/v1/playbooks/{playbook_id}` | Deletes a registered Markdown playbook subscription. |
 
 ---
 
-### B. MCP Tools (`/mcp`)
+### B. MCP Tools (`/mcp` — `22 Tools`)
 
-Connect any MCP client (Streamable HTTP) to `https://<YOUR_SERVICE_URL>/mcp`. Available tools:
+Connect any MCP client (Streamable HTTP) to `https://<YOUR_SERVICE_URL>/mcp`:
 
 | Category | Tool Name | Purpose |
 | :--- | :--- | :--- |
-| **Core Orchestration** | `hunt_entity` | Full 3-stage autonomous JIT threat hunt for a `USER`, `ASSET`, or `IP`. |
+| **Core Orchestration (8)** | `hunt_entity` | Full 3-stage autonomous JIT threat hunt for a `USER`, `ASSET`, or `IP` (`auto`, `risk-metrics`, `stats-hunter`, `bilateral`). |
 | | `profile_360_risk` | Decoupled 6-sector 360° behavioral risk radar profile for an entity. |
 | | `run_fleet_360_sweep` | Runs the Mode A fleetwide 360° sweep and ingests `BEHAVIORAL_RISK_RADAR_360` UDM events. |
-| | `scan_open_cases` | Scans open Chronicle SOAR cases and executes autonomous hunts. |
+| | `scan_open_cases` | Scans open Chronicle SOAR cases and executes autonomous 3-stage hunts. |
 | | `control_watchdog` | Starts, stops, resets, or queries the background `WatchdogDaemon`. |
 | | `get_case_activity` | Queries the triaged case ledger by `timeframe` and `tag`. |
 | | `manage_playbook` | Registers, lists, pauses, or deletes a scheduled Markdown hunting playbook from a GitHub URL. |
-| | `run_markdown_playbook` | Executes an on-demand pass of a Markdown hunting playbook and ingests matched UDM events. |
-| **Hybrid Compiler** | `compile_hunt_pipeline` | Compiles an AST-validated multi-stage YARA-L 2.0 query, Pre-Flight card, and 1-shot probe. |
+| | `run_markdown_playbook` | Executes an on-demand 3-wave pass of a Markdown hunting playbook and ingests matched UDM events. |
+| **Hybrid Compiler (2)** | `compile_hunt_pipeline` | Compiles an AST-validated multi-stage YARA-L 2.0 query, Pre-Flight card, and 1-shot probe. |
 | | `dispatch_hybrid_handoff` | Dispatches a federated `secops-threat-hunt-handoff-v1` payload to `secops-statistical-hunter`. |
-| **Specialized Hunters** | `hunt_cloud_crud` | 30-day baseline Cloud CRUD write surge with companion dimensions. |
+| **Specialized Hunters (12)** | `hunt_cloud_crud` | 30-day baseline Cloud CRUD write surge with companion dimensions. |
 | | `hunt_hybrid_enrichment` | Dual-Plane 2-stage macro-baseline + micro-telemetry signature fusion. |
 | | `hunt_circadian_von_mises` | Off-hours temporal anomaly detection using a 24-hour circular von Mises clock. |
 | | `hunt_macd_momentum` | Instantaneous momentum velocity divergence (`7d` vs. `30d` anchor). |
-| | `hunt_c2_jitter` | Robotic C2 beaconing detection via inter-arrival Coefficient of Variation ($CV \le 0.20$). |
+| | `hunt_c2_jitter` | Robotic C2 beaconing detection via inter-arrival Coefficient of Variation ($\text{CV} \le 0.20$). |
 | | `hunt_poisson_burst` | Credential spray burst clustering via Poisson Fano Factor dispersion ($F > 4.0$). |
 | | `hunt_shannon_entropy` | Obfuscated command line / DGA detection via Shannon character-class entropy. |
-| | `hunt_markov_transition` | Rare Living-off-the-Land parent$\rightarrow$child process transitions via Markov 2-gram surprisal. |
+| | `hunt_markov_transition` | Rare Living-off-the-Land parent $\rightarrow$ child process transitions via Markov 2-gram surprisal. |
 | | `hunt_zipfian_rarity` | Rare administrative binary execution in the enterprise Zipfian power-law tail. |
 | | `hunt_ewma_burst` | Acute intraday kinetic rate surges via EWMA velocity divergence. |
 | | `hunt_impossible_travel` | Supersonic geodesic travel velocity (`math.geo_distance >= 900 km/h`) across consecutive logins. |
@@ -239,25 +374,25 @@ Connect any MCP client (Streamable HTTP) to `https://<YOUR_SERVICE_URL>/mcp`. Av
 1. **In-Process Concurrency Locks & Local Deduplication Ledger**:
    `WatchdogDaemon` uses in-memory `asyncio.Lock` guards (`_scan_lock`, `_fleet_360_lock`, and per-playbook `_playbook_locks[pb_id]`), an in-memory `_in_flight_case_ids` set, and a thread-safe (`threading.RLock`) local atomic JSON ledger (`data/watchdog_state.json`) to track seen SOAR cases, intra-day `BEHAVIORAL_RISK_RADAR_360` emissions, and `PLAYBOOK_BEHAVIORAL_HUNT_MATCH` UDM deduplication. Running multiple container instances would cause replicas to race on the same open SOAR cases (posting duplicate comments to the Case Wall) and ingest duplicate UDM events into Chronicle.
 2. **Global Chronicle API Quota Governor**:
-   All background loops (4-hour Fleet 360° sweeps, SOAR Case Wall workers, parallel Markdown Playbooks, and UDM read-after-write indexing validators) share a single process-wide `asyncio.Semaphore` (`SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6`) inside `PipelineRunner.execute_query_via_mcp()`. Horizontal replicas multiply query concurrency against the same Chronicle tenant and risk triggering `HTTP 429RESOURCE_EXHAUSTED` throttling.
+   All background loops (4-hour Fleet 360° sweeps, SOAR Case Wall workers, parallel 3-wave Markdown Playbooks, and UDM read-after-write indexing validators) share a single process-wide `asyncio.Semaphore` (`SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6`) inside `PipelineRunner.execute_query_via_mcp()`. Horizontal replicas multiply query concurrency against the same Chronicle tenant and risk triggering `HTTP 429 RESOURCE_EXHAUSTED` throttling.
 3. **Background Scheduler Continuity (`--no-cpu-throttling`)**:
-   On Google Cloud Run, if CPU is only allocated during HTTP requests, Cloud Run freezes background `asyncio` tasks (`_run_loop`, `_worker_loop`, `_fleet_360_loop`, and `_playbook_loop`) and `secops-ueba-io` worker threads as soon as an HTTP response finishes. You **must** deploy with **CPU always allocated** (`--no-cpu-throttling`) and **`--min-instances=1`**.
+   On Google Cloud Run, if CPU is only allocated during HTTP requests, Cloud Run freezes background `asyncio` tasks (`_run_loop`, `_worker_loop`, `_fleet_360_loop`, and `_playbook_loop`) and `secops-ueba-io` worker threads as soon as an HTTP response finishes. You **must** deploy with **CPU always allocated** (`--no-cpu-throttling`) and **`--min-instances=1`**. *(Note: Even when `WATCHDOG_ENABLED=false`, `_playbook_loop` starts automatically on server startup whenever scheduled playbooks are registered.)*
 
 ---
 
 ### Hybrid Async + Worker ThreadPool Concurrency Architecture
-To run up to 14 cyclical Markdown hunting playbooks (150+ multi-stage YARA-L 2.0 queries with 2–22.5 minute Capstone UDM indexing barriers) concurrently alongside SOAR Case Wall triage and 360° fleet sweeps without blocking the event loop or starving worker slots, `agentic-ueba` separates **async network wait states** from **blocking I/O & CPU work**:
+To run all **15 cyclical Markdown hunting playbooks** (215+ multi-stage YARA-L 2.0 queries with 2–22.5 minute Wave 1 $\rightarrow$ Wave 2 and Wave 2 $\rightarrow$ Wave 3 UDM indexing barriers) concurrently alongside SOAR Case Wall triage and 360° fleet sweeps without blocking the event loop or starving worker slots, `agentic-ueba` separates **async network wait states** from **blocking I/O & CPU work**:
 
 1. **Global Chronicle `udm_search` Semaphore (`SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6`)**:
    Caps simultaneous in-flight Chronicle `udm_search` calls across all playbooks, UDM `run_id` indexing lag polls, 360° sector sweeps, and Case Wall workers so tenant QPS limits are never breached.
 2. **Parallel Playbook Execution (`SECOPS_PLAYBOOK_CONCURRENCY=6`) & Per-Playbook Locks**:
-   Up to 6 distinct Markdown playbooks execute concurrently. Because Chronicle UDM indexing (`ImportEvents` $\rightarrow$ Normalization $\rightarrow$ Indexing $\rightarrow$ Enrichment $\rightarrow$ F1/Mindmeld Stats store) typically takes **2 to 20 minutes**, a playbook waiting at its Option 3 Capstone barrier (`verify_udm_run_indexed()`) spends >99% of that window asynchronously sleeping (`await asyncio.sleep(30)`) while holding **zero** `udm_search` semaphore slots. Setting `SECOPS_PLAYBOOK_CONCURRENCY=6` (or `8` for 12+ playbooks) ensures that 3–4 playbooks parked in a 15-minute UDM indexing wait never starve other playbooks from running their upstream waves. Duplicate triggers of the *same* `playbook_id` immediately return `SKIPPED_CONCURRENT`.
+   Up to 6 distinct Markdown playbooks execute concurrently. Because Chronicle UDM indexing (`ImportEvents` $\rightarrow$ Normalization $\rightarrow$ Indexing $\rightarrow$ Enrichment $\rightarrow$ F1/Mindmeld Stats store) typically takes **2 to 20 minutes**, a playbook waiting at Synchronization Barrier #1 or #2 (`verify_udm_run_indexed()`) spends $>99\%$ of that window asynchronously sleeping (`await asyncio.sleep(30)`) while holding **zero** `udm_search` semaphore slots. Setting `SECOPS_PLAYBOOK_CONCURRENCY=6` (or `8` for 12–15 playbooks) ensures that playbooks parked in a 15-minute UDM indexing wait never starve other playbooks from running their active query waves. Duplicate triggers of the *same* `playbook_id` immediately return `SKIPPED_CONCURRENT`.
 3. **Intra-Playbook Wave Concurrency (`SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3`)**:
-   Within each playbook, independent upstream queries fan out concurrently in waves before synchronizing at entity-seeded queries (`is_seeded`) or pre-Capstone UDM flush + `run_id` indexing validation barriers (`is_capstone`).
+   Within each wave, eligible queries fan out concurrently (`3` at a time) before synchronizing at entity-seeded queries (`is_seeded`), UDM-gated `Stage B` expansions (`is_udm_gated`), or Wave 3 Capstone barriers (`is_capstone`).
 4. **Dedicated Blocking I/O & CPU Worker ThreadPool (`SECOPS_BLOCKING_IO_WORKERS=4` to `6`)**:
    Offloads synchronous operations (`chronicle_ingest.import_events` 500-event batch uploads over `urllib.request`, Google ADC OAuth token refreshes, Malachite YARA-L AST parsing/validation, and atomic `watchdog_state.json` disk writes) onto background `secops-ueba-io-*` OS threads via `loop.run_in_executor()`.
 5. **Pre-Barrier Buffer Release (Memory Hygiene for 3,000–10,000 Row Hunts)**:
-   When an upstream wave produces thousands of outlier rows (e.g., 3,000 events $\approx$ 12–15 MiB of structured UDM JSON), `_flush_pending_udm_events()` ships the 500-event batches to Chronicle `ImportEvents` and immediately calls `udm_events_to_ingest.clear()` *before* entering the 22.5-minute `verify_udm_run_indexed()` polling loop—keeping resident RAM flat while playbooks wait for UDM indexing.
+   When an upstream wave produces thousands of outlier rows (e.g., 3,000 events $\approx$ 12–15 MiB of structured UDM JSON), `_flush_pending_udm_events()` ships the 500-event batches to Chronicle `ImportEvents` and immediately calls `udm_events_to_ingest.clear()` *before* entering the 22.5-minute `verify_udm_run_indexed()` polling loop—keeping resident RAM flat across multi-barrier runs.
 
 ---
 
@@ -268,7 +403,7 @@ Choose the sizing profile that matches your active playbook and case triage volu
 | Workload Profile | Active Workloads | vCPU (`--cpu`) | Memory (`--memory`) | Recommended Concurrency Env Vars | Expected Peak Utilization |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Standard Tier**<br>*(Default)* | • Standing SOAR Case Triage (`3` workers)<br>• 4h Fleetwide 360° Sweep (`USER` + `ASSET`)<br>• **1–4** Markdown Hunting Playbooks | **`2 vCPU`** | **`2 GiB`** | `SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6`<br>`SECOPS_PLAYBOOK_CONCURRENCY=4`<br>`SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3`<br>`SECOPS_BLOCKING_IO_WORKERS=4`<br>`SECOPS_UDM_VALIDATION_MAX_ATTEMPTS=45`<br>`SECOPS_UDM_VALIDATION_POLL_SEC=30` | • **CPU**: 0.4–1.3 vCPU (spikes during AST compile & 500-event UDM batch serialization)<br>• **RAM**: ~650 MiB–1.2 GiB<br>• **Chronicle Search**: $\le 6$ concurrent queries |
-| **Full Curated Suite / High-Volume Tier**<br>*(12–14 Playbooks / 3,000+ Row Batches)* | • Standing SOAR Case Triage (`3–4` workers)<br>• 4h Fleetwide 360° Sweep (`USER` + `ASSET`)<br>• **All 12–14** Curated Detections & Threat Hunting Playbooks (~160+ multi-stage queries + Option 3 Capstone UDM loopback barriers) | **`4 vCPU`** | **`4 GiB`** | `SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6`<br>`SECOPS_PLAYBOOK_CONCURRENCY=6`<br>`SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3`<br>`SECOPS_BLOCKING_IO_WORKERS=6`<br>`SECOPS_UDM_VALIDATION_MAX_ATTEMPTS=45`<br>`SECOPS_UDM_VALIDATION_POLL_SEC=30` | • **CPU**: 1.2–2.8 vCPU during overlapping playbook waves, 3,000-row UDM batch flushes, & 360° sweeps<br>• **RAM**: ~1.2 GiB–2.4 GiB (10,000-row columnar stats buffers + concurrent 500-event `ImportEvents` chunks)<br>• **Chronicle Search**: $\le 6$ concurrent queries |
+| **Full Curated Suite / High-Volume Tier**<br>*(12–15 Playbooks / 3-Wave Loopback)* | • Standing SOAR Case Triage (`3–4` workers)<br>• 4h Fleetwide 360° Sweep (`USER` + `ASSET`)<br>• **All 15** Curated Detections & Threat Hunting Playbooks (~215+ multi-stage queries + `A -> UDM -> B -> Capstone` barriers) | **`4 vCPU`** | **`4 GiB`** | `SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6`<br>`SECOPS_PLAYBOOK_CONCURRENCY=6`<br>`SECOPS_PLAYBOOK_QUERY_CONCURRENCY=3`<br>`SECOPS_BLOCKING_IO_WORKERS=6`<br>`SECOPS_UDM_VALIDATION_MAX_ATTEMPTS=45`<br>`SECOPS_UDM_VALIDATION_POLL_SEC=30` | • **CPU**: 1.2–2.8 vCPU during overlapping playbook waves, 3,000-row UDM batch flushes, & 360° sweeps<br>• **RAM**: ~1.2 GiB–2.4 GiB (10,000-row columnar stats buffers + concurrent 500-event `ImportEvents` chunks)<br>• **Chronicle Search**: $\le 6$ concurrent queries |
 
 ### Baseline Container Settings & Timeout Guidance (All Tiers)
 | Resource / Setting | Recommended Value | Rationale |
@@ -278,8 +413,8 @@ Choose the sizing profile that matches your active playbook and case triage volu
 | **CPU Throttling** | **Always-On** (`--no-cpu-throttling`) | **Mandatory**: Required so standing 60s case scans, 4h fleet 360° sweeps, and 2–22.5 minute background UDM indexing barrier polls never freeze between HTTP requests. |
 | **Memory** | `2 GiB` (Standard) / `4 GiB` (Full Suite) | Headroom for concurrent 3,000–10,000 row columnar stats payloads, 500-event UDM batch builders, and SVG/HTML Case Wall rendering without OOM kills. |
 | **Uvicorn Workers** | `1` (Default in `Dockerfile`) | **Must remain `1`**: Single-process async event loop so all HTTP/MCP routes and background loops share the same `WatchdogDaemon` locks, semaphores, and `WatchdogState`. Never pass `--workers > 1` to `uvicorn`. |
-| **HTTP Request Timeout** | **`3600s` (`--timeout=3600`)** | **Critical for Option 3 UDM Loopback Playbooks**: Chronicle UDM indexing typically takes **2–20 minutes** after `ImportEvents`. A 10-minute (`600s`) HTTP timeout will sever synchronous `POST /api/v1/playbooks/run` or MCP `run_markdown_playbook` calls mid-barrier. Set `--timeout=3600` (Cloud Run's 60-minute max) for synchronous runs, and prefer **scheduled background execution** (`POST /api/v1/playbooks` with `"run_immediately": false`), which runs inside `_playbook_loop` and is completely independent of HTTP request timeouts. |
-| **Staggered Playbook Schedules** | Offset `interval_seconds` (e.g., `14400`, `14700`, `15000`) | When registering 12+ playbooks, staggering intervals by 3–5 minutes prevents simultaneous 3,000-row `ImportEvents` bursts and spreads UDM indexing barrier polls evenly across the 4-hour cycle. |
+| **HTTP Request Timeout** | **`3600s` (`--timeout=3600`)** | **Critical for 3-Wave UDM Loopback Playbooks**: Each UDM indexing barrier (`Wave 1 -> Wave 2` and `Wave 2 -> Wave 3`) can wait **2–20 minutes** after `ImportEvents`. Set `--timeout=3600` (Cloud Run's 60-minute max) for synchronous `POST /api/v1/playbooks/run` calls, and prefer **scheduled background execution** (`POST /api/v1/playbooks` with `"run_immediately": false`), which runs inside `_playbook_loop` independent of HTTP timeouts. |
+| **Staggered Playbook Schedules** | Offset `interval_seconds` (e.g., `14400`, `14700`, `15000`) | When registering 12–15 playbooks, staggering intervals by 3–5 minutes prevents simultaneous 3,000-row `ImportEvents` bursts and spreads UDM indexing barrier polls evenly across the 4-hour cycle. |
 
 ### Example Cloud Run Deployment Command (Full Curated Playbook Suite)
 ```bash
@@ -315,9 +450,9 @@ gcloud run deploy secops-agentic-hunter \
 | `GEMINI_FALLBACK_MODELS` | `gemini-3-flash-preview,gemini-2.5-pro,gemini-2.5-flash` | Ordered fallback models on quota/availability errors. |
 | `SECOPS_MAX_CONCURRENT_UDM_SEARCHES` | `6` | Global process-wide semaphore capping simultaneous Chronicle `udm_search` calls across all playbooks, UDM indexing validators, 360° sweeps, and case workers. |
 | `SECOPS_PLAYBOOK_CONCURRENCY` | `6` | Maximum number of distinct Markdown playbooks allowed to execute in parallel (sized so playbooks parked in 2–22.5m UDM indexing barriers do not starve other playbooks). |
-| `SECOPS_PLAYBOOK_QUERY_CONCURRENCY` | `3` | Intra-playbook wave concurrency for independent upstream queries prior to seeded or Capstone barriers. |
-| `SECOPS_BLOCKING_IO_WORKERS` | `4` | Worker threads in the `secops-ueba-io` `ThreadPoolExecutor` for offloading synchronous UDM `ImportEvents` ingestion (`6` recommended for Full Suite Tier). |
-| `SECOPS_UDM_VALIDATION_MAX_ATTEMPTS` | `45` | Maximum polling attempts in `verify_udm_run_indexed()` before blocking a downstream Capstone query (`45 × 30s = 22.5 minutes`). |
+| `SECOPS_PLAYBOOK_QUERY_CONCURRENCY` | `3` | Intra-playbook wave concurrency for eligible queries within Wave 1 and Wave 2 prior to seeded or UDM sync barriers. |
+| `SECOPS_BLOCKING_IO_WORKERS` | `4` | Worker threads in the `secops-ueba-io` `ThreadPoolExecutor` for offloading synchronous UDM `ImportEvents` ingestion, AST validation, and ADC auth (`6` recommended for Full Suite Tier). |
+| `SECOPS_UDM_VALIDATION_MAX_ATTEMPTS` | `45` | Maximum polling attempts in `verify_udm_run_indexed()` per UDM barrier before blocking downstream Stage B / Capstone queries (`45 × 30s = 22.5 minutes`). |
 | `SECOPS_UDM_VALIDATION_POLL_SEC` | `30.0` | Seconds between UDM indexing validation probes (`verify_udm_run_indexed()`). |
 | `WATCHDOG_ENABLED` | `false` | Auto-starts the standing case scanner, playbook scheduler, and fleet 360° loop on startup when `true`. |
 | `WATCHDOG_INTERVAL_SECONDS` | `60` | Polling interval (seconds) for open Chronicle SOAR cases. |
@@ -339,14 +474,14 @@ gcloud run deploy secops-agentic-hunter \
 
 ```text
 agentic_ueba/
-├── README.md                           # Operational guide, API reference, & Cloud Run hosting instructions
+├── README.md                           # Operational guide, architecture diagrams, API reference, & Cloud Run sizing
 ├── ARCHITECTURE.md                     # Deep-dive system architecture, data contracts, & mathematical models
 ├── LICENSE                             # Apache 2.0 License
 ├── Dockerfile                          # Production Python 3.13 container baking in canonical skills
 ├── cloudbuild.yaml                     # Cloud Build CI/CD pipeline (tests -> skill staging -> image build)
 ├── requirements.txt                    # Runtime Python dependencies
 ├── data/
-│   └── watchdog_state.json             # Persistent ledger for triaged cases & intra-day 360° emissions
+│   └── watchdog_state.json             # Persistent ledger for triaged cases, playbooks, & UDM dedup state
 ├── scripts/
 │   └── build_container.sh              # Stages canonical skills into .build/skills for container packaging
 ├── src/
@@ -354,21 +489,21 @@ agentic_ueba/
 │   ├── _bootstrap.py                   # Runtime path & virtualenv bootstrapper
 │   ├── config.py                       # Multi-tenant configuration & ADC Bearer token generator
 │   ├── models.py                       # Pydantic schemas (JITHuntRequest, JITHuntResponse, CleanHandOffPayload)
-│   ├── server.py                       # Dual FastMCP (/mcp) + Starlette REST Gateway (/api/v1/*)
-│   ├── autonomous_hunter.py            # 3-Stage investigation orchestrator + Gemini ReAct loop
-│   ├── strategy_decider.py             # 360° warrant analyzer & Tier 2A -> Tier 2B epistemic pivot router
-│   ├── risk_metrics_engine.py          # 30d UEBA engine, Fleet 360° sweep, & BEHAVIORAL_RISK_RADAR_360 ingestor
-│   ├── stats_hunter_engine.py          # Inline raw-log statistical engine (C2 CV, Fano, Shannon, Markov, Zipf, EWMA, Impossible Travel, Producer-Consumer)
-│   ├── playbook_runner.py              # GitHub Markdown playbook fetcher, wave runner, UDM run_id barrier, & Capstone engine
-│   ├── pipeline_runner.py              # Template renderer, Malachite AST validator, global udm_search governor, & IO thread pool
+│   ├── server.py                       # Dual FastMCP (22 tools on /mcp) + Starlette REST Gateway (14 routes)
+│   ├── autonomous_hunter.py            # 3-Stage investigation orchestrator, Bilateral mode, & Gemini ReAct loop
+│   ├── strategy_decider.py             # 360° warrant analyzer, confidence scorer, & Tier 2A -> Tier 2B pivot router
+│   ├── risk_metrics_engine.py          # 30d UEBA engine (38 metrics, 11 KillChains, %DataTable bridge, Fleet 360°)
+│   ├── stats_hunter_engine.py          # Bounded <=14d raw UDM engine (23 archetypes: C2 CV, Fano, Shannon, Markov, Zipf, EWMA, Geo, PCR)
+│   ├── playbook_runner.py              # 3-Wave Markdown playbook engine (Stage A -> UDM -> Stage B -> Capstone & ETag cache)
+│   ├── pipeline_runner.py              # Template renderer, Malachite AST bridge, global udm_search governor, & IO thread pool
 │   ├── query_integrity_gate.py         # Pre-dispatch AST/entity/slot/Data-Table validator & post-execution backend error gate
-│   ├── dynamic_protocol_adapter.py     # Runtime SKILL.md protocol adapter with reference offloading
-│   ├── federated_bridge.py             # Cross-skill Macro-to-Micro handoff bridge
+│   ├── dynamic_protocol_adapter.py     # Runtime SKILL.md protocol adapter, Bilateral persona builder, & BQ sanitizer
+│   ├── federated_bridge.py             # Two-phase Macro (30d metrics.*) -> Micro (<=14d raw UDM) handoff sieve
 │   ├── watchdog.py                     # Standing case scanner, worker pool, 4h Fleet 360° & parallel playbook scheduler
 │   └── formatters/
 │       ├── __init__.py
-│       └── case_wall_card.py           # Chronicle SOAR Case Wall HTML/SVG card formatter & sanitizer
-└── tests/                              # Unit & contract test suite (91 tests)
+│       └── case_wall_card.py           # Chronicle SOAR Case Wall 6-pillar HTML/SVG card formatter & sanitizer
+└── tests/                              # Unit & schema contract test suite (94 tests)
     ├── test_engines.py
     ├── test_metric_args.py
     ├── test_playbook_runner.py
@@ -381,7 +516,7 @@ agentic_ueba/
 ## 🧪 Local Development & Testing
 
 ```bash
-# Run the full 91-test unit and schema contract suite
+# Run the full 94-test unit and schema contract suite
 pytest tests/ -q
 
 # Start the server locally on port 8080

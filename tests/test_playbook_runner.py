@@ -232,7 +232,7 @@ def test_parse_real_php2shell_docs_file_if_present():
 
   runner = PlaybookRunner(TenantConfig(project_id="test-proj", customer_id="test-cust"))
   specs = runner.parse_markdown_playbook(real_doc.read_text(encoding="utf-8"))
-  assert len(specs) == 14
+  assert len(specs) == 15
   for spec in specs:
     assert spec.ast_errors == [], f"{spec.query_id} had AST errors: {spec.ast_errors}"
 
@@ -870,14 +870,14 @@ def test_parse_real_shadow_ai_docs_file_if_present():
 
   runner = PlaybookRunner(TenantConfig(project_id="test-proj", customer_id="test-cust"))
   specs = runner.parse_markdown_playbook(real_doc.read_text(encoding="utf-8"))
-  assert len(specs) == 15
+  assert len(specs) == 16
   for spec in specs:
     assert spec.ast_errors == [], f"{spec.query_id} had AST errors: {spec.ast_errors}"
   macro_ids = [s.query_id for s in specs if s.plane == "MACRO_METRICS"]
   raw_ids = [s.query_id for s in specs if s.plane == "RAW_TELEMETRY"]
   capstone_ids = [s.query_id for s in specs if s.is_capstone]
   stage_b_loopback_ids = [s.query_id for s in specs if runner._is_stage_b_loopback_query(s)]
-  assert len(macro_ids) == 10
+  assert len(macro_ids) == 11
   assert len(raw_ids) == 2
   assert len(capstone_ids) == 3
   assert len(stage_b_loopback_ids) == 2
@@ -943,24 +943,24 @@ async def test_shadow_ai_three_wave_udm_loopback_execution_order(monkeypatch):
       inter_query_delay_sec=0.0,
   )
   assert res["status"] == "SUCCESS"
-  assert res["queries_discovered"] == 15
-  assert res["queries_executed"] == 15
-  # Verify all 12 Wave 1 queries run BEFORE Flush 1 -> Wave 2 (2B, 4B) -> Flush 2 -> Wave 3 (Query 10)
-  first_flush_idx = wave_trace.index("FLUSH_UDM:12")
-  assert wave_trace[:first_flush_idx] == ["WAVE1_UPSTREAM"] * 12
+  assert res["queries_discovered"] == 16
+  assert res["queries_executed"] == 16
+  # Verify all 13 Wave 1 queries run BEFORE Flush 1 -> Wave 2 (2B, 4B) -> Flush 2 -> Wave 3 (Query 10)
+  first_flush_idx = wave_trace.index("FLUSH_UDM:13")
+  assert wave_trace[:first_flush_idx] == ["WAVE1_UPSTREAM"] * 13
   assert wave_trace[first_flush_idx:] == [
-      "FLUSH_UDM:12",
-      "VERIFY_UDM:12",
+      "FLUSH_UDM:13",
+      "VERIFY_UDM:13",
       "WAVE2_2B",
       "WAVE2_4B",
       "FLUSH_UDM:2",
-      "VERIFY_UDM:14",
+      "VERIFY_UDM:15",
       "WAVE3_CAPSTONE_10",
       "FLUSH_UDM:2",
   ]
-  # Verify reports are returned in document order q01..q15
+  # Verify reports are returned in document order q01..q16
   returned_qids = [q["query_id"][:3] for q in res["queries"]]
-  assert returned_qids == [f"q{i:02d}" for i in range(1, 16)]
+  assert returned_qids == [f"q{i:02d}" for i in range(1, 17)]
 
 
 @pytest.mark.anyio
@@ -1020,22 +1020,22 @@ async def test_insider_risk_three_wave_udm_loopback_execution_order(monkeypatch)
       inter_query_delay_sec=0.0,
   )
   assert res["status"] == "SUCCESS"
-  assert res["queries_discovered"] == 15
-  assert res["queries_executed"] == 15
-  first_flush_idx = wave_trace.index("FLUSH_UDM:12")
-  assert wave_trace[:first_flush_idx] == ["WAVE1_UPSTREAM"] * 12
+  assert res["queries_discovered"] == 16
+  assert res["queries_executed"] == 16
+  first_flush_idx = wave_trace.index("FLUSH_UDM:13")
+  assert wave_trace[:first_flush_idx] == ["WAVE1_UPSTREAM"] * 13
   assert wave_trace[first_flush_idx:] == [
-      "FLUSH_UDM:12",
-      "VERIFY_UDM:12",
+      "FLUSH_UDM:13",
+      "VERIFY_UDM:13",
       "WAVE2_2B",
       "WAVE2_6B",
       "FLUSH_UDM:2",
-      "VERIFY_UDM:14",
+      "VERIFY_UDM:15",
       "WAVE3_CAPSTONE_10",
       "FLUSH_UDM:2",
   ]
   returned_qids = [q["query_id"][:3] for q in res["queries"]]
-  assert returned_qids == [f"q{i:02d}" for i in range(1, 16)]
+  assert returned_qids == [f"q{i:02d}" for i in range(1, 17)]
 
 
 @pytest.mark.anyio
