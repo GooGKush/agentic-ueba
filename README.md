@@ -1,13 +1,13 @@
 # 🛡️ Agentic UEBA: Autonomous SecOps Threat Hunter, 360° Behavioral Risk Radar & Multi-Wave Stage-Expansion Engine
 
-[![Version](https://img.shields.io/badge/version-v2.3.0-blue.svg)](README.md) [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE) [![Unit Tests](https://img.shields.io/badge/unit%20tests-94%2F94%20passing%20(100%25)-brightgreen.svg)](tests/)
+[![Version](https://img.shields.io/badge/version-v2.4.0-blue.svg)](README.md) [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE) [![Unit Tests](https://img.shields.io/badge/unit%20tests-95%2F95%20passing%20(100%25)-brightgreen.svg)](tests/)
 
 **Agentic UEBA** (`secops-agentic-hunter`) is an autonomous, dual-interface threat hunting, behavioral baselining, and **multi-wave query orchestration service** for **Google Security Operations (Chronicle SIEM & SOAR)**.
 
-It embeds the canonical **`secops-risk-metrics-multistage`** (`v2.1.4+`) and **`secops-statistical-hunter`** (`v2.8.3+`) skills as a unified **Bilateral UEBA Harness**, acting as the stateful connective tissue across time:
-* **Macro + Micro Multi-Horizon Fusion**: Combines 30-day pre-computed `metrics.*` baselines (38 Malachite catalog metrics and 11 MITRE ATT&CK kill-chain archetypes) with bounded (`<= 14d`) raw-telemetry statistical and structural models (23 canonical raw UDM archetypes including Markov 2-gram process lineage, Shannon character entropy, C2 beaconing jitter, Poisson/Fano burst dispersion, Zipfian binary rarity, EWMA burst velocity, geodesic impossible travel, and producer-consumer byte inversion).
+It embeds the canonical **`secops-risk-metrics-multistage`** (`v2.2.0+`) and **`secops-statistical-hunter`** (`v2.9.0+`) skills as a unified **Bilateral UEBA Harness**, acting as the stateful connective tissue across time:
+* **Macro + Micro Multi-Horizon Fusion**: Combines 30-day pre-computed `metrics.*` baselines (38 Malachite catalog metrics, 18 mathematical models, 34 pipeline templates including 1-Stage Empirical Quantiles `window.percentile` / Bowley Quartile Skewness / Hubert–Vandervieren Skewness-Adjusted Tukey Fences, and 11 MITRE ATT&CK kill-chain archetypes) with bounded (`<= 14d`) raw-telemetry statistical and structural models (24 canonical raw UDM archetypes across 14 statistical deformations including Non-Parametric Quantiles/Tukey Skew Fences, Per-Flow $P_{50}/P_{90}$ Tail Shape, Telemetry Ingestion-Lag Quantile Auditing, Markov 2-gram process lineage, Shannon character entropy, C2 beaconing jitter, Poisson/Fano burst dispersion, Zipfian binary rarity, EWMA burst velocity, geodesic impossible travel, and producer-consumer byte inversion).
 * **Multi-Wave Search Stage Expansion (`Stage A -> UDM -> Stage B -> Capstone`)**: Overcomes Chronicle YARA-L 2.0's single-query compiler ceiling (`<= 2` raw UDM event stages and `<= 20` outcome variables per stage) by chaining searches across **in-memory entity seeding**, **SecOps Data Tables (`%ueba_hunt_bridge`)**, and **read-after-write verified UDM loopback barriers (`PLAYBOOK_BEHAVIORAL_HUNT_MATCH`)**—expanding complex threat runbooks into **4 to 6+ effective analytical stages** over time.
-* **Autonomous SOAR Triage & Dual Control Plane**: Continuously sweeps fleetwide `USER` and `ASSET` populations (`BEHAVIORAL_RISK_RADAR_360`), triages open SOAR cases with sanitized 6-pillar HTML/SVG Case Wall cards, and exposes **14 HTTP REST endpoints** alongside **22 Model Context Protocol (`/mcp`) tools**.
+* **Autonomous SOAR Triage & Dual Control Plane**: Continuously sweeps fleetwide `USER` and `ASSET` populations (`BEHAVIORAL_RISK_RADAR_360`), triages open SOAR cases with sanitized 6-pillar HTML/SVG Case Wall cards, and exposes **14 HTTP REST endpoints** alongside **23 Model Context Protocol (`/mcp`) tools**.
 
 ---
 
@@ -350,7 +350,7 @@ Connect any MCP client (Streamable HTTP) to `https://<YOUR_SERVICE_URL>/mcp`:
 | | `run_markdown_playbook` | Executes an on-demand 3-wave pass of a Markdown hunting playbook and ingests matched UDM events. |
 | **Hybrid Compiler (2)** | `compile_hunt_pipeline` | Compiles an AST-validated multi-stage YARA-L 2.0 query, Pre-Flight card, and 1-shot probe. |
 | | `dispatch_hybrid_handoff` | Dispatches a federated `secops-threat-hunt-handoff-v1` payload to `secops-statistical-hunter`. |
-| **Specialized Hunters (12)** | `hunt_cloud_crud` | 30-day baseline Cloud CRUD write surge with companion dimensions. |
+| **Specialized Hunters (13)** | `hunt_cloud_crud` | 30-day baseline Cloud CRUD write surge with companion dimensions. |
 | | `hunt_hybrid_enrichment` | Dual-Plane 2-stage macro-baseline + micro-telemetry signature fusion. |
 | | `hunt_circadian_von_mises` | Off-hours temporal anomaly detection using a 24-hour circular von Mises clock. |
 | | `hunt_macd_momentum` | Instantaneous momentum velocity divergence (`7d` vs. `30d` anchor). |
@@ -362,6 +362,7 @@ Connect any MCP client (Streamable HTTP) to `https://<YOUR_SERVICE_URL>/mcp`:
 | | `hunt_ewma_burst` | Acute intraday kinetic rate surges via EWMA velocity divergence. |
 | | `hunt_impossible_travel` | Supersonic geodesic travel velocity (`math.geo_distance >= 900 km/h`) across consecutive logins. |
 | | `hunt_producer_consumer_inversion` | Endpoints shifting from net data consumers to net data producers ($\rho \ge 0.80$ + $Z$-score spike). |
+| | `hunt_quantile_tukey_fences` | 1-Stage Empirical Quantiles (`window.percentile`), Bowley Quartile Skewness, Moors Tail-Heaviness, and Hubert–Vandervieren Skewness-Adjusted Tukey Fences (`QUANTILE_IQR_SKEW` / `IQR_TUKEY_SKEW_FENCES`). |
 
 ---
 

@@ -1108,7 +1108,7 @@ class StrategyDecider:
             )
         )
 
-      # C5: Parametric Model Refuted on Variance-Masked or Elevated Sector -> Pivot to True 4-Stage Non-Parametric MAD!
+      # C5: Parametric Model Refuted on Variance-Masked or Elevated Sector -> Pivot to True 4-Stage Non-Parametric MAD or 3-Stage QUANTILE_IQR_SKEW!
       if t2a_model in ("MACD_MOMENTUM_VELOCITY", "LONGITUDINAL_CUSUM_DRIFT", "STANDARD_Z_SCORE", "CIRCADIAN_VON_MISES") and (
           active_sec in variance_masked or active_z >= 2.0
       ):
@@ -1143,6 +1143,40 @@ class StrategyDecider:
                 confidence_band=band,
                 confidence_breakdown=breakdown,
                 pivot_reason=pivot_why,
+            )
+        )
+
+        # C5B: 3-Stage Non-Parametric Quantiles (window.percentile), Bowley Skewness & Hubert-Vandervieren Tukey Fence
+        q_why = (
+            f"Parametric Tier 2A model (`{t2a_model}`) was compressed by heavy right-tail skewness on `{mad_metric}`. "
+            "Pivoting to 3-Stage `QUANTILE_IQR_SKEW` (`quantile_iqr_skew_3stage.yl2`) computes 1-stage empirical quantiles (`$p10, $q25, $q50, $q75, $p90`), "
+            "Bowley Quartile Skewness (`$bowley_skew`), and the Hubert-Vandervieren Skewness-Adjusted Tukey Fence (`$tukey_fence_ratio`)."
+        )
+        q_score, q_band, q_breakdown = cls.score_hypothesis_confidence(
+            model_name="QUANTILE_IQR_SKEW",
+            target_metric=mad_metric,
+            outlier_vector=active_sec,
+            ctx=ctx,
+            radar_result=radar_result,
+            is_pivot=True,
+            prior_refuted=True,
+            executed_signatures=executed_signatures,
+            empty_families=empty_families,
+        )
+        candidates.append(
+            CandidateHypothesis(
+                hypothesis_title=f"3-Stage Empirical Quantiles, Bowley Skewness & Skew-Adjusted Tukey Fence (`{mad_metric}`)",
+                selected_skill="secops-risk-metrics-multistage",
+                model_name="QUANTILE_IQR_SKEW",
+                directive_query="quantile_iqr_skew",
+                target_metric=mad_metric,
+                hypothesis_h0=f"Observed `{mad_metric}` volume sits below the Hubert-Vandervieren skewness-adjusted Tukey upper fence (`$tukey_fence_ratio < 1.5`).",
+                hypothesis_h1=f"Right-skewed historical bursts (`$bowley_skew > 0.25`) masked a true upper-fence breach on `{mad_metric}` (`$tukey_fence_ratio >= 1.5`).",
+                evidentiary_defense=q_why,
+                confidence_score=q_score,
+                confidence_band=q_band,
+                confidence_breakdown=q_breakdown,
+                pivot_reason=q_why,
             )
         )
 

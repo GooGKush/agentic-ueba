@@ -854,13 +854,19 @@ stage stage1_hourly_events {
   assert PlaybookRunner.resolve_effective_lookback_days(raw_spec, lookback_days_override=35) == 14
   assert PlaybookRunner.resolve_effective_lookback_days(macro_spec, lookback_days_override=35) == 35
 
-  # Verify new v2.1.3 / v2.8.3 effective Z extraction fields
+  # Verify new v2.1.3 / v2.8.3 and v2.2.0 / v2.9.0 effective Z extraction fields
   z_ewma, f_ewma = PlaybookRunner.extract_row_effective_z({"ewma_velocity_score": 5.4})
   assert (z_ewma, f_ewma) == (5.4, "ewma_velocity_score")
   z_pcr, f_pcr = PlaybookRunner.extract_row_effective_z({"pcr_z_score": 4.2})
   assert (z_pcr, f_pcr) == (4.2, "pcr_z_score")
   z_norm, f_norm = PlaybookRunner.extract_row_effective_z({"threat_vector_norm_sq": 36.0})
   assert (z_norm, f_norm) == (6.0, "threat_vector_norm_sq")
+  z_tukey, f_tukey = PlaybookRunner.extract_row_effective_z({"tukey_fence_ratio": 4.5, "bowley_skew": 0.42})
+  assert (z_tukey, f_tukey) == (4.5, "tukey_fence_ratio")
+  z_flow_tail, f_flow_tail = PlaybookRunner.extract_row_effective_z({"flow_tail_burst_ratio": 12.8})
+  assert (z_flow_tail, f_flow_tail) == (12.8, "flow_tail_burst_ratio")
+  z_http_tail, f_http_tail = PlaybookRunner.extract_row_effective_z({"tail_to_median_ratio": 15.0})
+  assert (z_http_tail, f_http_tail) == (15.0, "tail_to_median_ratio")
 
 
 def test_parse_real_shadow_ai_docs_file_if_present():

@@ -1096,9 +1096,15 @@ order:
         "HYBRID_METRIC_DERIVED_ASSET_AGE_2STAGE": PipelineArchitecture.HYBRID_METRIC_DERIVED_ASSET_AGE_2STAGE,
     }
 
+    quantile_enum = getattr(StatisticalModel, "QUANTILE_IQR_SKEW", StatisticalModel.MAD)
     stat_model_map = {
         "STANDARD_Z_SCORE": StatisticalModel.STANDARD_Z_SCORE,
         "MAD": StatisticalModel.MAD,
+        "QUANTILE_IQR_SKEW": quantile_enum,
+        "QUANTILE_IQR_SKEW_3STAGE": quantile_enum,
+        "QUANTILE": quantile_enum,
+        "TUKEY_FENCE": quantile_enum,
+        "BOWLEY_SKEW": quantile_enum,
         "RELATIVE_DEVIATION": StatisticalModel.RELATIVE_DEVIATION,
         "VARIANCE": StatisticalModel.VARIANCE,
         "POISSON": StatisticalModel.POISSON,
@@ -1121,8 +1127,12 @@ order:
     is_entity_graph = any(
         k in model_upper for k in ("DERIVED_", "WHOIS_", "FLEET_PREVALENCE", "ASSET_AGE", "RARE_DESTINATION")
     )
-    # 4-stage MAD requires ~30d raw window so mad_center / mad_spread compute true 30d median/MAD
-    effective_lookback = max(lookback_days, 30) if model_upper == "MAD" else lookback_days
+    # 4-stage MAD and 3-stage QUANTILE_IQR_SKEW require ~30d raw window so median/quantiles evaluate across historical buckets
+    effective_lookback = (
+        max(lookback_days, 30)
+        if model_upper in ("MAD", "QUANTILE_IQR_SKEW", "QUANTILE_IQR_SKEW_3STAGE", "QUANTILE", "TUKEY_FENCE", "BOWLEY_SKEW")
+        else lookback_days
+    )
     start_iso, end_iso = self._iso_window(effective_lookback, is_entity_graph=is_entity_graph)
 
     if model_upper in ("RARE_DESTINATION_ECG_3STAGE", "RARE_DESTINATION_ECG"):
@@ -1193,6 +1203,9 @@ order:
       top_row = rows[0]
       for score_key in (
           "modified_z",
+          "tukey_fence_ratio",
+          "flow_tail_burst_ratio",
+          "tail_to_median_ratio",
           "cusum_drift_score",
           "cusum_drift",
           "cusum_z",
@@ -1234,6 +1247,8 @@ order:
           "beacon_score",
           "flow_z",
           "personal_z",
+          "tail_heaviness",
+          "bowley_skew",
           "raw_z",
           "z_score",
           "z",
@@ -1282,6 +1297,8 @@ order:
           break
       for avg_key in (
           "median_val",
+          "q50_val",
+          "q50",
           "expected_hourly_mean",
           "hist_avg_daily",
           "daily_mean",
@@ -1322,11 +1339,39 @@ order:
         "stats_rows": len(rows),
         "executed_query": rendered,
     }
+    if rows:
+      top_row = rows[0]
+      for q_key in ("tukey_fence_ratio", "bowley_skew", "tail_heaviness", "adj_upper_fence", "q25_val", "q50_val", "q75_val", "iqr"):
+        if q_key in top_row and top_row[q_key] is not None:
+          result_dict[q_key] = round(float(top_row[q_key]), 3)
     if drift_days is not None:
       result_dict["drift_days"] = drift_days
     if max_daily_z is not None:
       result_dict["max_daily_z"] = max_daily_z
     return result_dict
+
+  async def run_quantile_iqr_skew(
+      self,
+      session: ClientSession,
+      entity: str,
+      entity_type: str = "ASSET",
+      target_metric: str = "network_bytes_outbound",
+      identifier_field: Optional[str] = None,
+      lookback_days: int = 30,
+      hypothesis_goal: Optional[str] = None,
+  ) -> Dict[str, Any]:
+    """Executes the v2.2.0 3-Stage Empirical Quantiles (window.percentile), Bowley Skewness & Skew-Adjusted Tukey Fence pipeline."""
+    return await self.run_dynamic_metric_pipeline(
+        session=session,
+        entity=entity,
+        entity_type=entity_type,
+        target_metric=target_metric,
+        model_name="QUANTILE_IQR_SKEW",
+        identifier_field=identifier_field,
+        lookback_days=max(lookback_days, 30),
+        hypothesis_goal=hypothesis_goal
+        or f"3-Stage Quantile IQR, Bowley Skewness & Hubert-Vandervieren Tukey Fence ({target_metric}) for {entity}",
+    )
 
   async def run_circadian_von_mises(
       self,
