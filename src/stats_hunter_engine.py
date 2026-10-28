@@ -623,6 +623,9 @@ class StatsHunterEngine:
     if rows:
       top_row = rows[0]
       score_keys = list(getattr(builder, "PRIMARY_SCORE_KEYS", ())) + [
+          "tukey_fence_ratio",
+          "flow_tail_burst_ratio",
+          "tail_to_median_ratio",
           "ewma_velocity_score",
           "velocity_score",
           "markov_threat_score",
@@ -630,6 +633,9 @@ class StatsHunterEngine:
           "zipf_rarity_score",
           "pcr_z_score",
           "producer_ratio",
+          "tail_ratio",
+          "bowley_skew",
+          "tail_lag_spread",
       ]
       for k in score_keys:
         if k in top_row and top_row[k] is not None:
@@ -665,3 +671,21 @@ class StatsHunterEngine:
         "stats_rows": len(rows),
         "executed_query": rendered,
     }
+
+  async def run_iqr_tukey_skew_fences(
+      self,
+      session: ClientSession,
+      entity: str,
+      entity_type: str = "ASSET",
+      event_type: str = "NETWORK_CONNECTION",
+      lookback_days: int = 14,
+  ) -> Dict[str, Any]:
+    """Executes the v2.9.0 3-Stage Non-Parametric Quantiles (window.percentile), Bowley Skewness & Skew-Adjusted Tukey Fence pipeline."""
+    return await self.run_dynamic_archetype_pipeline(
+        session=session,
+        entity=entity,
+        archetype="IQR_TUKEY_SKEW_FENCES",
+        entity_type=entity_type,
+        event_type=event_type,
+        lookback_days=lookback_days,
+    )

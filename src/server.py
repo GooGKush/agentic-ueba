@@ -407,6 +407,39 @@ async def hunt_producer_consumer_inversion(
 
 
 @mcp.tool()
+async def hunt_quantile_tukey_fences(
+    entity: str,
+    entity_type: str = "ASSET",
+    target_metric: str = "network_bytes_outbound",
+    case_id: Optional[str] = None,
+    lookback_days: int = 30,
+    post_to_case_wall: bool = True,
+) -> Dict[str, Any]:
+  """Risk Metrics (v2.2.0) / Statistical Hunter (v2.9.0): Evaluates 1-Stage Empirical Quantiles (window.percentile), Bowley Quartile Skewness, Moors Tail-Heaviness, and Hubert-Vandervieren Skewness-Adjusted Tukey Fences."""
+  from src.models import StrategyDirective
+
+  directive = StrategyDirective(
+      selected_skill="secops-risk-metrics-multistage",
+      model_name="QUANTILE_IQR_SKEW",
+      directive_query="quantile_iqr_skew",
+      target_metric=target_metric,
+  )
+  req = JITHuntRequest(
+      target_entity=entity,
+      entity_type=entity_type,
+      alert_name="Empirical Quantiles, Bowley Skewness & Skew-Adjusted Tukey Fence Investigation",
+      query="quantile_iqr_skew",
+      skill="risk-metrics",
+      lookback_days=lookback_days,
+      case_id=case_id,
+      post_to_case_wall=post_to_case_wall,
+      directive=directive,
+  )
+  resp = await engine.execute_jit_hunt(req)
+  return resp.model_dump()
+
+
+@mcp.tool()
 async def get_case_activity(timeframe: str = "1h", tag: Optional[str] = None) -> Dict[str, Any]:
   """Returns an activity summary report of cases touched by the agent (e.g. '1h', '24h', '7d', 'all'), optionally filtered by tag (e.g. 'RISK:CRITICAL', 'RISK:HIGH', 'VECTOR:EGRESS', 'SECOND_ORDER_HUNT')."""
   return watchdog.state.get_activity_report(timeframe=timeframe, tag=tag)

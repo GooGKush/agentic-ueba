@@ -748,9 +748,14 @@ class AutonomousHunterEngine:
       )
       return sec_res, sec_report
 
-    if "dynamic_metric" in sec_query or "cusum" in sec_query:
+    if "dynamic_metric" in sec_query or "cusum" in sec_query or "quantile" in sec_query or "tukey" in sec_query or "bowley" in sec_query:
       m_name = target_metric or "workspace_total_download_actions"
-      stat_model = getattr(directive, "model_name", None) or ("LONGITUDINAL_CUSUM_DRIFT" if "cusum" in sec_query else "STANDARD_Z_SCORE")
+      default_stat_model = (
+          "QUANTILE_IQR_SKEW"
+          if any(k in sec_query for k in ("quantile", "tukey", "bowley"))
+          else ("LONGITUDINAL_CUSUM_DRIFT" if "cusum" in sec_query else "STANDARD_Z_SCORE")
+      )
+      stat_model = getattr(directive, "model_name", None) or default_stat_model
       sec_res = await RiskMetricsEngine(tenant).run_dynamic_metric_pipeline(
           session=session,
           entity=exec_entity,
@@ -2560,11 +2565,15 @@ class AutonomousHunterEngine:
                 f"Deterministic Sector Fusion fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
             )
 
-        # --- 12. Deterministic Fast-Path: Dynamic Situational Metric / CUSUM Drift ---
-        elif "dynamic_metric" in query_str or "cusum" in query_str:
+        # --- 12. Deterministic Fast-Path: Dynamic Situational Metric / CUSUM Drift / Quantile IQR Skew ---
+        elif "dynamic_metric" in query_str or "cusum" in query_str or "quantile" in query_str or "tukey" in query_str or "bowley" in query_str:
           try:
             m_name = getattr(req.directive, "target_metric", None) or "workspace_total_download_actions"
-            stat_model = "cusum" if "cusum" in query_str else "zscore"
+            stat_model = (
+                "QUANTILE_IQR_SKEW"
+                if any(k in query_str for k in ("quantile", "tukey", "bowley"))
+                else ("cusum" if "cusum" in query_str else "zscore")
+            )
             dyn_res = await RiskMetricsEngine(tenant).run_dynamic_metric_pipeline(
                 session=session,
                 entity=req.target_entity,

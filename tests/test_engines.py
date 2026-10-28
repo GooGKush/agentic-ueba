@@ -2612,3 +2612,76 @@ def test_bilateral_ueba_harness_and_telemetry_physics_guardrail():
   )
   assert hunter.resolve_skill_selection(req_bilateral) == "bilateral"
 
+
+@pytest.mark.anyio
+async def test_quantile_iqr_skew_and_tukey_skew_fences_pipelines(monkeypatch):
+  """Verify v2.2.0 QUANTILE_IQR_SKEW (risk-metrics) and v2.9.0 IQR_TUKEY_SKEW_FENCES (stats-hunter) pipelines."""
+  from src.query_integrity_gate import QueryIntegrityGate
+
+  rm_engine = RiskMetricsEngine()
+  sh_engine = StatsHunterEngine()
+
+  async def _fake_rm_quantile(session, query, start_iso, end_iso):
+    QueryIntegrityGate.verify_pre_dispatch(query, raise_on_error=True)
+    assert "window.percentile(" in query
+    assert "stage quantile_envelope" in query
+    assert "$bowley_skew" in query
+    assert "$tukey_fence_ratio" in query
+    return {
+        "observed": 50000000.0,
+        "q25_val": 1000000.0,
+        "q50_val": 2500000.0,
+        "q75_val": 6000000.0,
+        "bowley_skew": 0.40,
+        "tail_heaviness": 3.1,
+        "adj_upper_fence": 12000000.0,
+        "tukey_fence_ratio": 4.17,
+        "personal_z": 2.4,
+    }
+
+  monkeypatch.setattr(rm_engine.runner, "execute_query_via_mcp", _fake_rm_quantile)
+  monkeypatch.setattr(rm_engine.runner, "parse_stats_response", lambda resp: [resp])
+
+  q_res = await rm_engine.run_quantile_iqr_skew(
+      session=None,
+      entity="wks-dev-01",
+      entity_type="ASSET",
+      target_metric="network_bytes_outbound",
+      lookback_days=14,
+  )
+  assert q_res["model"] == "QUANTILE_IQR_SKEW"
+  assert q_res["top_z_score"] == 4.17
+  assert q_res["tukey_fence_ratio"] == 4.17
+  assert q_res["bowley_skew"] == 0.4
+  assert q_res["tail_heaviness"] == 3.1
+  assert q_res["is_outlier"] is True
+
+  async def _fake_sh_tukey(session, query, start_iso, end_iso):
+    QueryIntegrityGate.verify_pre_dispatch(query, raise_on_error=True)
+    assert "window.percentile(" in query
+    assert "stage quantile_fences" in query
+    assert "$bowley_skew" in query
+    assert "$surge_ratio" in query
+    return {
+        "surge_ratio": 3.85,
+        "tukey_fence_ratio": 3.85,
+        "bowley_skew": 0.52,
+        "tail_heaviness": 2.95,
+    }
+
+  monkeypatch.setattr(sh_engine.runner, "execute_query_via_mcp", _fake_sh_tukey)
+  monkeypatch.setattr(sh_engine.runner, "parse_stats_response", lambda resp: [resp])
+
+  sh_res = await sh_engine.run_iqr_tukey_skew_fences(
+      session=None,
+      entity="wks-dev-01",
+      entity_type="ASSET",
+      event_type="NETWORK_CONNECTION",
+      lookback_days=30,
+  )
+  assert sh_res["model"] == "IQR_TUKEY_SKEW_FENCES"
+  assert sh_res["score_metric"] in ("surge_ratio", "tukey_fence_ratio")
+  assert sh_res["top_z_score"] == 3.85
+  assert sh_res["is_outlier"] is True
+
+

@@ -1,4 +1,4 @@
-# 🏛️ Agentic UEBA System Architecture (`v2.3.0`)
+# 🏛️ Agentic UEBA System Architecture (`v2.4.0`)
 
 Welcome to **Agentic UEBA** (`secops-agentic-hunter`). This document defines the production architecture, subsystem responsibilities, mathematical gates, multi-wave query orchestration contracts, and UDM ingestion schemas for the autonomous Google Security Operations (Chronicle SIEM & SOAR) threat hunting engine.
 
@@ -13,12 +13,12 @@ Welcome to **Agentic UEBA** (`secops-agentic-hunter`). This document defines the
 │                       THE BILATERAL UEBA THREAT HUNTING PARADIGM                       │
 │                                                                                        │
 │  [ TIER 1: THE BILATERAL UEBA HARNESS — Canonical Embedded Skills ]                    │
-│  • Macro Plane (secops-risk-metrics-multistage v2.1.4+):                               │
+│  • Macro Plane (secops-risk-metrics-multistage v2.2.0+):                               │
 │    - 30-day metrics.* baselines across 38 Malachite metrics & 11 KillChainArchetypes   │
-│    - 16+ mathematical models (Bayesian Peer, 4-Stage MAD, Hurdle, CUSUM, Triad, 360°)  │
-│  • Micro / Windowed Plane (secops-statistical-hunter v2.8.3+):                         │
-│    - Bounded (<= 14d) raw UDM statistical & structural models across 23 archetypes     │
-│    - Markov 2-gram lineage, Shannon entropy, C2 CV, Fano burst, Zipf, EWMA, Geo, PCR   │
+│    - 18 mathematical models & 34 templates (Quantile/IQR/Skew, MAD, Peer, CUSUM, 360°) │
+│  • Micro / Windowed Plane (secops-statistical-hunter v2.9.0+):                         │
+│    - Bounded (<= 14d) raw UDM statistical & structural models across 24 archetypes     │
+│    - Tukey/Bowley Skew Fences, Markov, Shannon, C2 CV, Fano, Zipf, EWMA, Geo, PCR, Lag │
 │  • Normalization Layer: Calibrated Risk Index (CRI in [0, 100], Sigmoid alpha = 0.6)   │
 │                                                                                        │
 │                   │ (CleanHandOffPayload / UDM Loopback / %ueba_hunt_bridge)           │

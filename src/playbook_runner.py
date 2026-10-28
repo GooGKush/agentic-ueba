@@ -340,7 +340,22 @@ class PlaybookRunner:
         return 1
     if "playbook_behavioral_hunt_match" in combined:
       return 7
-    if any(k in combined for k in ("zipf", "markov", "hurdle", "mad", "poisson_rare", "beta_binomial", "by 1d")):
+    if any(
+        k in combined
+        for k in (
+            "zipf",
+            "markov",
+            "hurdle",
+            "mad",
+            "quantile",
+            "tukey",
+            "bowley",
+            "iqr",
+            "poisson_rare",
+            "beta_binomial",
+            "by 1d",
+        )
+    ):
       return 7
     return 1
 
@@ -433,7 +448,7 @@ class PlaybookRunner:
       else:
         if stripped == "```":
           block_text = "\n".join(fence_lines).strip()
-          if fence_lang in ("yara", "yaral", "yl2", ""):
+          if fence_lang in ("yara", "yaral", "yara-l", "yl2", ""):
             if re.search(r"^\s*stage\s+[a-zA-Z0-9_]+\s*\{", block_text, re.MULTILINE):
               raw_blocks.append((heading_at_fence_start, block_text))
           fence_open = False
@@ -786,6 +801,9 @@ class PlaybookRunner:
         "personal_z",
         "m_z_score",
         "modified_z",
+        "tukey_fence_ratio",
+        "flow_tail_burst_ratio",
+        "tail_to_median_ratio",
         "fused_threat_score",
         "threat_score",
         "composite_risk",
@@ -812,6 +830,12 @@ class PlaybookRunner:
         "intensity_z",
         "surprisal_score",
         "fano_factor",
+        "tail_heaviness",
+        "tail_ratio",
+        "bowley_skew",
+        "qcd",
+        "tail_lag_spread",
+        "surge_ratio",
     )
     for field in direct_z_fields:
       val = row.get(field)
