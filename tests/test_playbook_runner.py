@@ -964,6 +964,81 @@ async def test_shadow_ai_three_wave_udm_loopback_execution_order(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_insider_risk_three_wave_udm_loopback_execution_order(monkeypatch):
+  real_doc = Path("/usr/local/google/home/kushmerek/projects/docs/insider-risk-dlp-ueba-hunting.md")
+  if not real_doc.is_file():
+    pytest.skip("Local insider-risk-dlp-ueba-hunting.md not present in this environment")
+
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  risk_eng = RiskMetricsEngine(tenant)
+  runner = PlaybookRunner(tenant_config=tenant, risk_engine=risk_eng)
+
+  wave_trace = []
+  ingested_batches = []
+
+  async def fake_execute(session, query, start_iso, end_iso):
+    if "$indexed_events = count(metadata.id)" in query:
+      total_ingested = sum(len(b) for b in ingested_batches)
+      wave_trace.append(f"VERIFY_UDM:{total_ingested}")
+      return {"stats": [{"run_id": "run_insider_risk_wave_test", "indexed_events": total_ingested}]}
+    if ":q[0-9]+_query_2a" in query:
+      wave_trace.append("WAVE2_2B")
+      return {"stats": [{"entity": "MUGATU\\hanselmcdonald", "unified_threat_score": 5.2}]}
+    if ":q[0-9]+_query_6a" in query:
+      wave_trace.append("WAVE2_6B")
+      return {"stats": [{"user": "tim.smith", "fano_factor": 4.8, "unified_threat_score": 5.8}]}
+    if ":q[0-9]+_query_[1-9]" in query:
+      wave_trace.append("WAVE3_CAPSTONE_10")
+      return {
+          "stats": [
+              {
+                  "entity": "MUGATU\\hanselmcdonald",
+                  "distinct_scenarios_matched": 3,
+                  "capstone_threat_norm_sq": 49.0,
+                  "unified_threat_score": 8.4,
+              }
+          ]
+      }
+    wave_trace.append("WAVE1_UPSTREAM")
+    return {"stats": [{"entity": "MUGATU\\hanselmcdonald", "unified_threat_score": 4.2}]}
+
+  def fake_ingest(events):
+    ingested_batches.append(list(events))
+    wave_trace.append(f"FLUSH_UDM:{len(events)}")
+    return {"status": "SUCCESS", "events_ingested": len(events), "batches": 1}
+
+  monkeypatch.setattr(risk_eng.runner, "execute_query_via_mcp", fake_execute)
+  monkeypatch.setattr(risk_eng, "ingest_udm_events", fake_ingest)
+
+  res = await runner.execute_playbook(
+      session=AsyncMock(),
+      source=str(real_doc),
+      playbook_id="insider-risk-dlp-ueba",
+      run_id="run_insider_risk_wave_test",
+      query_concurrency=4,
+      udm_validation_poll_sec=0.0,
+      inter_query_delay_sec=0.0,
+  )
+  assert res["status"] == "SUCCESS"
+  assert res["queries_discovered"] == 15
+  assert res["queries_executed"] == 15
+  first_flush_idx = wave_trace.index("FLUSH_UDM:12")
+  assert wave_trace[:first_flush_idx] == ["WAVE1_UPSTREAM"] * 12
+  assert wave_trace[first_flush_idx:] == [
+      "FLUSH_UDM:12",
+      "VERIFY_UDM:12",
+      "WAVE2_2B",
+      "WAVE2_6B",
+      "FLUSH_UDM:2",
+      "VERIFY_UDM:14",
+      "WAVE3_CAPSTONE_10",
+      "FLUSH_UDM:2",
+  ]
+  returned_qids = [q["query_id"][:3] for q in res["queries"]]
+  assert returned_qids == [f"q{i:02d}" for i in range(1, 16)]
+
+
+@pytest.mark.anyio
 async def test_federated_bridge_bilateral_exploit_and_shadow_ai(monkeypatch):
   from src.federated_bridge import FederatedBridge
 
