@@ -3,16 +3,25 @@
 
 """Unit and integration tests for PlaybookRunner, Watchdog Playbook Scheduler, and REST API."""
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
+import math
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 import pytest
 
+from src import harness_truth
 from src.config import TenantConfig
 from src.playbook_runner import PlaybookRunner
+from src.query_integrity_gate import QueryIntegrityGate
 from src.risk_metrics_engine import RiskMetricsEngine
 from src.watchdog import WatchdogDaemon
+
+
+def _docs_dir() -> Path:
+  env_docs = os.environ.get("DOCS_ROOT")
+  return Path(env_docs) if env_docs else Path.home() / "projects" / "docs"
 
 
 SAMPLE_PLAYBOOK_MD = """# Sample UEBA Hunting Playbook
@@ -163,6 +172,365 @@ order:
 """
 
 
+CAPSTONE_PLAYBOOK_MD = """# Cloud Threats Playbook with Option 1 Piecewise & Option 3 Capstone
+
+### 1. Query 3: Unified Cold-Start Hurdle & 30-Day MAD Secret Harvesting
+
+```yara
+// ============================================================================
+// Goal: Detect secret harvesting across both cold-start (<5 active days) and mature (>=5 active days) identities.
+// Statistical Model: Piecewise Two-Part Hurdle + 4-Stage 30-Day MAD
+// ============================================================================
+
+stage stage1_daily {
+    metadata.event_type = "RESOURCE_READ"
+    principal.user.userid = $user
+    $user != ""
+
+  match:
+    $user by 1d
+
+  outcome:
+    $daily_val = count(metadata.id)
+    $distinct_secrets = count_distinct(target.resource.name)
+}
+
+stage stage2_median {
+    $user = $stage1_daily.user
+    $daily_val = $stage1_daily.daily_val
+
+  match:
+    $user
+
+  outcome:
+    $median_val = percentile($daily_val, 50)
+    $active_days = count($daily_val)
+}
+
+stage stage3_mad {
+    $user = $stage1_daily.user
+    $daily_val = $stage1_daily.daily_val
+    $user = $stage2_median.user
+    $median_val = $stage2_median.median_val
+
+  match:
+    $user
+
+  outcome:
+    $abs_dev = math.abs($daily_val - $median_val)
+    $mad_raw = percentile($abs_dev, 50)
+    $baseline_median = max($median_val)
+    $baseline_days = max($stage2_median.active_days)
+}
+
+$user = $stage1_daily.user
+$observed_val = $stage1_daily.daily_val
+$observed_secrets = $stage1_daily.distinct_secrets
+$day_bucket = $stage1_daily.window_start
+$user = $stage3_mad.user
+
+match:
+  $user, $day_bucket
+
+outcome:
+  $obs = max($observed_val)
+  $secrets = max($observed_secrets)
+  $med = max($stage3_mad.baseline_median)
+  $mad = max($stage3_mad.mad_raw)
+  $raw_active_days = max($stage3_mad.baseline_days)
+  $scaled_mad = $mad * 1.4826
+  $safe_mad = if($scaled_mad > 0, $scaled_mad, 1.0)
+  $modified_z = ($obs - $med) / $safe_mad
+  $hurdle_rarity_boost = if($raw_active_days <= 4, 3.0, 1.0)
+  $hurdle_threat_score = math.log($obs + 1) * $secrets * $hurdle_rarity_boost / 4.0
+  $unified_threat_score = if($raw_active_days <= 4, $hurdle_threat_score, $modified_z)
+
+condition:
+  $obs >= 5 and $unified_threat_score >= 3.5
+
+order:
+  $unified_threat_score desc
+```
+
+### 2. Capstone Query: Multi-Scenario Entity Convergence via UDM Loopback
+
+```yara
+// ============================================================================
+// Goal: Correlate entities matching >= 2 distinct queries in this playbook via PLAYBOOK_BEHAVIORAL_HUNT_MATCH.
+// Statistical Model: 2-Stage UDM Loopback Euclidean L2 Norm Convergence
+// ============================================================================
+
+stage stage1_query_hits {
+    metadata.event_type = "GENERIC_EVENT"
+    metadata.product_event_type = "PLAYBOOK_BEHAVIORAL_HUNT_MATCH"
+    principal.user.userid = $entity
+    security_result.rule_name = $rule_name
+    $entity != ""
+    $rule_name != ""
+
+  match:
+    $entity, $rule_name by 1d
+
+  outcome:
+    $query_z = max(security_result.confidence_score)
+    $query_cri = max(security_result.risk_score)
+}
+
+$entity = $stage1_query_hits.entity
+$day_bucket = $stage1_query_hits.window_start
+
+match:
+  $entity, $day_bucket by 1d
+
+outcome:
+  $distinct_queries = count_distinct($stage1_query_hits.rule_name)
+  $triggered_queries = array_distinct($stage1_query_hits.rule_name)
+  $capstone_threat_norm_sq = sum($stage1_query_hits.query_z * $stage1_query_hits.query_z)
+  $max_single_cri = max($stage1_query_hits.query_cri)
+
+condition:
+  $distinct_queries >= 2 and $capstone_threat_norm_sq >= 25.0
+
+order:
+  $capstone_threat_norm_sq desc
+```
+"""
+
+
+WINDOWS_PLAYBOOK_MD = """# Window Contract Playbook
+
+### 1. Macro Daily Egress Z-Score
+
+```yara
+// Goal: Score daily outbound bytes per host against the 30-day metrics baseline.
+// Statistical Model: Parametric Z-Score (metrics.network_bytes_outbound)
+stage stage1_extract {
+    network.sent_bytes > 0
+    network.sent_bytes < 1000000000000000
+    principal.asset.ip = $entity
+    $entity != ""
+
+  match:
+    $entity by 1d
+
+  outcome:
+    $observed_val = sum(network.sent_bytes)
+    $historical_avg = max(metrics.network_bytes_outbound(
+        period: 1d, window: 30d, metric: value_sum, agg: avg,
+        principal.asset.ip: principal.asset.ip
+    ))
+    $historical_stddev = max(metrics.network_bytes_outbound(
+        period: 1d, window: 30d, metric: value_sum, agg: stddev,
+        principal.asset.ip: principal.asset.ip
+    ))
+}
+
+$entity = $stage1_extract.entity
+
+match:
+  $entity
+
+outcome:
+  $observed = max($stage1_extract.observed_val)
+  $baseline_mean = max($stage1_extract.historical_avg)
+  $baseline_stddev = max($stage1_extract.historical_stddev)
+  $safe_stddev = if($baseline_stddev > 44979.0, $baseline_stddev, 44979.0)
+  $z_score = ($observed - $baseline_mean) / $safe_stddev
+
+condition:
+  $z_score >= 3.0
+```
+
+### 2. Macro HTTP Surge to Rare Domains (Entity Graph)
+
+```yara
+// Goal: Detect hosts with an HTTP surge toward rare domains (10-day prevalence).
+// Statistical Model: Hybrid 30-Day Z-Score + DERIVED_CONTEXT prevalence
+stage http_metric_anomalies {
+    network.http.method != ""
+    principal.asset.hostname = $host
+    target.hostname = $domain
+    $host != ""
+    $domain != ""
+
+  match:
+    $host, $domain by 1d
+
+  outcome:
+    $http_count = count(metadata.id)
+    $b_avg = max(metrics.http_queries_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.asset.hostname: principal.asset.hostname
+    ))
+}
+
+$host = $http_metric_anomalies.host
+$domain = $http_metric_anomalies.domain
+$g.graph.metadata.entity_type = "DOMAIN_NAME"
+$g.graph.metadata.source_type = "DERIVED_CONTEXT"
+$g.graph.entity.domain.name = $domain
+$g.graph.entity.domain.prevalence.day_count = 10
+$g.graph.entity.domain.prevalence.rolling_max <= 3
+
+match:
+  $host, $domain
+
+outcome:
+  $observed_http = max($http_metric_anomalies.http_count)
+  $baseline_mean = max($http_metric_anomalies.b_avg)
+  $prevalence = max($g.graph.entity.domain.prevalence.rolling_max)
+
+condition:
+  $observed_http >= 10
+```
+
+### 3. Macro Quantile Egress Fence
+
+```yara
+// Goal: Quantile egress fence over raw daily bytes with a scored-day gate.
+// Statistical Model: Non-Parametric Quantile Tukey Fence
+stage stage1_extract {
+    network.sent_bytes > 0
+    network.sent_bytes < 1000000000000000
+    principal.asset.hostname = $host
+    $host != ""
+
+  match:
+    $host by 1d
+
+  outcome:
+    $observed_val = sum(network.sent_bytes)
+    $in_scoring_window = max(if(timestamp.get_date(metadata.event_timestamp.seconds) >= "2026-10-29", 1, 0))
+    $historical_avg = max(metrics.network_bytes_outbound(
+        period: 1d, window: 30d, metric: value_sum, agg: avg,
+        principal.asset.hostname: principal.asset.hostname
+    ))
+}
+
+stage quantile_envelope {
+    $host = $stage1_extract.host
+
+  match:
+    $host
+
+  outcome:
+    $q75 = window.percentile($stage1_extract.observed_val, 75)
+    $raw_active_days = count_distinct($stage1_extract.window_start)
+}
+
+$host = $stage1_extract.host
+$host = $quantile_envelope.host
+$ws = $stage1_extract.window_start
+
+match:
+  $host, $ws by 1d
+
+outcome:
+  $observed = sum($stage1_extract.observed_val)
+  $q75_val = max($quantile_envelope.q75)
+  $raw_active_days = max($quantile_envelope.raw_active_days)
+  $in_scoring_window = max($stage1_extract.in_scoring_window)
+  $safe_q75 = if($q75_val > 0, $q75_val, 1.0)
+  $tukey_fence_ratio = $observed / $safe_q75
+
+condition:
+  $in_scoring_window = 1 and $raw_active_days >= 7 and $tukey_fence_ratio >= 2.0
+```
+
+### 4. Raw Hourly Burst
+
+```yara
+// Goal: Hourly authentication failure burst per user.
+// Statistical Model: Poisson burst (by 1h)
+stage hourly_failures {
+    metadata.event_type = "USER_LOGIN"
+    security_result.action = "BLOCK"
+    principal.user.userid = $user
+    $user != ""
+
+  match:
+    $user by 1h
+
+  outcome:
+    $hourly_count = count(metadata.id)
+}
+
+$user = $hourly_failures.user
+
+match:
+  $user
+
+outcome:
+  $peak_hour = max($hourly_failures.hourly_count)
+
+condition:
+  $peak_hour >= 20
+```
+
+### 5. Raw Daily Process MAD
+
+```yara
+// Goal: Daily process launch MAD outlier per host.
+// Statistical Model: Raw MAD modified Z (by 1d)
+stage daily_counts {
+    metadata.event_type = "PROCESS_LAUNCH"
+    principal.hostname = $host
+    $host != ""
+
+  match:
+    $host by 1d
+
+  outcome:
+    $daily_count = count(metadata.id)
+}
+
+$host = $daily_counts.host
+
+match:
+  $host
+
+outcome:
+  $obs = max($daily_counts.daily_count)
+
+condition:
+  $obs >= 5
+```
+
+### 6. Capstone Query: Multi-Scenario Entity Convergence via UDM Loopback
+
+```yara
+// Goal: Correlate entities matching >= 2 distinct queries in this playbook via PLAYBOOK_BEHAVIORAL_HUNT_MATCH.
+// Statistical Model: 2-Stage UDM Loopback Euclidean L2 Norm Convergence
+stage stage1_query_hits {
+    metadata.event_type = "GENERIC_EVENT"
+    metadata.product_event_type = "PLAYBOOK_BEHAVIORAL_HUNT_MATCH"
+    principal.user.userid = $entity
+    security_result.rule_name = $rule_name
+    $entity != ""
+    $rule_name != ""
+
+  match:
+    $entity, $rule_name by 1d
+
+  outcome:
+    $query_z = max(security_result.confidence_score)
+}
+
+$entity = $stage1_query_hits.entity
+
+match:
+  $entity
+
+outcome:
+  $distinct_queries = count_distinct($stage1_query_hits.rule_name)
+  $capstone_threat_norm_sq = sum($stage1_query_hits.query_z * $stage1_query_hits.query_z)
+
+condition:
+  $distinct_queries >= 2 and $capstone_threat_norm_sq >= 25.0
+```
+"""
+
+
 @pytest.fixture
 def anyio_backend():
   return "asyncio"
@@ -226,7 +594,7 @@ def test_parse_markdown_playbook_and_seeded_query_handling():
 
 
 def test_parse_real_php2shell_docs_file_if_present():
-  real_doc = Path("/usr/local/google/home/kushmerek/projects/docs/php2shell-ueba-hunting.md")
+  real_doc = _docs_dir() / "php2shell-ueba-hunting.md"
   if not real_doc.is_file():
     pytest.skip("Local docs repo not present in this environment")
 
@@ -454,129 +822,7 @@ async def test_server_playbook_rest_endpoints(tmp_path, monkeypatch):
 
 @pytest.mark.anyio
 async def test_option1_piecewise_unification_and_option3_capstone_udm_loopback(tmp_path, monkeypatch):
-  capstone_md = """# Cloud Threats Playbook with Option 1 Piecewise & Option 3 Capstone
-
-### 1. Query 3: Unified Cold-Start Hurdle & 30-Day MAD Secret Harvesting
-
-```yara
-// ============================================================================
-// Goal: Detect secret harvesting across both cold-start (<5 active days) and mature (>=5 active days) identities.
-// Statistical Model: Piecewise Two-Part Hurdle + 4-Stage 30-Day MAD
-// ============================================================================
-
-stage stage1_daily {
-    metadata.event_type = "RESOURCE_READ"
-    principal.user.userid = $user
-    $user != ""
-
-  match:
-    $user by 1d
-
-  outcome:
-    $daily_val = count(metadata.id)
-    $distinct_secrets = count_distinct(target.resource.name)
-}
-
-stage stage2_median {
-    $user = $stage1_daily.user
-    $daily_val = $stage1_daily.daily_val
-
-  match:
-    $user
-
-  outcome:
-    $median_val = percentile($daily_val, 50)
-    $active_days = count($daily_val)
-}
-
-stage stage3_mad {
-    $user = $stage1_daily.user
-    $daily_val = $stage1_daily.daily_val
-    $user = $stage2_median.user
-    $median_val = $stage2_median.median_val
-
-  match:
-    $user
-
-  outcome:
-    $abs_dev = math.abs($daily_val - $median_val)
-    $mad_raw = percentile($abs_dev, 50)
-    $baseline_median = max($median_val)
-    $baseline_days = max($stage2_median.active_days)
-}
-
-$user = $stage1_daily.user
-$observed_val = $stage1_daily.daily_val
-$observed_secrets = $stage1_daily.distinct_secrets
-$day_bucket = $stage1_daily.window_start
-$user = $stage3_mad.user
-
-match:
-  $user, $day_bucket
-
-outcome:
-  $obs = max($observed_val)
-  $secrets = max($observed_secrets)
-  $med = max($stage3_mad.baseline_median)
-  $mad = max($stage3_mad.mad_raw)
-  $raw_active_days = max($stage3_mad.baseline_days)
-  $scaled_mad = $mad * 1.4826
-  $safe_mad = if($scaled_mad > 0, $scaled_mad, 1.0)
-  $modified_z = ($obs - $med) / $safe_mad
-  $hurdle_rarity_boost = if($raw_active_days <= 4, 3.0, 1.0)
-  $hurdle_threat_score = math.log($obs + 1) * $secrets * $hurdle_rarity_boost / 4.0
-  $unified_threat_score = if($raw_active_days <= 4, $hurdle_threat_score, $modified_z)
-
-condition:
-  $obs >= 5 and $unified_threat_score >= 3.5
-
-order:
-  $unified_threat_score desc
-```
-
-### 2. Capstone Query: Multi-Scenario Entity Convergence via UDM Loopback
-
-```yara
-// ============================================================================
-// Goal: Correlate entities matching >= 2 distinct queries in this playbook via PLAYBOOK_BEHAVIORAL_HUNT_MATCH.
-// Statistical Model: 2-Stage UDM Loopback Euclidean L2 Norm Convergence
-// ============================================================================
-
-stage stage1_query_hits {
-    metadata.event_type = "GENERIC_EVENT"
-    metadata.product_event_type = "PLAYBOOK_BEHAVIORAL_HUNT_MATCH"
-    principal.user.userid = $entity
-    security_result.rule_name = $rule_name
-    $entity != ""
-    $rule_name != ""
-
-  match:
-    $entity, $rule_name by 1d
-
-  outcome:
-    $query_z = max(security_result.confidence_score)
-    $query_cri = max(security_result.risk_score)
-}
-
-$entity = $stage1_query_hits.entity
-$day_bucket = $stage1_query_hits.window_start
-
-match:
-  $entity, $day_bucket by 1d
-
-outcome:
-  $distinct_queries = count_distinct($stage1_query_hits.rule_name)
-  $triggered_queries = array_distinct($stage1_query_hits.rule_name)
-  $capstone_threat_norm_sq = sum($stage1_query_hits.query_z * $stage1_query_hits.query_z)
-  $max_single_cri = max($stage1_query_hits.query_cri)
-
-condition:
-  $distinct_queries >= 2 and $capstone_threat_norm_sq >= 25.0
-
-order:
-  $capstone_threat_norm_sq desc
-```
-"""
+  capstone_md = CAPSTONE_PLAYBOOK_MD
   md_file = tmp_path / "cloud-threats-ueba-hunting.md"
   md_file.write_text(capstone_md, encoding="utf-8")
 
@@ -660,7 +906,11 @@ order:
   assert res["queries"][0]["matched_entities"][0]["score_field"] == "unified_threat_score"
   assert res["queries"][0]["matched_entities"][0]["effective_z"] == 5.4
   assert res["queries"][1]["matched_entities"][0]["score_field"] == "capstone_threat_norm_sq"
-  assert res["queries"][1]["matched_entities"][0]["effective_z"] == 6.0
+  # Remediated harness (WS7-02): squared composites map onto the Z-equivalent scale through the
+  # skills' score-semantics registry instead of reading sqrt(sum Z^2) as sigma.
+  assert res["queries"][1]["matched_entities"][0]["effective_z"] == round(
+      harness_truth.constants().score_to_z_equivalent("capstone_threat_norm_sq", 36.0), 2
+  )
 
 
 @pytest.mark.anyio
@@ -854,15 +1104,20 @@ stage stage1_hourly_events {
   assert PlaybookRunner.resolve_effective_lookback_days(raw_spec, lookback_days_override=35) == 14
   assert PlaybookRunner.resolve_effective_lookback_days(macro_spec, lookback_days_override=35) == 35
 
-  # Verify new v2.1.3 / v2.8.3 and v2.2.0 / v2.9.0 effective Z extraction fields
+  # Verify new v2.1.3 / v2.8.3 and v2.2.0 / v2.9.0 effective Z extraction fields. Native scores map onto
+  # the Z-equivalent scale through the harness score-semantics registry (WS7-02); keys outside the
+  # registry stay linear around the 3.0 anchor.
+  semantics = harness_truth.constants()
   z_ewma, f_ewma = PlaybookRunner.extract_row_effective_z({"ewma_velocity_score": 5.4})
-  assert (z_ewma, f_ewma) == (5.4, "ewma_velocity_score")
+  assert f_ewma == "ewma_velocity_score"
+  assert z_ewma == pytest.approx(semantics.score_to_z_equivalent("ewma_velocity_score", 5.4))
   z_pcr, f_pcr = PlaybookRunner.extract_row_effective_z({"pcr_z_score": 4.2})
   assert (z_pcr, f_pcr) == (4.2, "pcr_z_score")
   z_norm, f_norm = PlaybookRunner.extract_row_effective_z({"threat_vector_norm_sq": 36.0})
   assert (z_norm, f_norm) == (6.0, "threat_vector_norm_sq")
   z_tukey, f_tukey = PlaybookRunner.extract_row_effective_z({"tukey_fence_ratio": 4.5, "bowley_skew": 0.42})
-  assert (z_tukey, f_tukey) == (4.5, "tukey_fence_ratio")
+  assert f_tukey == "tukey_fence_ratio"
+  assert z_tukey == pytest.approx(semantics.score_to_z_equivalent("tukey_fence_ratio", 4.5))
   z_flow_tail, f_flow_tail = PlaybookRunner.extract_row_effective_z({"flow_tail_burst_ratio": 12.8})
   assert (z_flow_tail, f_flow_tail) == (12.8, "flow_tail_burst_ratio")
   z_http_tail, f_http_tail = PlaybookRunner.extract_row_effective_z({"tail_to_median_ratio": 15.0})
@@ -870,7 +1125,7 @@ stage stage1_hourly_events {
 
 
 def test_parse_real_shadow_ai_docs_file_if_present():
-  real_doc = Path("/usr/local/google/home/kushmerek/projects/docs/shadow-ai-agentic-ueba-hunting.md")
+  real_doc = _docs_dir() / "shadow-ai-agentic-ueba-hunting.md"
   if not real_doc.is_file():
     pytest.skip("Local shadow-ai-agentic-ueba-hunting.md not present in this environment")
 
@@ -894,7 +1149,7 @@ def test_parse_real_shadow_ai_docs_file_if_present():
 
 @pytest.mark.anyio
 async def test_shadow_ai_three_wave_udm_loopback_execution_order(monkeypatch):
-  real_doc = Path("/usr/local/google/home/kushmerek/projects/docs/shadow-ai-agentic-ueba-hunting.md")
+  real_doc = _docs_dir() / "shadow-ai-agentic-ueba-hunting.md"
   if not real_doc.is_file():
     pytest.skip("Local shadow-ai-agentic-ueba-hunting.md not present in this environment")
 
@@ -971,7 +1226,7 @@ async def test_shadow_ai_three_wave_udm_loopback_execution_order(monkeypatch):
 
 @pytest.mark.anyio
 async def test_insider_risk_three_wave_udm_loopback_execution_order(monkeypatch):
-  real_doc = Path("/usr/local/google/home/kushmerek/projects/docs/insider-risk-dlp-ueba-hunting.md")
+  real_doc = _docs_dir() / "insider-risk-dlp-ueba-hunting.md"
   if not real_doc.is_file():
     pytest.skip("Local insider-risk-dlp-ueba-hunting.md not present in this environment")
 
@@ -1220,7 +1475,7 @@ condition:
 
 def test_all_curated_playbooks_three_wave_ast_and_outcome_compliance():
   import re
-  docs_dir = Path("/usr/local/google/home/kushmerek/projects/docs")
+  docs_dir = _docs_dir()
   if not docs_dir.is_dir():
     pytest.skip("docs repo not present")
   runner = PlaybookRunner()
@@ -1260,8 +1515,758 @@ def test_all_curated_playbooks_three_wave_ast_and_outcome_compliance():
         assert len(vars_defined) <= 20, f"{fname} {s.query_id} exceeds 20 outcome vars ({len(vars_defined)})"
 
 
+# ---------------------------------------------------------------------------
+# Remediated harness contract (src.harness_truth): score semantics, CRI, verdicts,
+# write-back and loopback gates, run-ID provenance and Mode A / Entity Graph windows.
+# ---------------------------------------------------------------------------
 
 
+def _ingesting_runner(monkeypatch, fake_execute):
+  tenant = TenantConfig(project_id="test-proj", customer_id="test-cust")
+  risk_eng = RiskMetricsEngine(tenant)
+  runner = PlaybookRunner(tenant_config=tenant, risk_engine=risk_eng)
+  ingested = []
+
+  def fake_ingest(events):
+    ingested.extend(events)
+    return {"status": "SUCCESS", "events_ingested": len(events), "batches": 1}
+
+  monkeypatch.setattr(risk_eng.runner, "execute_query_via_mcp", fake_execute)
+  monkeypatch.setattr(risk_eng, "ingest_udm_events", fake_ingest)
+  return runner, ingested
 
 
+def _labels(event):
+  return {lbl["key"]: lbl["value"] for lbl in event["target"]["resource"]["attribute"]["labels"]}
 
+
+def test_extract_row_effective_z_maps_native_scores_through_harness_semantics():
+  semantics = harness_truth.constants()
+  for field, value in (
+      ("z_score", 4.8),
+      ("modified_z", 4.2),
+      ("fano_factor", 7.0),
+      ("tukey_fence_ratio", 2.0),
+      ("surge_ratio", 2.5),
+      ("shannon_entropy_score", 6.6),
+      ("zipf_rarity_score", 3.0),
+      ("ewma_velocity_score", 5.4),
+      ("cv", 0.2),
+      ("regularized_failure_prob", 0.5),
+      ("poisson_z_sq", 49.0),
+      ("capstone_threat_norm_sq", 36.0),
+  ):
+    z, f = PlaybookRunner.extract_row_effective_z({field: value})
+    assert f == field
+    assert z == pytest.approx(semantics.score_to_z_equivalent(field, value)), field
+  # A negative Z is not an outlier: it maps to the canonical zero floor (CRI 0), not through as-is.
+  assert PlaybookRunner.extract_row_effective_z({"z_score": -1.5}) == (0.0, "z_score")
+
+
+def test_match_event_uses_canonical_cri_bands_verdicts_and_actions():
+  runner = PlaybookRunner(TenantConfig(project_id="test-proj", customer_id="test-cust"))
+  ip_spec = runner.parse_markdown_playbook(SAMPLE_PLAYBOOK_MD)[1]
+  user_spec = runner.parse_markdown_playbook(CAPSTONE_PLAYBOOK_MD)[0]
+  common = dict(
+      playbook_id="pb-harness",
+      playbook_source="local",
+      playbook_sha256="0" * 64,
+      run_timestamp_iso="2026-10-30T10:00:00Z",
+      evaluated_day="2026-10-29",
+      run_id="run_pb_harness",
+  )
+
+  low = runner.build_playbook_match_udm_event(spec=ip_spec, row={"entity": "203.0.113.10", "z_score": 2.0}, **common)
+  low_cri = harness_truth.calculate_cri(2.0)
+  assert low["security_result"][0]["risk_score"] == low_cri  # no artificial CRI floor
+  assert low["security_result"][0]["severity"] == harness_truth.cri_band(low_cri)[0]
+  assert _labels(low)["Verdict"] == harness_truth.verdict_for(low_cri)
+  assert _labels(low)["Recommended Action"] == harness_truth.recommended_action(low_cri)
+  assert harness_truth.RECOMMENDATION_NOTE in _labels(low)["Action Guidance"]
+
+  critical_z = 9.0
+  critical_cri = harness_truth.calculate_cri(critical_z)
+  assert harness_truth.verdict_for(critical_cri) == "CRITICAL_OUTLIER"
+  ip_event = runner.build_playbook_match_udm_event(spec=ip_spec, row={"entity": "203.0.113.10", "z_score": critical_z}, **common)
+  user_event = runner.build_playbook_match_udm_event(spec=user_spec, row={"user": "alice@corp.local", "z_score": critical_z}, **common)
+  host_event = runner.build_playbook_match_udm_event(spec=ip_spec, row={"host": "web-prod-01", "z_score": critical_z}, **common)
+  assert _labels(ip_event)["Recommended Action"] == harness_truth.recommended_action(critical_cri, containment_action="THROTTLE_EGRESS")
+  assert _labels(user_event)["Recommended Action"] == harness_truth.recommended_action(critical_cri, containment_action="LOCK_ACCOUNT")
+  assert _labels(host_event)["Recommended Action"] == harness_truth.recommended_action(critical_cri, containment_action="ISOLATE_HOST")
+  assert user_event["security_result"][0]["severity"] == "CRITICAL"
+
+
+@pytest.mark.anyio
+async def test_udm_writeback_is_gated_by_harness_cri_threshold(tmp_path, monkeypatch):
+  md_file = tmp_path / "writeback-gate.md"
+  md_file.write_text(SAMPLE_PLAYBOOK_MD, encoding="utf-8")
+
+  async def fake_execute(session, query, start_iso, end_iso):
+    if "stage1_bailout" in query:
+      return {"stats": [{"target_ip": "203.0.113.1", "z_score": 2.5}, {"target_ip": "203.0.113.2", "z_score": 3.5}]}
+    return {"stats": []}
+
+  runner, ingested = _ingesting_runner(monkeypatch, fake_execute)
+  threshold = harness_truth.writeback_cri_threshold()
+  low_cri, high_cri = harness_truth.calculate_cri(2.5), harness_truth.calculate_cri(3.5)
+  assert low_cri < threshold <= high_cri
+
+  res = await runner.execute_playbook(
+      session=AsyncMock(), source=str(md_file), run_id="run_writeback_gate", inter_query_delay_sec=0.0
+  )
+  assert [e["principal"]["ip"] for e in ingested] == [["203.0.113.2"]]
+  assert ingested[0]["security_result"][0]["risk_score"] == high_cri
+  assert res["writeback_cri_threshold"] == threshold
+  assert res["total_matches_found"] == 2
+  assert res["total_matches_emitted"] == 1
+  assert res["total_matches_below_writeback_cri"] == 1
+  assert res["queries"][0]["matches_below_writeback_cri"] == 1
+
+  # The threshold is read from the harness on every run (no local copy).
+  monkeypatch.setattr(harness_truth, "writeback_cri_threshold", lambda: high_cri + 1)
+  ingested.clear()
+  res2 = await runner.execute_playbook(
+      session=AsyncMock(), source=str(md_file), run_id="run_writeback_gate_2", inter_query_delay_sec=0.0
+  )
+  assert ingested == []
+  assert res2["total_matches_emitted"] == 0
+  assert res2["total_matches_below_writeback_cri"] == 2
+
+
+def test_cross_query_convergence_uses_harness_loopback_thresholds(monkeypatch):
+  runner = PlaybookRunner(TenantConfig(project_id="test-proj", customer_id="test-cust"))
+  min_hits, sum_z_sq = harness_truth.loopback_thresholds()
+  z_at_gate = math.sqrt(sum_z_sq / min_hits)
+
+  def hits(z, distinct):
+    return [
+        {"query_id": f"q{i:02d}", "section": f"S{i}", "goal": "g", "entity_type": "USER", "effective_z": z, "score_field": "z_score"}
+        for i in range(distinct)
+    ]
+
+  entity_hits = {
+      "above@corp.local": hits(z_at_gate * 1.02, min_hits),
+      "below@corp.local": hits(z_at_gate * 0.98, min_hits),
+      "single@corp.local": hits(20.0, 1) + hits(19.0, 1),
+  }
+  kwargs = dict(
+      playbook_id="pb-conv",
+      playbook_source="local",
+      playbook_sha256="0" * 64,
+      entity_hits=entity_hits,
+      run_timestamp_iso="2026-10-30T10:00:00Z",
+      evaluated_day="2026-10-29",
+      run_id="run_conv",
+  )
+  summaries, events = runner.converge_playbook_entities(**kwargs)
+  assert [s["entity"] for s in summaries] == ["above@corp.local"]
+  assert len(events) == 1
+
+  norm_sq = sum(h["effective_z"] ** 2 for h in entity_hits["above@corp.local"])
+  z_eq = harness_truth.constants().score_to_z_equivalent("composite_threat_norm_sq", norm_sq)
+  cri = harness_truth.calculate_cri(z_eq)
+  summary = summaries[0]
+  assert summary["distinct_queries_matched"] == min_hits
+  assert summary["combined_norm_sq"] == round(norm_sq, 2)
+  assert summary["cri_score"] == cri
+  assert summary["severity"] == harness_truth.cri_band(cri)[0]
+  assert summary["verdict"] == harness_truth.verdict_for(cri)
+  assert summary["recommended_action"] == harness_truth.recommended_action(cri, containment_action="LOCK_ACCOUNT")
+  assert summary["loopback_thresholds"] == {"min_distinct_hits": min_hits, "sum_z_sq_threshold": sum_z_sq}
+  assert events[0]["security_result"][0]["risk_score"] == cri
+  assert events[0]["metadata"]["product_log_id"] == "run_conv"
+
+  # Thresholds are read from the harness at call time.
+  monkeypatch.setattr(harness_truth, "loopback_thresholds", lambda: (min_hits + 1, sum_z_sq))
+  assert runner.converge_playbook_entities(**kwargs) == ([], [])
+
+
+@pytest.mark.anyio
+async def test_final_capstone_rows_enforce_harness_loopback_gate(tmp_path, monkeypatch):
+  md_file = tmp_path / "cloud-threats-ueba-hunting.md"
+  md_file.write_text(CAPSTONE_PLAYBOOK_MD, encoding="utf-8")
+  min_hits, sum_z_sq = harness_truth.loopback_thresholds()
+
+  async def fake_execute(session, query, start_iso, end_iso):
+    if "$indexed_events = count(metadata.id)" in query:
+      return {"stats": [{"indexed_events": 1}]}
+    if "PLAYBOOK_BEHAVIORAL_HUNT_MATCH" in query:
+      return {
+          "stats": [
+              # Clears a looser in-query gate (e.g. 18.0) but not the harness sum-Z^2 threshold.
+              {"entity": "below@corp.local", "distinct_queries": min_hits, "capstone_threat_norm_sq": sum_z_sq * 0.8},
+              {"entity": "fires@corp.local", "distinct_scenarios_matched": min_hits + 1, "capstone_threat_norm_sq": sum_z_sq * 1.2},
+              {"entity": "few@corp.local", "distinct_queries": min_hits - 1, "capstone_threat_norm_sq": sum_z_sq * 4},
+              # No distinct-hit or sum-Z^2 evidence: fails closed.
+              {"entity": "unknown@corp.local", "capstone_threat_score": 9.0},
+          ]
+      }
+    return {"stats": [{"user": "svc@corp.local", "unified_threat_score": 5.4}]}
+
+  runner, ingested = _ingesting_runner(monkeypatch, fake_execute)
+  res = await runner.execute_playbook(
+      session=AsyncMock(),
+      source=str(md_file),
+      run_id="run_capstone_gate",
+      udm_validation_poll_sec=0.0,
+      inter_query_delay_sec=0.0,
+  )
+  capstone = res["queries"][1]
+  assert capstone["matches_found"] == 4
+  assert capstone["matches_emitted"] == 1
+  assert capstone["matches_below_loopback_gate"] == 3
+  assert [m["entity"] for m in capstone["matched_entities"]] == ["fires@corp.local"]
+  assert capstone["loopback_gate"] == {"min_distinct_hits": min_hits, "sum_z_sq_threshold": sum_z_sq}
+  assert res["total_capstone_rows_below_loopback_gate"] == 3
+
+  capstone_events = [e for e in ingested if e["security_result"][0]["rule_name"].endswith(capstone["query_id"])]
+  assert len(capstone_events) == 1
+  z_eq = harness_truth.constants().score_to_z_equivalent("capstone_threat_norm_sq", sum_z_sq * 1.2)
+  assert capstone_events[0]["security_result"][0]["risk_score"] == harness_truth.calculate_cri(z_eq)
+
+
+@pytest.mark.anyio
+async def test_every_written_event_keeps_run_id_and_playbook_description(tmp_path, monkeypatch):
+  md_file = tmp_path / "php2shell-ueba-hunting.md"
+  md_file.write_text(SAMPLE_PLAYBOOK_MD, encoding="utf-8")
+
+  async def fake_execute(session, query, start_iso, end_iso):
+    if "stage1_bailout" in query:
+      return {"stats": [{"client_ip": "198.51.100.77", "target_ip": "203.0.113.10", "bailout_events": 2, "carrier_events": 1}]}
+    if "metrics.network_bytes_outbound" in query:
+      return {"stats": [{"entity": "203.0.113.10", "personal_z": 5.2, "z_score": 5.2}]}
+    return {"stats": []}
+
+  runner, ingested = _ingesting_runner(monkeypatch, fake_execute)
+  run_id = "run_php2shell-ueba_20261030T100000Z_feedbeef"
+  res = await runner.execute_playbook(
+      session=AsyncMock(), source=str(md_file), playbook_id="php2shell-ueba", run_id=run_id, inter_query_delay_sec=0.0
+  )
+  assert res["run_id"] == run_id
+  # Two per-query findings plus the cross-query convergence finding.
+  assert len(ingested) == 3
+  assert any(e["security_result"][0]["rule_type"] == "PLAYBOOK_CAPSTONE_CONVERGENCE" for e in ingested)
+  for event in ingested:
+    metadata = event["metadata"]
+    assert metadata["product_log_id"] == run_id
+    assert metadata["description"] and "php2shell-ueba" in metadata["description"]
+    assert {"key": "run_id", "value": run_id} in metadata["ingestion_labels"]
+    assert {"key": "playbook_id", "value": "php2shell-ueba"} in metadata["ingestion_labels"]
+    assert {"key": "run_id", "value": run_id} in event["security_result"][0]["detection_fields"]
+    assert _labels(event)["Run ID"] == run_id
+
+
+async def _run_windows_playbook(tmp_path, monkeypatch, **kwargs):
+  md_file = tmp_path / "window-contract.md"
+  md_file.write_text(WINDOWS_PLAYBOOK_MD, encoding="utf-8")
+  seen = []
+
+  async def fake_execute(session, query, start_iso, end_iso):
+    seen.append((query, start_iso, end_iso))
+    if "$indexed_events = count(metadata.id)" in query:
+      return {"stats": [{"indexed_events": len(ingested)}]}
+    if "PLAYBOOK_BEHAVIORAL_HUNT_MATCH" in query:
+      return {"stats": []}
+    return {"stats": [{"user": "u@corp.local", "z_score": 4.0}]}
+
+  runner, ingested = _ingesting_runner(monkeypatch, fake_execute)
+  now = datetime(2026, 10, 30, 10, 0, 0, tzinfo=timezone.utc)
+  res = await runner.execute_playbook(
+      session=AsyncMock(),
+      source=str(md_file),
+      run_id="run_window_contract",
+      now_utc=now,
+      udm_validation_poll_sec=0.0,
+      inter_query_delay_sec=0.0,
+      **kwargs,
+  )
+  return runner, res, seen, now
+
+
+def _window_for(seen, marker):
+  hits = [entry for entry in seen if marker in entry[0]]
+  assert len(hits) == 1, (marker, len(hits))
+  return hits[0]
+
+
+def _midnight(day):
+  return f"{day.isoformat()}T00:00:00Z"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("query_concurrency", [1, 4])
+async def test_execute_playbook_windows_follow_harness_mode_a_and_ecg(tmp_path, monkeypatch, query_concurrency):
+  runner, res, seen, now = await _run_windows_playbook(tmp_path, monkeypatch, query_concurrency=query_concurrency)
+  specs = runner.parse_markdown_playbook(WINDOWS_PLAYBOOK_MD)
+  day = harness_truth.mode_a_day(now)
+  mode_a = harness_truth.mode_a_window(day)
+  assert res["evaluated_day"] == day.isoformat()
+  assert res["queries_executed"] == 6
+
+  # Macro metrics query: Mode A, the last complete UTC day [D, D+1).
+  assert _window_for(seen, "principal.asset.ip = $entity")[1:] == mode_a
+
+  # Entity Graph join: [D-2, D+1) with the raw-event stage pinned to D, never the graph join.
+  pin = harness_truth.event_day_pin(day)
+  ecg_query, start, end = _window_for(seen, "http_metric_anomalies")
+  assert (start, end) == harness_truth.ecg_window(day)
+  stage_body = ecg_query.split("stage http_metric_anomalies {", 1)[1].split("}", 1)[0]
+  assert stage_body.count(pin) == 1
+  assert ecg_query.count(pin) == 1
+  assert pin not in specs[1].raw_query  # the parsed runbook text is left untouched
+
+  # Raw quantile / MAD baseline gated by $in_scoring_window keeps its 30-day raw window ending at D+1.
+  quantile_query, start, end = _window_for(seen, "quantile_envelope")
+  assert (start, end) == harness_truth.raw_baseline_window(day)
+  assert pin not in quantile_query
+
+  # Raw telemetry: complete UTC days ending at D+1.
+  assert _window_for(seen, "hourly_failures")[1:] == mode_a
+  raw_days = specs[4].default_lookback_days
+  assert _window_for(seen, "daily_counts")[1:] == (_midnight(day - timedelta(days=raw_days - 1)), mode_a[1])
+
+  # Loopback capstone and its UDM indexing probe start at D and run past the write time.
+  _, start, end = _window_for(seen, "stage1_query_hits")
+  assert start == mode_a[0]
+  assert end > now.strftime("%Y-%m-%dT%H:%M:%SZ")
+  probes = [entry for entry in seen if "$indexed_events = count(metadata.id)" in entry[0]]
+  assert probes and all(p[1] == mode_a[0] for p in probes)
+
+  by_id = {q["query_id"]: q for q in res["queries"]}
+  assert by_id[specs[0].query_id]["window"]["start"] == mode_a[0]
+  assert by_id[specs[0].query_id]["window"]["end"] == mode_a[1]
+  assert by_id[specs[1].query_id]["window"]["start"] == harness_truth.ecg_window(day)[0]
+
+
+@pytest.mark.anyio
+async def test_lookback_override_respects_harness_mode_caps(tmp_path, monkeypatch):
+  runner, res, seen, now = await _run_windows_playbook(tmp_path, monkeypatch, lookback_days_override=35)
+  day = harness_truth.mode_a_day(now)
+  mode_a = harness_truth.mode_a_window(day)
+  caps = harness_truth.mode_caps()
+  macro_days, micro_days = caps["mode_b_macro_days"], caps["mode_b_micro_days"]
+  # Macro metrics: Mode B fixed-baseline timeline capped by the harness.
+  assert _window_for(seen, "principal.asset.ip = $entity")[1:] == (_midnight(day - timedelta(days=macro_days - 1)), mode_a[1])
+  # Entity Graph joins stay Mode A with the event-day pin.
+  ecg_query, start, end = _window_for(seen, "http_metric_anomalies")
+  assert (start, end) == harness_truth.ecg_window(day)
+  assert harness_truth.event_day_pin(day) in ecg_query
+  # Raw telemetry: clamped by the Telemetry Physics Guardrail (micro Mode B cap).
+  for marker in ("hourly_failures", "daily_counts"):
+    assert _window_for(seen, marker)[1:] == (_midnight(day - timedelta(days=micro_days - 1)), mode_a[1])
+
+
+def test_raw_lookback_clamp_reads_the_harness_micro_cap(monkeypatch):
+  runner = PlaybookRunner(TenantConfig(project_id="test-proj", customer_id="test-cust"))
+  raw_spec = runner.parse_markdown_playbook(SAMPLE_PLAYBOOK_MD)[0]
+  assert raw_spec.plane == "RAW_TELEMETRY"
+  caps = dict(harness_truth.mode_caps())
+  assert PlaybookRunner.resolve_effective_lookback_days(raw_spec, 35) == caps["mode_b_micro_days"]
+  caps["mode_b_micro_days"] = 10
+  monkeypatch.setattr(harness_truth, "mode_caps", lambda: dict(caps))
+  assert PlaybookRunner.resolve_effective_lookback_days(raw_spec, 35) == 10
+
+
+def test_raw_baseline_scoring_window_comes_from_harness_truth(monkeypatch):
+  runner = PlaybookRunner(TenantConfig(project_id="test-proj", customer_id="test-cust"))
+  spec = runner.parse_markdown_playbook(WINDOWS_PLAYBOOK_MD)[2]
+  assert "$in_scoring_window" in spec.raw_query and spec.plane == "MACRO_METRICS"
+  day = date(2026, 10, 29)
+  for override in (None, 3, 35):
+    window = PlaybookRunner.resolve_query_window(spec, day, lookback_days_override=override)
+    assert window["mode"] == "RAW_BASELINE_SCORING_WINDOW"
+    assert (window["start"], window["end"]) == harness_truth.raw_baseline_window(day)
+    assert window["lookback_days"] == 30 and window["scored_day"] == day.isoformat()
+  # Read from harness_truth on every call, not re-derived from another harness quantity (the Mode C cap).
+  monkeypatch.setattr(harness_truth, "raw_baseline_window", lambda d=None: ("2026-10-08T00:00:00Z", "2026-10-30T00:00:00Z"))
+  window = PlaybookRunner.resolve_query_window(spec, day)
+  assert (window["start"], window["end"], window["lookback_days"]) == ("2026-10-08T00:00:00Z", "2026-10-30T00:00:00Z", 22)
+
+
+# Regenerated runbooks carry concrete example dates: stale event-day pins ("2026-10-15"), a concrete
+# first-scored date ("2026-10-21") or the {{first_scored_date}} slot. Execution re-dates them to D.
+PINNED_DATES_PLAYBOOK_MD = """# Execution-Time Date Pin Playbook
+
+### 1. Macro Daily Egress Z-Score With An Example Event-Day Pin
+
+```yara
+// Goal: Score one pinned day of outbound bytes per host against the 30-day metrics baseline.
+// Statistical Model: Parametric Z-Score (metrics.network_bytes_outbound)
+stage stale_pin_daily {
+    network.sent_bytes > 0
+    network.sent_bytes < 1000000000000000
+    timestamp.get_date(metadata.event_timestamp.seconds) = "2026-10-15"
+    principal.asset.ip = $entity
+    $entity != ""
+
+  match:
+    $entity by 1d
+
+  outcome:
+    $observed_val = sum(network.sent_bytes)
+    $historical_avg = max(metrics.network_bytes_outbound(
+        period: 1d, window: 30d, metric: value_sum, agg: avg,
+        principal.asset.ip: principal.asset.ip
+    ))
+    $historical_stddev = max(metrics.network_bytes_outbound(
+        period: 1d, window: 30d, metric: value_sum, agg: stddev,
+        principal.asset.ip: principal.asset.ip
+    ))
+}
+
+$entity = $stale_pin_daily.entity
+
+match:
+  $entity
+
+outcome:
+  $observed = max($stale_pin_daily.observed_val)
+  $baseline_mean = max($stale_pin_daily.historical_avg)
+  $baseline_stddev = max($stale_pin_daily.historical_stddev)
+  $safe_stddev = if($baseline_stddev > 44979.0, $baseline_stddev, 44979.0)
+  $z_score = ($observed - $baseline_mean) / $safe_stddev
+
+condition:
+  $z_score >= 3.0
+```
+
+### 2. Entity Graph Rare Domains With An Example Event-Day Pin
+
+```yara
+// Goal: Detect hosts with an HTTP surge toward rare domains (10-day prevalence).
+// Statistical Model: Hybrid 30-Day Z-Score + DERIVED_CONTEXT prevalence
+stage ecg_pinned_events {
+    network.http.method != ""
+    timestamp.get_date(metadata.event_timestamp.seconds) = "2026-10-15"
+    principal.asset.hostname = $host
+    target.hostname = $domain
+    $host != ""
+    $domain != ""
+
+  match:
+    $host, $domain by 1d
+
+  outcome:
+    $http_count = count(metadata.id)
+    $b_avg = max(metrics.http_queries_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.asset.hostname: principal.asset.hostname
+    ))
+}
+
+$host = $ecg_pinned_events.host
+$domain = $ecg_pinned_events.domain
+$g.graph.metadata.entity_type = "DOMAIN_NAME"
+$g.graph.metadata.source_type = "DERIVED_CONTEXT"
+$g.graph.entity.domain.name = $domain
+$g.graph.entity.domain.prevalence.day_count = 10
+$g.graph.entity.domain.prevalence.rolling_max <= 3
+
+match:
+  $host, $domain
+
+outcome:
+  $observed_http = max($ecg_pinned_events.http_count)
+  $baseline_mean = max($ecg_pinned_events.b_avg)
+  $prevalence = max($g.graph.entity.domain.prevalence.rolling_max)
+
+condition:
+  $observed_http >= 10
+```
+
+### 3. Entity Graph Rare Domains Without An Event-Day Pin
+
+```yara
+// Goal: Detect hosts with an HTTP surge toward rare domains (10-day prevalence), unpinned event stage.
+// Statistical Model: Hybrid 30-Day Z-Score + DERIVED_CONTEXT prevalence
+stage ecg_unpinned_events {
+    network.http.method != ""
+    principal.asset.hostname = $host
+    target.hostname = $domain
+    $host != ""
+    $domain != ""
+
+  match:
+    $host, $domain by 1d
+
+  outcome:
+    $http_count = count(metadata.id)
+    $b_avg = max(metrics.http_queries_total(
+        period: 1d, window: 30d, metric: event_count_sum, agg: avg,
+        principal.asset.hostname: principal.asset.hostname
+    ))
+}
+
+$host = $ecg_unpinned_events.host
+$domain = $ecg_unpinned_events.domain
+$g.graph.metadata.entity_type = "DOMAIN_NAME"
+$g.graph.metadata.source_type = "DERIVED_CONTEXT"
+$g.graph.entity.domain.name = $domain
+$g.graph.entity.domain.prevalence.day_count = 10
+$g.graph.entity.domain.prevalence.rolling_max <= 3
+
+match:
+  $host, $domain
+
+outcome:
+  $observed_http = max($ecg_unpinned_events.http_count)
+  $prevalence = max($g.graph.entity.domain.prevalence.rolling_max)
+
+condition:
+  $observed_http >= 10
+```
+
+### 4. Quantile Egress Fence With The First-Scored Date Slot
+
+```yara
+// Goal: Quantile egress fence over raw daily bytes, scored from {{first_scored_date}} onward.
+// Statistical Model: Non-Parametric Quantile Tukey Fence
+stage slot_extract {
+    network.sent_bytes > 0
+    network.sent_bytes < 1000000000000000
+    principal.asset.hostname = $host
+    $host != ""
+
+  match:
+    $host by 1d
+
+  outcome:
+    $observed_val = sum(network.sent_bytes)
+    $in_scoring_window = max(if(timestamp.get_date(metadata.event_timestamp.seconds) >= "{{first_scored_date}}", 1, 0))
+    $historical_avg = max(metrics.network_bytes_outbound(
+        period: 1d, window: 30d, metric: value_sum, agg: avg,
+        principal.asset.hostname: principal.asset.hostname
+    ))
+}
+
+stage slot_envelope {
+    $host = $slot_extract.host
+
+  match:
+    $host
+
+  outcome:
+    $q75 = window.percentile($slot_extract.observed_val, 75)
+    $raw_active_days = count_distinct($slot_extract.window_start)
+}
+
+$host = $slot_extract.host
+$host = $slot_envelope.host
+$ws = $slot_extract.window_start
+
+match:
+  $host, $ws by 1d
+
+outcome:
+  $observed = sum($slot_extract.observed_val)
+  $q75_val = max($slot_envelope.q75)
+  $raw_active_days = max($slot_envelope.raw_active_days)
+  $in_scoring_window = max($slot_extract.in_scoring_window)
+  $safe_q75 = if($q75_val > 0, $q75_val, 1.0)
+  $tukey_fence_ratio = $observed / $safe_q75
+
+condition:
+  $in_scoring_window = 1 and $raw_active_days >= 7 and $tukey_fence_ratio >= 2.0
+```
+
+### 5. Quantile Egress Fence With An Example First-Scored Date
+
+```yara
+// Goal: Quantile egress fence over raw daily bytes with an example first-scored date.
+// Statistical Model: Non-Parametric Quantile Tukey Fence
+stage dated_extract {
+    network.sent_bytes > 0
+    network.sent_bytes < 1000000000000000
+    principal.asset.hostname = $host
+    $host != ""
+
+  match:
+    $host by 1d
+
+  outcome:
+    $observed_val = sum(network.sent_bytes)
+    $in_scoring_window = max(if(timestamp.get_date(metadata.event_timestamp.seconds) >= "2026-10-21", 1, 0))
+    $historical_avg = max(metrics.network_bytes_outbound(
+        period: 1d, window: 30d, metric: value_sum, agg: avg,
+        principal.asset.hostname: principal.asset.hostname
+    ))
+}
+
+stage dated_envelope {
+    $host = $dated_extract.host
+
+  match:
+    $host
+
+  outcome:
+    $q75 = window.percentile($dated_extract.observed_val, 75)
+    $raw_active_days = count_distinct($dated_extract.window_start)
+}
+
+$host = $dated_extract.host
+$host = $dated_envelope.host
+$ws = $dated_extract.window_start
+
+match:
+  $host, $ws by 1d
+
+outcome:
+  $observed = sum($dated_extract.observed_val)
+  $q75_val = max($dated_envelope.q75)
+  $raw_active_days = max($dated_envelope.raw_active_days)
+  $in_scoring_window = max($dated_extract.in_scoring_window)
+  $safe_q75 = if($q75_val > 0, $q75_val, 1.0)
+  $tukey_fence_ratio = $observed / $safe_q75
+
+condition:
+  $in_scoring_window = 1 and $raw_active_days >= 7 and $tukey_fence_ratio >= 2.0
+```
+"""
+
+_EXAMPLE_DATES = ("2026-10-15", "2026-10-21")
+
+
+def _code(query):
+  """The query without // and /* */ comments."""
+  return PlaybookRunner._strip_yaral_comments(query)  # pylint: disable=protected-access
+
+
+def _stage_body(query, name):
+  return query.split(f"stage {name} {{", 1)[1].split("}", 1)[0]
+
+
+def _first_scored(day):
+  return f'timestamp.get_date(metadata.event_timestamp.seconds) >= "{day.isoformat()}"'
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("query_concurrency", [1, 4])
+async def test_execution_pins_every_query_to_the_scored_day(tmp_path, monkeypatch, query_concurrency):
+  md_file = tmp_path / "pinned-dates.md"
+  md_file.write_text(PINNED_DATES_PLAYBOOK_MD, encoding="utf-8")
+  seen = {}
+
+  async def fake_execute(session, query, start_iso, end_iso):
+    stage = query.split("stage ", 1)[1].split(" ", 1)[0]
+    seen[stage] = (query, QueryIntegrityGate.verify_pre_dispatch(query, raise_on_error=False)["errors"])
+    return {"stats": []}
+
+  runner, _ = _ingesting_runner(monkeypatch, fake_execute)
+  now = datetime(2026, 10, 30, 10, 0, 0, tzinfo=timezone.utc)
+  res = await runner.execute_playbook(
+      session=AsyncMock(), source=str(md_file), run_id="run_pinned_dates", now_utc=now, ingest_events=False,
+      query_concurrency=query_concurrency, inter_query_delay_sec=0.0,
+  )
+  day = harness_truth.mode_a_day(now)
+  pin = harness_truth.event_day_pin(day)
+  assert res["queries_executed"] == 5 and len(seen) == 5
+  for stage, (query, gate_errors) in seen.items():
+    # Every dispatched query passes the pre-dispatch gate: no example date and no unresolved slot is left.
+    assert gate_errors == [], (stage, gate_errors)
+    assert not any(example in query for example in _EXAMPLE_DATES), stage
+    assert "{{" not in query, stage
+
+  # An existing event-day pin with another date is rewritten to D (Mode A and Entity Graph queries alike).
+  for stage in ("stale_pin_daily", "ecg_pinned_events"):
+    query = seen[stage][0]
+    assert _stage_body(query, stage).count(pin) == 1 and query.count(pin) == 1, stage
+  # An Entity Graph event stage without a pin gets exactly one.
+  query = seen["ecg_unpinned_events"][0]
+  assert _stage_body(query, "ecg_unpinned_events").count(pin) == 1 and query.count(pin) == 1
+  # {{first_scored_date}} and an example first-scored date become D; raw baselines get no event-day pin.
+  for stage in ("slot_extract", "dated_extract"):
+    query = seen[stage][0]
+    assert _code(query).count(_first_scored(day)) == 1, stage
+    assert pin not in query, stage
+  assert f"scored from {day.isoformat()} onward" in seen["slot_extract"][0]
+
+  # The parsing contract is unchanged: the runbook text keeps its example dates and slot.
+  specs = runner.parse_markdown_playbook(PINNED_DATES_PLAYBOOK_MD)
+  assert [s.raw_query.count('"2026-10-15"') for s in specs] == [1, 1, 0, 0, 0]
+  assert "{{first_scored_date}}" in specs[3].raw_query and '"2026-10-21"' in specs[4].raw_query
+
+
+def test_scored_day_pins_are_idempotent_and_never_doubled():
+  runner = PlaybookRunner(TenantConfig(project_id="test-proj", customer_id="test-cust"))
+  specs = runner.parse_markdown_playbook(PINNED_DATES_PLAYBOOK_MD)
+  day, next_day = date(2026, 10, 29), date(2026, 10, 30)
+  pin, next_pin = harness_truth.event_day_pin(day), harness_truth.event_day_pin(next_day)
+  for spec in specs:
+    for pin_event_stages in (False, True):
+      once = PlaybookRunner.pin_query_to_scored_day(spec.raw_query, day, pin_event_stages)
+      assert PlaybookRunner.pin_query_to_scored_day(once, day, pin_event_stages) == once
+      # Re-pinning a prepared query to another day re-dates every pin instead of adding one.
+      moved = PlaybookRunner.pin_query_to_scored_day(once, next_day, pin_event_stages)
+      assert pin not in moved and _first_scored(day) not in moved
+      assert moved.count(next_pin) == once.count(pin)
+      assert moved.count(_first_scored(next_day)) == once.count(_first_scored(day))
+      for name in ("stale_pin_daily", "ecg_pinned_events", "ecg_unpinned_events", "slot_extract", "dated_extract"):
+        if f"stage {name} {{" in once:
+          assert _code(_stage_body(once, name)).count(pin) <= 1, (spec.query_id, name)
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        'timestamp.get_date(metadata.event_timestamp.seconds) = "2026-10-15"',
+        'timestamp.get_date( metadata.event_timestamp.seconds )="2026-10-15"',
+        'timestamp.get_date(metadata.event_timestamp.seconds, "UTC") = "2026-10-15"',
+    ],
+)
+def test_existing_event_day_pin_spellings_are_rewritten_not_doubled(existing):
+  query = PINNED_DATES_PLAYBOOK_MD.split("```yara\n")[2].split("```")[0].replace(
+      'timestamp.get_date(metadata.event_timestamp.seconds) = "2026-10-15"', existing)
+  assert existing in query
+  day = date(2026, 10, 29)
+  pinned = PlaybookRunner.pin_query_to_scored_day(query, day, pin_event_stages=True)
+  body = _code(_stage_body(pinned, "ecg_pinned_events"))
+  assert "2026-10-15" not in pinned
+  assert body.count("timestamp.get_date(") == 1 and f'"{day.isoformat()}"' in body
+
+
+def test_a_commented_example_pin_does_not_count_as_an_event_day_pin():
+  query = PINNED_DATES_PLAYBOOK_MD.split("```yara\n")[3].split("```")[0].replace(
+      '    network.http.method != ""\n',
+      '    network.http.method != ""\n'
+      '    // Example: timestamp.get_date(metadata.event_timestamp.seconds) = "2026-10-15"\n',
+      1,
+  )
+  day = date(2026, 10, 29)
+  pinned = PlaybookRunner.pin_query_to_scored_day(query, day, pin_event_stages=True)
+  assert _code(_stage_body(pinned, "ecg_unpinned_events")).count(harness_truth.event_day_pin(day)) == 1
+
+
+def test_loopback_stages_keep_their_own_dates():
+  # PLAYBOOK_BEHAVIORAL_HUNT_MATCH events carry the run timestamp, not the scored day, so a loopback
+  # stage's date is never re-dated to D; a raw-telemetry stage of the same query is.
+  query = (
+      "stage stage1_loopback {\n"
+      '    metadata.event_type = "GENERIC_EVENT"\n'
+      '    metadata.product_event_type = "PLAYBOOK_BEHAVIORAL_HUNT_MATCH"\n'
+      '    timestamp.get_date(metadata.event_timestamp.seconds) = "2026-10-30"\n'
+      "    principal.user.userid = $user\n"
+      "\n"
+      "  match:\n"
+      "    $user by 1d\n"
+      "\n"
+      "  outcome:\n"
+      "    $hits = count_distinct(security_result.rule_name)\n"
+      "}\n"
+      "\n"
+      "stage stage2_raw {\n"
+      '    metadata.event_type = "USER_LOGIN"\n'
+      '    timestamp.get_date(metadata.event_timestamp.seconds) = "2026-10-15"\n'
+      "    principal.user.userid = $user\n"
+      "\n"
+      "  match:\n"
+      "    $user by 1d\n"
+      "\n"
+      "  outcome:\n"
+      "    $logins = count(metadata.id)\n"
+      "}\n"
+  )
+  day = date(2026, 10, 29)
+  pinned = PlaybookRunner.pin_query_to_scored_day(query, day)
+  assert '= "2026-10-30"' in _stage_body(pinned, "stage1_loopback")
+  assert _stage_body(pinned, "stage2_raw").count(harness_truth.event_day_pin(day)) == 1
+  assert "2026-10-15" not in pinned

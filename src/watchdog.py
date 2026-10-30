@@ -9,7 +9,9 @@ Runs a continuous background monitoring loop that:
 3. Automatically determines the optimal threat hunting strategy.
 4. Enqueues hunt requests to a bounded producer-consumer queue drained by a parallel worker pool.
 5. Executes multi-stage YARA-L behavioral/statistical hunts against Chronicle OneMCP.
-6. Injects 6-pillar forensic reports directly into the case wall via create_case_comment.
+6. Injects the skills' canonical forensic reports directly into the case wall via create_case_comment.
+
+CRI bands, verdicts and re-emission tiers come from src/harness_truth.py.
 """
 
 import asyncio
@@ -32,6 +34,7 @@ except ImportError:
   except ImportError:
     from mcp.client.sse import sse_client as streamable_http_client
 
+from src import harness_truth
 from src.config import TenantConfig
 from src.models import JITHuntRequest, JITHuntResponse
 from src.playbook_runner import PlaybookRunner
@@ -39,6 +42,31 @@ from src.risk_metrics_engine import RiskMetricsEngine
 from src.strategy_decider import StrategyDecider
 
 logger = logging.getLogger("WatchdogDaemon")
+
+
+def _cri_band_rank(score: Any) -> int:
+  """Ordinal of the harness CRI band for a Z / Z-equivalent score (-1 when N/A)."""
+  code = harness_truth.cri_band(harness_truth.calculate_cri(score))[0]
+  for rank, band in enumerate(harness_truth.cri_bands()):
+    if band[2] == code:
+      return rank
+  return -1
+
+
+def _escalated(new_score: Any, prev_score: Any, min_delta: Optional[float]) -> bool:
+  """True when `new_score` reaches a higher harness CRI band than `prev_score`.
+
+  With an explicit `min_delta`, a rise of at least that many score units also counts.
+  """
+  if _cri_band_rank(new_score) > _cri_band_rank(prev_score):
+    return True
+  return min_delta is not None and (float(new_score) - float(prev_score)) >= float(min_delta)
+
+
+def _max_cri(*values: Any) -> Optional[int]:
+  """Largest valid CRI among `values` (harness coerce_cri), or None when all are N/A."""
+  valid = [cri for cri in (harness_truth.coerce_cri(v) for v in values) if cri is not None]
+  return max(valid) if valid else None
 
 
 def _unwrap_exception(e: BaseException) -> str:
@@ -245,14 +273,15 @@ class WatchdogState:
       entity_id: str,
       breached_sectors: List[str],
       composite_d: float,
-      min_delta_d: float = 2.0,
+      min_delta_d: Optional[float] = None,
   ) -> bool:
     """Intra-day deduplication check for 4-hour Mode A fleet 360 radar sweeps.
 
     Returns True if:
     - Entity has not been emitted yet on `bucket_date`, OR
     - At least one sector in `breached_sectors` was not previously breached on `bucket_date`, OR
-    - The Euclidean composite distance D escalated by >= `min_delta_d` (+2.0 sigma).
+    - The Euclidean composite distance D reaches a higher harness CRI band than the recorded D, OR
+    - D rose by at least `min_delta_d`, when the caller passes one.
     """
     key = f"{bucket_date}:{entity_type.upper()}:{entity_id.lower()}"
     prev = self.fleet_360_emissions.get(key)
@@ -262,9 +291,7 @@ class WatchdogState:
     if any(sec not in prev_sectors for sec in breached_sectors):
       return True
     prev_d = float(prev.get("composite_d", 0.0))
-    if (float(composite_d) - prev_d) >= min_delta_d:
-      return True
-    return False
+    return _escalated(composite_d, prev_d, min_delta_d)
 
   def record_fleet_360_emission(
       self,
@@ -273,21 +300,20 @@ class WatchdogState:
       entity_id: str,
       breached_sectors: List[str],
       composite_d: float,
-      composite_cri: int,
+      composite_cri: Optional[int],
   ) -> None:
     """Records an intra-day 360 radar emission for deduplication across 4-hour sweeps."""
     key = f"{bucket_date}:{entity_type.upper()}:{entity_id.lower()}"
     prev = self.fleet_360_emissions.get(key, {})
     merged_sectors = sorted(set(prev.get("breached_sectors", [])) | set(breached_sectors))
     prev_d = float(prev.get("composite_d", 0.0))
-    prev_cri = int(prev.get("composite_cri", 0))
     self.fleet_360_emissions[key] = {
         "bucket_date": bucket_date,
         "entity_type": entity_type.upper(),
         "entity_id": entity_id.lower(),
         "breached_sectors": merged_sectors,
         "composite_d": round(max(prev_d, float(composite_d)), 2),
-        "composite_cri": max(prev_cri, int(composite_cri)),
+        "composite_cri": _max_cri(prev.get("composite_cri"), composite_cri),
         "emission_count": int(prev.get("emission_count", 0)) + 1,
         "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
@@ -315,17 +341,19 @@ class WatchdogState:
       query_id: str,
       entity_id: str,
       effective_z: float,
-      min_delta_z: float = 2.0,
+      min_delta_z: Optional[float] = None,
   ) -> bool:
-    """Intra-day deduplication check for scheduled Markdown playbook hunts."""
+    """Intra-day deduplication check for scheduled Markdown playbook hunts.
+
+    Re-emits a same-day match only when its effective Z reaches a higher harness CRI band than
+    the recorded one (or rose by at least `min_delta_z`, when the caller passes one).
+    """
     key = f"{bucket_date}:{playbook_id.lower()}:{query_id.lower()}:{entity_id.lower()}"
     prev = self.playbook_emissions.get(key)
     if not prev:
       return True
     prev_z = float(prev.get("effective_z", 0.0))
-    if (float(effective_z) - prev_z) >= min_delta_z:
-      return True
-    return False
+    return _escalated(effective_z, prev_z, min_delta_z)
 
   def record_playbook_emission(
       self,
@@ -334,20 +362,19 @@ class WatchdogState:
       query_id: str,
       entity_id: str,
       effective_z: float,
-      cri_score: int,
+      cri_score: Optional[int],
   ) -> None:
     """Records an intra-day playbook match emission for deduplication across sweeps."""
     key = f"{bucket_date}:{playbook_id.lower()}:{query_id.lower()}:{entity_id.lower()}"
     prev = self.playbook_emissions.get(key, {})
     prev_z = float(prev.get("effective_z", 0.0))
-    prev_cri = int(prev.get("cri_score", 0))
     self.playbook_emissions[key] = {
         "bucket_date": bucket_date,
         "playbook_id": playbook_id,
         "query_id": query_id,
         "entity_id": entity_id.lower(),
         "effective_z": round(max(prev_z, float(effective_z)), 2),
-        "cri_score": max(prev_cri, int(cri_score)),
+        "cri_score": _max_cri(prev.get("cri_score"), cri_score),
         "emission_count": int(prev.get("emission_count", 0)) + 1,
         "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
@@ -433,13 +460,14 @@ class WatchdogState:
         except Exception:
           pass
 
+      cri_value = res.get("cri", res.get("calibrated_risk_index"))
       # Ensure tags and common_vector are populated (backfilling legacy records if needed)
       rec_tags = res.get("tags")
       if rec_tags is None:
         p_vec = str(res.get("primary_vector") or "")
         sec_ran = bool(res.get("second_order_ran") or p_vec.startswith("tier2"))
         rec_tags = CaseWallCardFormatter.build_case_tags(
-            calibrated_risk_index=float(res.get("cri") or 0.0),
+            calibrated_risk_index=harness_truth.coerce_cri(cri_value),
             primary_vector=p_vec,
             model_name=str(res.get("strategy") or ""),
             second_order_ran=sec_ran,
@@ -464,7 +492,8 @@ class WatchdogState:
           continue
 
       filtered_cases.append(res)
-      v = res.get("verdict", "UNKNOWN")
+      # Legacy records without a verdict take the harness band verdict of their CRI.
+      v = res.get("verdict") or harness_truth.verdict_for(cri_value)
       verdicts[v] = verdicts.get(v, 0) + 1
       s = res.get("strategy", "UNKNOWN")
       strategies[s] = strategies.get(s, 0) + 1
@@ -1071,7 +1100,8 @@ class WatchdogDaemon:
 
     Guarded by an asyncio.Lock to prevent overlapping sweeps.
     Applies intra-day deduplication via WatchdogState so entities are only re-emitted
-    on the same UTC bucket date if a new sector breaches >= 3.0σ or Composite D escalates by >= +2.0σ.
+    on the same UTC bucket date if a new sector breaches the spike gate or Composite D
+    reaches a higher harness CRI band.
     """
     if self._fleet_360_lock.locked():
       logger.warning("Fleet 360 radar sweep is already in progress. Skipping concurrent run.")

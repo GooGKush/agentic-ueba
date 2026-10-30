@@ -8,10 +8,19 @@ GitHub Markdown URLs (blob, raw, or repo directory) or local files, validate eac
 query against the Malachite AST validator, execute periodic searches via Chronicle
 OneMCP, chain upstream candidate entities into seeded follow-up queries, and ingest
 confirmed matches as native UDM GENERIC_EVENT records via Chronicle ImportEvents.
+
+Scoring, gating and time windows follow the remediated UEBA harness at runtime
+(`src.harness_truth`): native model scores map onto the Z-equivalent scale through the
+skills' score-semantics registry, CRI comes from the canonical formula, verdicts and
+recommended actions from the CRI bands, UDM write-back requires
+`writeback_cri_threshold()`, Wave 3 loopback convergence requires
+`loopback_thresholds()`, and every query runs on the Mode A / Entity Graph / raw-baseline
+windows (`mode_a_window`, `ecg_window`, `raw_baseline_window`) for the last complete UTC day D,
+with its event-day pins and first-scored dates set to D at execution (`event_day_pin`).
 """
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import ipaddress
 import json
@@ -26,6 +35,7 @@ import uuid
 
 import httpx
 
+from src import harness_truth
 from src.config import TenantConfig
 from src.pipeline_runner import PipelineRunner
 from src.risk_metrics_engine import RiskMetricsEngine
@@ -115,9 +125,53 @@ class PlaybookRunner:
       "sa-worker@proj.iam.gserviceaccount.com",
   )
 
-  # Strict Telemetry Physics Guardrail: raw UDM statistical hunts are bounded to <= 14 days
-  MAX_RAW_TELEMETRY_LOOKBACK_DAYS = 14
+  # Strict Telemetry Physics Guardrail: raw UDM statistical hunts are bounded by the harness micro
+  # Mode B cap (harness_truth.mode_caps()["mode_b_micro_days"]); see max_raw_telemetry_lookback_days().
   _METRICS_CALL_RE = re.compile(r"^[ \t]*(?!//).*?\bmetrics\.[a-zA-Z0-9_]+\s*\(", re.MULTILINE)
+
+  # Entity Graph joins (same detection as the risk-metrics hybrid engine) and the raw-baseline
+  # scoring gate used by MAD / quantile pipelines that need a wide raw window.
+  _ECG_JOIN_RE = re.compile(r"\bgraph\.(?:entity|metadata|relations)\b")
+  _SCORING_WINDOW_RE = re.compile(r"\$in_scoring_window\b")
+  # timestamp.get_date() of the event time (optional event variable and time-zone argument).
+  _EVENT_DATE_CALL = (
+      r'timestamp\.get_date\(\s*(?:\$[A-Za-z_]\w*\.)?metadata\.event_timestamp\.seconds\s*(?:,\s*"[^"\n]*"\s*)?\)'
+  )
+  # Event-day pin `... = "YYYY-MM-DD"` and the first-scored date of a `$in_scoring_window` gate
+  # (`$in_scoring_window = max(if(... >= "YYYY-MM-DD", 1, 0))` or its `{{first_scored_date}}` slot).
+  _EVENT_DATE_PIN_RE = re.compile(rf'({_EVENT_DATE_CALL}\s*=\s*)"\d{{4}}-\d{{2}}-\d{{2}}"')
+  _FIRST_SCORED_DATE_RE = re.compile(
+      rf'(\$in_scoring_window\s*=[^\n]*?{_EVENT_DATE_CALL}\s*>=\s*)"\d{{4}}-\d{{2}}-\d{{2}}"'
+  )
+  _FIRST_SCORED_SLOT_RE = re.compile(r"\{\{\s*first_scored_date\s*\}\}")
+  _LOOPBACK_EVENT_LITERAL = '"PLAYBOOK_BEHAVIORAL_HUNT_MATCH"'
+  _EVENT_VARIABLE_RE = re.compile(
+      r"\$([A-Za-z_]\w*)\.(?:metadata|principal|target|src|network|security_result|about|intermediary|observer|extensions)\."
+  )
+
+  # Domain containment recommended at Critical CRI (harness_truth.recommended_action), by entity type.
+  # Recommendations only: agentic_ueba never executes containment.
+  CONTAINMENT_ACTION_BY_ENTITY_TYPE: Dict[str, str] = {
+      "USER": "LOCK_ACCOUNT",
+      "IP": "THROTTLE_EGRESS",
+      "ASSET": "ISOLATE_HOST",
+  }
+
+  # Wave 3 capstone row columns carrying the loopback evidence (distinct scenario hits and sum Z^2).
+  LOOPBACK_DISTINCT_HIT_COLUMNS: Tuple[str, ...] = (
+      "distinct_scenarios_matched",
+      "distinct_queries",
+      "distinct_queries_matched",
+      "distinct_hits",
+      "distinct_scenarios",
+  )
+  LOOPBACK_SUM_Z_SQ_COLUMNS: Tuple[str, ...] = (
+      "capstone_threat_norm_sq",
+      "composite_threat_norm_sq",
+      "sum_z_sq",
+  )
+  # Score-semantics registry key used to map an in-memory convergence sum Z^2 onto the Z-equivalent scale.
+  CONVERGENCE_SCORE_KEY = "composite_threat_norm_sq"
 
   # Default UDM Loopback indexing wait budget (45 attempts * 30s = 22.5 minutes) to accommodate
   # Chronicle SIEM UDM indexing latency (typically 2-20 minutes for ImportEvents).
@@ -360,13 +414,19 @@ class PlaybookRunner:
     return 1
 
   @classmethod
+  def max_raw_telemetry_lookback_days(cls) -> int:
+    """Telemetry Physics Guardrail ceiling for raw UDM hunts: the harness micro Mode B cap."""
+    return int(harness_truth.mode_caps()["mode_b_micro_days"])
+
+  @classmethod
   def resolve_effective_lookback_days(
       cls, spec: PlaybookQuerySpec, lookback_days_override: Optional[int] = None
   ) -> int:
     """Resolves lookback days for a playbook query while enforcing the Telemetry Physics Guardrail.
 
-    Raw UDM statistical hunter queries (`RAW_TELEMETRY`) are clamped to <= 14 days even when a
-    wider `lookback_days_override` (e.g., 30d/35d) is passed, preventing 1M row scan cap timeouts.
+    Raw UDM statistical hunter queries (`RAW_TELEMETRY`) are clamped to the harness micro Mode B cap
+    (`max_raw_telemetry_lookback_days()`) even when a wider `lookback_days_override` (e.g., 30d/35d) is
+    passed, preventing 1M row scan cap timeouts.
     """
     lb = (
         int(lookback_days_override)
@@ -374,13 +434,191 @@ class PlaybookRunner:
         else spec.default_lookback_days
     )
     lb = max(1, lb)
-    if spec.plane == "RAW_TELEMETRY" and lb > cls.MAX_RAW_TELEMETRY_LOOKBACK_DAYS:
+    raw_cap = cls.max_raw_telemetry_lookback_days()
+    if spec.plane == "RAW_TELEMETRY" and lb > raw_cap:
       logger.info(
           f"Telemetry Physics Guardrail: clamping RAW_TELEMETRY query '{spec.query_id}' "
-          f"lookback from {lb}d to {cls.MAX_RAW_TELEMETRY_LOOKBACK_DAYS}d."
+          f"lookback from {lb}d to {raw_cap}d."
       )
-      return cls.MAX_RAW_TELEMETRY_LOOKBACK_DAYS
+      return raw_cap
     return lb
+
+  @staticmethod
+  def _strip_yaral_comments(query: str) -> str:
+    no_block = re.sub(r"/\*.*?\*/", "", query, flags=re.DOTALL)
+    return re.sub(r"//[^\n]*", "", no_block)
+
+  @staticmethod
+  def _utc_midnight(day: date) -> str:
+    return f"{day.isoformat()}T00:00:00Z"
+
+  @classmethod
+  def resolve_query_window(
+      cls,
+      spec: PlaybookQuerySpec,
+      evaluated_day: date,
+      now_utc: Optional[datetime] = None,
+      lookback_days_override: Optional[int] = None,
+  ) -> Dict[str, Any]:
+    """Resolves the `[start, end)` search window of a playbook query for scored UTC day D.
+
+    D is the last complete UTC day (`harness_truth.mode_a_day`). Windows:
+    * UDM loopback queries (Stage B and Capstone): `[D, now + 2m)`, covering the scored day and the
+      PLAYBOOK_BEHAVIORAL_HUNT_MATCH events written during this run (scoped by run ID).
+    * `metrics.*` queries: Mode A `harness_truth.mode_a_window(D)`; with an explicit lookback override,
+      a Mode B fixed-baseline timeline ending at D, capped by `mode_caps()["mode_b_macro_days"]`.
+    * `metrics.*` queries gated by `$in_scoring_window` (raw MAD / quantile baselines): the raw 30-day
+      baseline window `harness_truth.raw_baseline_window(D)`, as the risk-metrics hybrid engine.
+    * Entity Graph joins: `harness_truth.ecg_window(D)` with raw-event stages pinned to D
+      (`pin_event_stages=True`, see `pin_query_to_scored_day`).
+    * Raw telemetry: complete UTC days ending at D (`resolve_effective_lookback_days`).
+    """
+    day_start, day_end = harness_truth.mode_a_window(evaluated_day)
+    end_date = evaluated_day + timedelta(days=1)
+
+    def _window(mode: str, start: str, end: str, pin_event_stages: bool = False) -> Dict[str, Any]:
+      start_date = datetime.strptime(start[:10], "%Y-%m-%d").date()
+      return {
+          "mode": mode,
+          "start": start,
+          "end": end,
+          "scored_day": evaluated_day.isoformat(),
+          "lookback_days": max(1, (end_date - start_date).days),
+          "pin_event_stages": pin_event_stages,
+      }
+
+    if spec.is_capstone:
+      now = max(datetime.now(timezone.utc), now_utc or datetime.now(timezone.utc))
+      loopback_end = (now + timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+      return _window("LOOPBACK_RUN_SCOPED", day_start, loopback_end)
+
+    code = cls._strip_yaral_comments(spec.raw_query)
+    has_ecg = bool(cls._ECG_JOIN_RE.search(code))
+    caps = harness_truth.mode_caps()
+
+    if spec.plane == "MACRO_METRICS":
+      if cls._SCORING_WINDOW_RE.search(code):
+        raw_start, raw_end = harness_truth.raw_baseline_window(evaluated_day)
+        return _window("RAW_BASELINE_SCORING_WINDOW", raw_start, raw_end)
+      if has_ecg:
+        ecg_start, ecg_end = harness_truth.ecg_window(evaluated_day)
+        return _window("ECG_MODE_A", ecg_start, ecg_end, pin_event_stages=True)
+      scored_days = 1
+      if lookback_days_override is not None and int(lookback_days_override) > 1:
+        scored_days = min(int(lookback_days_override), int(caps["mode_b_macro_days"]))
+      if scored_days <= 1:
+        return _window("MODE_A", day_start, day_end)
+      start = cls._utc_midnight(evaluated_day - timedelta(days=scored_days - 1))
+      return _window("MODE_B", start, day_end)
+
+    lb_days = cls.resolve_effective_lookback_days(spec, lookback_days_override)
+    if has_ecg and lb_days <= 1:
+      ecg_start, ecg_end = harness_truth.ecg_window(evaluated_day)
+      return _window("ECG_MODE_A", ecg_start, ecg_end, pin_event_stages=True)
+    start = cls._utc_midnight(evaluated_day - timedelta(days=lb_days - 1))
+    if has_ecg:
+      start = min(start, harness_truth.ecg_window(evaluated_day)[0])
+    return _window("MODE_A" if lb_days <= 1 else "RAW_LOOKBACK", start, day_end)
+
+  @staticmethod
+  def _named_stage_body_spans(query: str) -> List[Tuple[str, int, int]]:
+    """`(stage_name, body_start, body_end)` for each named stage, by brace depth (comments/strings skipped)."""
+    spans: List[Tuple[str, int, int]] = []
+    for m in re.finditer(r"(?m)^[ \t]*stage\s+([A-Za-z0-9_]+)\s*\{", query):
+      depth, i, n = 1, m.end(), len(query)
+      quote: Optional[str] = None
+      while i < n and depth:
+        ch = query[i]
+        if quote:
+          if ch == quote and query[i - 1] != "\\":
+            quote = None
+        elif ch in "\"`":
+          quote = ch
+        elif query.startswith("//", i):
+          nl = query.find("\n", i)
+          i = n if nl < 0 else nl
+          continue
+        elif query.startswith("/*", i):
+          close = query.find("*/", i + 2)
+          i = n if close < 0 else close + 2
+          continue
+        elif ch == "{":
+          depth += 1
+        elif ch == "}":
+          depth -= 1
+        i += 1
+      if depth == 0:
+        spans.append((m.group(1), m.end(), i - 1))
+    return spans
+
+  @classmethod
+  def pin_event_stages_to_day(cls, query_text: str, day: date) -> str:
+    """Pins each raw-event named stage of an Entity Graph query to scored day D.
+
+    Uses `harness_truth.event_day_pin(D)`. Graph stages and stages derived from other stages are left
+    alone; an existing `timestamp.get_date(...) = "YYYY-MM-DD"` pin is re-dated to D (as the
+    risk-metrics hybrid engine does) instead of being duplicated. A pin that only appears in a comment
+    is not a pin.
+    """
+    pin = harness_truth.event_day_pin(day)
+    spans = cls._named_stage_body_spans(query_text)
+    names = [name for name, _, _ in spans]
+    insertions: List[Tuple[int, int, str]] = []
+    for name, body_start, body_end in spans:
+      body = query_text[body_start:body_end]
+      body_code = cls._strip_yaral_comments(body)
+      event_part = re.split(r"\b(?:match|outcome|condition|order)\s*:", body_code, maxsplit=1)[0]
+      if re.search(r"\bgraph\.", event_part):
+        continue
+      if any(re.search(r"\$" + re.escape(other) + r"\.", event_part) for other in names if other != name):
+        continue
+      if cls._EVENT_DATE_PIN_RE.search(body_code):
+        insertions.append((body_start, body_end, cls._EVENT_DATE_PIN_RE.sub(rf'\g<1>"{day.isoformat()}"', body)))
+        continue
+      event_vars = sorted(set(cls._EVENT_VARIABLE_RE.findall(event_part)))
+      predicates = (
+          [pin.replace("metadata.event_timestamp", f"${var}.metadata.event_timestamp", 1) for var in event_vars]
+          if event_vars
+          else [pin]
+      )
+      insertions.append((body_start, body_start, "".join(f"\n    {p}" for p in predicates)))
+    pinned = query_text
+    for start, end, text in sorted(insertions, reverse=True):
+      pinned = pinned[:start] + text + pinned[end:]
+    return pinned
+
+  @classmethod
+  def pin_query_to_scored_day(cls, query_text: str, day: date, pin_event_stages: bool = False) -> str:
+    """Execution-time dates for scored day D; the parsed runbook text itself is never modified.
+
+    Regenerated runbooks carry concrete example dates. Before dispatch:
+    * `{{first_scored_date}}` and the first-scored date of a `$in_scoring_window` gate become D (Mode A
+      scores only D);
+    * every existing event-day pin `timestamp.get_date(metadata.event_timestamp.seconds) = "YYYY-MM-DD"`
+      is re-dated to D, except in loopback stages: PLAYBOOK_BEHAVIORAL_HUNT_MATCH events carry the
+      run timestamp, not D;
+    * with `pin_event_stages` (Entity Graph joins), `harness_truth.event_day_pin(D)` is added to each
+      raw-event stage that has no pin (`pin_event_stages_to_day`).
+    Idempotent: a second pass changes nothing and a stage never carries two pins.
+    """
+    day_str = day.isoformat()
+    pinned = cls._FIRST_SCORED_SLOT_RE.sub(day_str, query_text)
+    pinned = cls._FIRST_SCORED_DATE_RE.sub(rf'\g<1>"{day_str}"', pinned)
+    loopback_spans = [
+        (start, end)
+        for _, start, end in cls._named_stage_body_spans(pinned)
+        if cls._LOOPBACK_EVENT_LITERAL in cls._strip_yaral_comments(pinned[start:end])
+    ]
+
+    def _redate(match: "re.Match[str]") -> str:
+      if any(start <= match.start() < end for start, end in loopback_spans):
+        return match.group(0)
+      return f'{match.group(1)}"{day_str}"'
+
+    pinned = cls._EVENT_DATE_PIN_RE.sub(_redate, pinned)
+    if pin_event_stages:
+      pinned = cls.pin_event_stages_to_day(pinned, day)
+    return pinned
 
   @classmethod
   def _is_seeded_query(cls, query: str) -> bool:
@@ -787,11 +1025,14 @@ class PlaybookRunner:
   def extract_row_effective_z(row: Dict[str, Any]) -> Tuple[float, str]:
     """Extracts (effective_z_score, score_field_name) from a parsed Chronicle stats row.
 
-    Maps model-specific statistical outputs (Z-score, Modified Z, Piecewise Unified score,
+    Picks the row's primary model output (Z-score, Modified Z, Piecewise Unified score,
     Hurdle score, Markov surprisal, Zipf rarity, Fano factor, CUSUM drift, Shannon entropy,
     Bayesian anomaly score, Delta-Z, squared Z norms, Beta-Binomial rate, Jitter CV,
-    or causal sequence matches) onto a unified positive sigma scale for CRI scoring.
+    or causal sequence matches) and maps it onto the harness Z-equivalent scale (model
+    threshold -> 3.0, true sigma unchanged) with the skills' score-semantics registry
+    (`scripts/ueba_constants.score_to_z_equivalent`), so CRI and loopback sum Z^2 are calibrated.
     """
+    semantics = harness_truth.constants()
     direct_z_fields = (
         "unified_threat_score",
         "piecewise_threat_score",
@@ -840,12 +1081,9 @@ class PlaybookRunner:
     for field in direct_z_fields:
       val = row.get(field)
       if val is not None:
-        try:
-          fval = float(val)
-          if not math.isnan(fval):
-            return fval, field
-        except (ValueError, TypeError):
-          pass
+        z_equiv = semantics.score_to_z_equivalent(field, val)
+        if z_equiv is not None:
+          return z_equiv, field
 
     squared_z_fields = (
         "capstone_threat_norm_sq",
@@ -854,38 +1092,110 @@ class PlaybookRunner:
         "d_vs_fleet_sq",
         "poisson_z_sq",
     )
-    for field in squared_z_fields:
+    # Bounded failure probability and inter-arrival jitter CV (inverted) close the scored columns.
+    for field in squared_z_fields + ("regularized_failure_prob", "cv"):
       val = row.get(field)
       if val is not None:
-        try:
-          fval = max(0.0, float(val))
-          return math.sqrt(fval), field
-        except (ValueError, TypeError):
-          pass
-
-    if row.get("regularized_failure_prob") is not None:
-      try:
-        prob = float(row["regularized_failure_prob"])
-        # Map regularized failure rate [0.40 .. 1.0] onto sigma [3.5 .. 8.0]
-        eff_z = 3.5 + max(0.0, (prob - 0.40)) * 7.5
-        return round(eff_z, 2), "regularized_failure_prob"
-      except (ValueError, TypeError):
-        pass
-
-    if row.get("cv") is not None:
-      try:
-        cv_val = max(0.0, float(row["cv"]))
-        # Map low inter-arrival jitter CV [0.0 .. 0.25] onto sigma [6.0 .. 3.5]
-        eff_z = max(3.5, 6.0 - (cv_val * 10.0))
-        return round(eff_z, 2), "cv"
-      except (ValueError, TypeError):
-        pass
+        z_equiv = semantics.score_to_z_equivalent(field, val)
+        if z_equiv is not None:
+          return z_equiv, field
 
     if row.get("carrier_events") is not None or row.get("bailout_events") is not None:
       # Two-stage causal sequence bridge match that passed root `condition:`
       return 4.5, "causal_sequence_match"
 
     return 3.5, "condition_gate_match"
+
+  @staticmethod
+  def _finite_float(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+      return None
+    try:
+      fval = float(value)
+    except (ValueError, TypeError):
+      return None
+    return fval if math.isfinite(fval) else None
+
+  @classmethod
+  def is_final_capstone(cls, spec: PlaybookQuerySpec) -> bool:
+    """True for a Wave 3 Capstone rollup (a capstone that is not an inline Stage B loopback query)."""
+    return spec.is_capstone and not cls._is_stage_b_loopback_query(spec)
+
+  @classmethod
+  def score_row(cls, row: Dict[str, Any], spec: PlaybookQuerySpec) -> Dict[str, Any]:
+    """Entity, Z-equivalent score and canonical CRI for one returned row.
+
+    Wave 3 Capstone rows are scored on the loopback sum Z^2 they were gated on; every
+    other row on its primary model output (`extract_row_effective_z`).
+    """
+    entity_id, entity_type = cls.extract_row_entity(row, spec.entity_type_hint)
+    effective_z: Optional[float] = None
+    score_field = ""
+    if cls.is_final_capstone(spec):
+      for col in cls.LOOPBACK_SUM_Z_SQ_COLUMNS:
+        if row.get(col) is not None:
+          effective_z = harness_truth.constants().score_to_z_equivalent(col, row[col])
+          if effective_z is not None:
+            score_field = col
+            break
+    if effective_z is None:
+      effective_z, score_field = cls.extract_row_effective_z(row)
+    return {
+        "entity": entity_id,
+        "entity_type": entity_type,
+        "effective_z": effective_z,
+        "score_field": score_field,
+        "native_score": row.get(score_field),
+        "cri": harness_truth.calculate_cri(effective_z),
+    }
+
+  @classmethod
+  def evaluate_loopback_gate(cls, row: Dict[str, Any]) -> Dict[str, Any]:
+    """Harness loopback gate for a Wave 3 Capstone row.
+
+    Fires only on >= LOOPBACK_MIN_DISTINCT_HITS distinct hits and sum Z^2 >=
+    LOOPBACK_COMPOSITE_SUM_Z_SQ_THRESHOLD (`harness_truth.loopback_thresholds()`), whatever gate the
+    playbook query itself used. Rows without both evidence columns fail closed.
+    """
+    min_hits, sum_z_sq_threshold = harness_truth.loopback_thresholds()
+    distinct_hits = next(
+        (v for v in (cls._finite_float(row.get(c)) for c in cls.LOOPBACK_DISTINCT_HIT_COLUMNS) if v is not None),
+        None,
+    )
+    sum_z_sq = next(
+        (v for v in (cls._finite_float(row.get(c)) for c in cls.LOOPBACK_SUM_Z_SQ_COLUMNS) if v is not None),
+        None,
+    )
+    if distinct_hits is None or sum_z_sq is None:
+      reason = "MISSING_LOOPBACK_EVIDENCE"
+    elif distinct_hits < min_hits:
+      reason = "BELOW_MIN_DISTINCT_HITS"
+    elif sum_z_sq < sum_z_sq_threshold:
+      reason = "BELOW_SUM_Z_SQ_THRESHOLD"
+    else:
+      reason = "FIRED"
+    return {
+        "fired": reason == "FIRED",
+        "reason": reason,
+        "distinct_hits": distinct_hits,
+        "sum_z_sq": sum_z_sq,
+        "min_distinct_hits": min_hits,
+        "sum_z_sq_threshold": sum_z_sq_threshold,
+    }
+
+  @classmethod
+  def assess_cri(cls, cri: Any, entity_type: str) -> Dict[str, Any]:
+    """Band, UDM severity, verdict and recommended action for a CRI (all from harness_truth)."""
+    band_code, band_label, _ = harness_truth.cri_band(cri)
+    return {
+        "band": band_label,
+        "severity": "UNKNOWN_SEVERITY" if band_code == "N/A" else band_code,
+        "verdict": harness_truth.verdict_for(cri),
+        "recommended_action": harness_truth.recommended_action(
+            cri, containment_action=cls.CONTAINMENT_ACTION_BY_ENTITY_TYPE.get(entity_type, "ISOLATE_HOST")
+        ),
+        "action_guidance": harness_truth.action_guidance(cri),
+    }
 
   def build_playbook_match_udm_event(
       self,
@@ -897,15 +1207,23 @@ class PlaybookRunner:
       run_timestamp_iso: str,
       evaluated_day: str,
       run_id: Optional[str] = None,
+      query_window: Optional[Dict[str, Any]] = None,
   ) -> Dict[str, Any]:
-    """Builds a Chronicle ImportEvents-compliant UDM GENERIC_EVENT for a matched row."""
+    """Builds a Chronicle ImportEvents-compliant UDM GENERIC_EVENT for a matched row.
+
+    CRI is the canonical harness CRI of the row's Z-equivalent score (no floor); severity, verdict and
+    recommended action come from its band. Callers gate write-back on
+    `harness_truth.writeback_cri_threshold()`.
+    """
     eff_run_id = run_id or f"run_{playbook_id}_{evaluated_day}"
-    entity_id, entity_type = self.extract_row_entity(row, spec.entity_type_hint)
-    effective_z, score_field = self.extract_row_effective_z(row)
-    raw_cri = self.runner.calculate_cri(effective_z)
-    # Any row passing a playbook query's root `condition:` is a confirmed outlier (>= 50 CRI)
-    cri_score = max(50, raw_cri)
-    severity = self.risk_engine.derive_cri_severity(cri_score)
+    scored = self.score_row(row, spec)
+    entity_id, entity_type = scored["entity"], scored["entity_type"]
+    effective_z, score_field = scored["effective_z"], scored["score_field"]
+    cri_score = scored["cri"] if scored["cri"] is not None else 0
+    assessment = self.assess_cri(cri_score, entity_type)
+    severity = assessment["severity"]
+    semantics = harness_truth.constants()
+    native_score = scored["native_score"]
 
     if entity_type == "USER":
       principal: Dict[str, Any] = {"user": {"userid": entity_id}}
@@ -929,10 +1247,20 @@ class PlaybookRunner:
         {"key": "Target Entity", "value": entity_id},
         {"key": "Entity Type", "value": entity_type},
         {"key": "Score Metric", "value": score_field},
-        {"key": "Effective Z-Score", "value": f"+{effective_z:.2f}σ"},
+        {
+            "key": "Native Score",
+            "value": semantics.format_score_with_unit(score_field, native_score) if native_score is not None else "N/A",
+        },
+        {"key": "Effective Z-Score", "value": semantics.format_score_with_unit(score_field, effective_z)},
         {"key": "CRI Score", "value": str(cri_score)},
+        {"key": "CRI Band", "value": assessment["band"]},
         {"key": "Severity Tier", "value": severity},
+        {"key": "Verdict", "value": assessment["verdict"]},
+        {"key": "Recommended Action", "value": assessment["recommended_action"]},
+        {"key": "Action Guidance", "value": assessment["action_guidance"]},
     ]
+    if query_window:
+      labels.append({"key": "Query Window", "value": f"{query_window.get('start')} -> {query_window.get('end')}"})
 
     # Attach all returned query outcome columns as structured labels
     for col_key, col_val in sorted(row.items()):
@@ -1010,12 +1338,18 @@ class PlaybookRunner:
   ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Synthesizes Cross-Query Entity Convergence across all matched queries in a playbook run.
 
-    Any entity matching >= 2 distinct queries in the playbook receives a converged Euclidean
-    L2 norm Z-score (`sqrt(sum(z_i^2))`) and a consolidated UDM convergence event.
+    An entity converges only when it matches >= LOOPBACK_MIN_DISTINCT_HITS distinct queries with
+    sum(z_i^2) >= LOOPBACK_COMPOSITE_SUM_Z_SQ_THRESHOLD (`harness_truth.loopback_thresholds()`, read
+    on every call). The sum Z^2 maps onto the Z-equivalent scale through the harness score-semantics
+    registry; its canonical CRI must clear `harness_truth.writeback_cri_threshold()` for the
+    consolidated UDM convergence event to be written back.
     """
     eff_run_id = run_id or f"run_{playbook_id}_{evaluated_day}"
     converged_summaries: List[Dict[str, Any]] = []
     convergence_udm_events: List[Dict[str, Any]] = []
+    min_distinct_hits, sum_z_sq_threshold = harness_truth.loopback_thresholds()
+    writeback_threshold = harness_truth.writeback_cri_threshold()
+    semantics = harness_truth.constants()
 
     for entity_id, hits in sorted(entity_hits.items()):
       if not entity_id or entity_id == "unknown_entity":
@@ -1027,16 +1361,21 @@ class PlaybookRunner:
         if qid not in by_query or hit["effective_z"] > by_query[qid]["effective_z"]:
           by_query[qid] = hit
 
-      if len(by_query) < 2:
+      if len(by_query) < min_distinct_hits:
         continue
 
       distinct_hits = list(by_query.values())
       entity_type = distinct_hits[0]["entity_type"]
       norm_sq = sum(h["effective_z"] ** 2 for h in distinct_hits)
-      combined_z = round(math.sqrt(norm_sq), 2)
-      raw_cri = self.runner.calculate_cri(combined_z)
-      cri_score = max(65, raw_cri)
-      severity = self.risk_engine.derive_cri_severity(cri_score)
+      if norm_sq < sum_z_sq_threshold:
+        continue
+      combined_norm = math.sqrt(norm_sq)
+      combined_z = semantics.score_to_z_equivalent(self.CONVERGENCE_SCORE_KEY, norm_sq)
+      cri_score = harness_truth.calculate_cri(combined_z)
+      if cri_score is None or cri_score < writeback_threshold:
+        continue
+      assessment = self.assess_cri(cri_score, entity_type)
+      severity = assessment["severity"]
       contributing_queries = sorted(by_query.keys())
       contributing_sections = sorted({h["section"] for h in distinct_hits if h.get("section")})
 
@@ -1047,10 +1386,17 @@ class PlaybookRunner:
           "distinct_queries_matched": len(distinct_hits),
           "contributing_queries": contributing_queries,
           "contributing_sections": contributing_sections,
-          "combined_effective_z": combined_z,
+          "combined_effective_z": round(combined_z, 2),
+          "combined_l2_norm": round(combined_norm, 2),
           "combined_norm_sq": round(norm_sq, 2),
           "cri_score": cri_score,
           "severity": severity,
+          "verdict": assessment["verdict"],
+          "recommended_action": assessment["recommended_action"],
+          "loopback_thresholds": {
+              "min_distinct_hits": min_distinct_hits,
+              "sum_z_sq_threshold": sum_z_sq_threshold,
+          },
       }
       converged_summaries.append(summary_entry)
 
@@ -1075,15 +1421,22 @@ class PlaybookRunner:
           {"key": "Entity Type", "value": entity_type},
           {"key": "Distinct Queries Matched", "value": str(len(distinct_hits))},
           {"key": "Contributing Queries", "value": ",".join(contributing_queries)[:256]},
-          {"key": "Effective Z-Score", "value": f"+{combined_z:.2f}σ"},
+          {"key": "Sum Z^2", "value": f"{norm_sq:.2f}"},
+          {"key": "Combined L2 Norm", "value": f"{combined_norm:.2f}"},
+          {"key": "Effective Z-Score", "value": f"{combined_z:.2f}"},
           {"key": "CRI Score", "value": str(cri_score)},
+          {"key": "CRI Band", "value": assessment["band"]},
           {"key": "Severity Tier", "value": severity},
+          {"key": "Verdict", "value": assessment["verdict"]},
+          {"key": "Recommended Action", "value": assessment["recommended_action"]},
+          {"key": "Action Guidance", "value": assessment["action_guidance"]},
       ]
 
       summary_text = (
           f"[{playbook_id}/capstone_cross_query_convergence] Cross-Query Entity Convergence — "
           f"{entity_type} {entity_id} matched {len(distinct_hits)} distinct queries "
-          f"({','.join(contributing_queries)}) with L2 Z={combined_z:.2f}σ, CRI={cri_score}/100"
+          f"({','.join(contributing_queries)}) with sum Z^2={norm_sq:.2f} "
+          f"(L2 norm {combined_norm:.2f}), CRI={cri_score}/100"
       )
 
       convergence_udm_events.append({
@@ -1096,6 +1449,11 @@ class PlaybookRunner:
               "event_type": self.PLAYBOOK_EVENT_METADATA["event_type"],
               "product_event_type": self.PLAYBOOK_EVENT_METADATA["product_event_type"],
               "description": summary_text,
+              "ingestion_labels": [
+                  {"key": "run_id", "value": eff_run_id},
+                  {"key": "playbook_id", "value": playbook_id},
+                  {"key": "query_id", "value": "capstone_cross_query_convergence"},
+              ],
           },
           "observer": {
               "hostname": "secops-agentic-playbook-hunter",
@@ -1116,7 +1474,7 @@ class PlaybookRunner:
                   "threat_status": "ACTIVE",
                   "severity": severity,
                   "risk_score": cri_score,
-                  "confidence_score": combined_z,
+                  "confidence_score": round(combined_z, 2),
                   "summary": summary_text,
                   "description": (
                       f"Entity {entity_id} triggered {len(distinct_hits)} distinct behavioral "
@@ -1154,10 +1512,18 @@ class PlaybookRunner:
       record_emit_fn: Optional[Callable[[str, str, str, str, float, int], None]] = None,
       http_client: Optional[httpx.AsyncClient] = None,
   ) -> Dict[str, Any]:
-    """Fetches, parses, validates, and executes all multi-stage queries in a Markdown playbook."""
+    """Fetches, parses, validates, and executes all multi-stage queries in a Markdown playbook.
+
+    Every query runs on the harness window for the last complete UTC day D
+    (`resolve_query_window`) with its dates set to D (`pin_query_to_scored_day`); D is the run's
+    `evaluated_day` and intra-day dedup bucket.
+    """
     stamp_dt = now_utc or datetime.now(timezone.utc)
     run_timestamp_iso = stamp_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    bucket_date = stamp_dt.strftime("%Y-%m-%d")
+    evaluated_day = harness_truth.mode_a_day(stamp_dt)
+    bucket_date = evaluated_day.isoformat()
+    writeback_threshold = harness_truth.writeback_cri_threshold()
+    loopback_min_hits, loopback_sum_z_sq = harness_truth.loopback_thresholds()
 
     pb_id = playbook_id or self.derive_playbook_id(source)
     eff_run_id = run_id or self.generate_run_id(pb_id, stamp_dt)
@@ -1216,6 +1582,8 @@ class PlaybookRunner:
     total_matches = 0
     total_emitted = 0
     total_suppressed = 0
+    total_below_writeback = 0
+    total_below_loopback = 0
     total_udm_generated = 0
     upstream_udm_generated = 0
     flushed_upstream_udm = 0
@@ -1247,24 +1615,30 @@ class PlaybookRunner:
 
     def _process_query_rows(
         spec: PlaybookQuerySpec,
-        lb_days: int,
+        window: Dict[str, Any],
         rows: List[Dict[str, Any]],
         capstone_sync_validation: Optional[Dict[str, Any]] = None,
     ) -> None:
       nonlocal previous_candidates, total_matches, total_emitted, total_suppressed
-      nonlocal total_udm_generated, upstream_udm_generated
+      nonlocal total_udm_generated, upstream_udm_generated, total_below_writeback, total_below_loopback
       current_candidates: List[str] = []
       matched_entities: List[Dict[str, Any]] = []
       emitted_for_query = 0
       suppressed_for_query = 0
-      is_final_capstone = spec.is_capstone and not self._is_stage_b_loopback_query(spec)
+      below_writeback_for_query = 0
+      below_loopback_for_query = 0
+      is_final_capstone = self.is_final_capstone(spec)
 
       for row in rows:
-        entity_id, entity_type = self.extract_row_entity(row, spec.entity_type_hint)
-        effective_z, score_field = self.extract_row_effective_z(row)
+        scored = self.score_row(row, spec)
+        entity_id, entity_type = scored["entity"], scored["entity_type"]
+        effective_z, score_field = scored["effective_z"], scored["score_field"]
+        cri_score = scored["cri"]
+        # UDM write-back requires the harness CRI threshold; only qualifying findings feed convergence.
+        writeback_eligible = cri_score is not None and cri_score >= writeback_threshold
         if entity_id and entity_id != "unknown_entity":
           current_candidates.append(entity_id)
-          if not is_final_capstone:
+          if not is_final_capstone and writeback_eligible:
             entity_query_hits.setdefault(entity_id, []).append({
                 "query_id": spec.query_id,
                 "section": spec.section,
@@ -1275,6 +1649,15 @@ class PlaybookRunner:
             })
 
         total_matches += 1
+        # Wave 3 Capstone rows fire only on the harness loopback gate, whatever the query's own gate.
+        if is_final_capstone and not self.evaluate_loopback_gate(row)["fired"]:
+          total_below_loopback += 1
+          below_loopback_for_query += 1
+          continue
+        if not writeback_eligible:
+          total_below_writeback += 1
+          below_writeback_for_query += 1
+          continue
         # When a playbook has a downstream `run_id`-scoped Capstone query, never suppress
         # upstream events via intra-day deduplication so the current `run_id` batch is complete.
         bypass_intraday_dedup = has_capstone and scope_capstone_to_run_id and not is_final_capstone
@@ -1293,6 +1676,7 @@ class PlaybookRunner:
             run_timestamp_iso=run_timestamp_iso,
             evaluated_day=bucket_date,
             run_id=eff_run_id,
+            query_window=window,
         )
         udm_events_to_ingest.append(udm_event)
         total_udm_generated += 1
@@ -1305,12 +1689,15 @@ class PlaybookRunner:
         if record_emit_fn is not None:
           record_emit_fn(bucket_date, pb_id, spec.query_id, entity_id, effective_z, cri_score)
 
+        assessment = self.assess_cri(cri_score, entity_type)
         matched_entities.append({
             "entity": entity_id,
             "entity_type": entity_type,
             "score_field": score_field,
             "effective_z": round(effective_z, 2),
             "cri_score": cri_score,
+            "verdict": assessment["verdict"],
+            "recommended_action": assessment["recommended_action"],
         })
 
       previous_candidates = current_candidates
@@ -1321,13 +1708,21 @@ class PlaybookRunner:
           "statistical_model": spec.statistical_model,
           "plane": spec.plane,
           "is_capstone": spec.is_capstone,
-          "lookback_days": lb_days,
+          "lookback_days": window["lookback_days"],
+          "window": {"start": window["start"], "end": window["end"], "mode": window["mode"]},
           "status": "SUCCESS",
           "matches_found": len(rows),
           "matches_emitted": emitted_for_query,
           "matches_suppressed_dedup": suppressed_for_query,
+          "matches_below_writeback_cri": below_writeback_for_query,
           "matched_entities": matched_entities[:25],
       }
+      if is_final_capstone:
+        q_report["matches_below_loopback_gate"] = below_loopback_for_query
+        q_report["loopback_gate"] = {
+            "min_distinct_hits": loopback_min_hits,
+            "sum_z_sq_threshold": loopback_sum_z_sq,
+        }
       if capstone_sync_validation is not None:
         q_report["udm_sync_validation"] = capstone_sync_validation
       query_reports.append(q_report)
@@ -1359,27 +1754,27 @@ class PlaybookRunner:
         if len(wave_specs) > 1:
           async def _run_wave_item(
               w_idx: int, w_spec: PlaybookQuerySpec
-          ) -> Tuple[PlaybookQuerySpec, int, Optional[List[Dict[str, Any]]], Optional[str]]:
-            lb = self.resolve_effective_lookback_days(w_spec, lookback_days_override)
-            s_iso = (stamp_dt - timedelta(days=max(1, lb))).strftime("%Y-%m-%dT%H:%M:%SZ")
+          ) -> Tuple[PlaybookQuerySpec, Dict[str, Any], Optional[List[Dict[str, Any]]], Optional[str]]:
+            w_window = self.resolve_query_window(w_spec, evaluated_day, stamp_dt, lookback_days_override)
+            w_query = self.pin_query_to_scored_day(w_spec.raw_query, evaluated_day, w_window["pin_event_stages"])
             async with query_sem:
               if w_idx > 0 and inter_query_delay_sec > 0:
                 await asyncio.sleep(inter_query_delay_sec)
               try:
                 resp = await self.runner.execute_query_via_mcp(
                     session=session,
-                    query=w_spec.raw_query,
-                    start_iso=s_iso,
-                    end_iso=run_timestamp_iso,
+                    query=w_query,
+                    start_iso=w_window["start"],
+                    end_iso=w_window["end"],
                 )
-                return w_spec, lb, self.runner.parse_stats_response(resp), None
+                return w_spec, w_window, self.runner.parse_stats_response(resp), None
               except Exception as w_err:
-                return w_spec, lb, None, str(w_err)
+                return w_spec, w_window, None, str(w_err)
 
           wave_outcomes = await asyncio.gather(
               *(_run_wave_item(w_i, w_s) for w_i, w_s in enumerate(wave_specs))
           )
-          for w_spec, lb, w_rows, w_err in wave_outcomes:
+          for w_spec, w_window, w_rows, w_err in wave_outcomes:
             if w_err is not None or w_rows is None:
               logger.error(f"Playbook '{pb_id}' query '{w_spec.query_id}' execution failed: {w_err}")
               query_reports.append({
@@ -1389,11 +1784,12 @@ class PlaybookRunner:
                   "status": "ERROR",
                   "error": w_err or "Unknown error",
                   "matches_found": 0,
+                  "window": {"start": w_window["start"], "end": w_window["end"], "mode": w_window["mode"]},
               })
               previous_candidates = []
             else:
               queries_executed += 1
-              _process_query_rows(w_spec, lb, w_rows)
+              _process_query_rows(w_spec, w_window, w_rows)
           continue
         else:
           # Single query in wave: rewind idx by 1 and fall through to standard sequential path
@@ -1418,17 +1814,13 @@ class PlaybookRunner:
         previous_candidates = []
         continue
 
-      lb_days = self.resolve_effective_lookback_days(spec, lookback_days_override)
-      start_dt = stamp_dt - timedelta(days=max(1, lb_days))
-      start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+      window = self.resolve_query_window(spec, evaluated_day, stamp_dt, lookback_days_override)
+      start_iso, window_end_iso = window["start"], window["end"]
 
       # Option 3: If this query is a Capstone UDM Loopback query (`PLAYBOOK_BEHAVIORAL_HUNT_MATCH`),
       # flush all upstream playbook match UDM events AND verify they are indexed in Chronicle UDM
       # before running the Capstone query.
       capstone_sync_validation: Optional[Dict[str, Any]] = None
-      capstone_end_iso = (
-          max(datetime.now(timezone.utc), stamp_dt) + timedelta(minutes=2)
-      ).strftime("%Y-%m-%dT%H:%M:%SZ")
       if spec.is_capstone:
         is_stage_b_loopback = self._is_stage_b_loopback_query(spec)
         if is_stage_b_loopback and not wave2_flushed:
@@ -1468,7 +1860,7 @@ class PlaybookRunner:
                 run_id=eff_run_id,
                 expected_events=expected_for_wave,
                 start_iso=start_iso,
-                end_iso=capstone_end_iso,
+                end_iso=window_end_iso,
                 max_attempts=eff_val_max_attempts,
                 poll_interval_sec=eff_val_poll_sec,
                 playbook_id=pb_id,
@@ -1537,18 +1929,18 @@ class PlaybookRunner:
           previous_candidates = []
           continue
         query_to_run = prepared
+      query_to_run = self.pin_query_to_scored_day(query_to_run, evaluated_day, window["pin_event_stages"])
 
       if queries_executed > 0 and inter_query_delay_sec > 0:
         await asyncio.sleep(inter_query_delay_sec)
 
-      effective_end_iso = capstone_end_iso if spec.is_capstone else run_timestamp_iso
       try:
         async with query_sem:
           raw_resp = await self.runner.execute_query_via_mcp(
               session=session,
               query=query_to_run,
               start_iso=start_iso,
-              end_iso=effective_end_iso,
+              end_iso=window_end_iso,
           )
         queries_executed += 1
         rows = self.runner.parse_stats_response(raw_resp)
@@ -1561,6 +1953,7 @@ class PlaybookRunner:
             "status": "ERROR",
             "error": str(q_err),
             "matches_found": 0,
+            "window": {"start": start_iso, "end": window_end_iso, "mode": window["mode"]},
         }
         if capstone_sync_validation is not None:
           err_report["udm_sync_validation"] = capstone_sync_validation
@@ -1568,7 +1961,7 @@ class PlaybookRunner:
         previous_candidates = []
         continue
 
-      _process_query_rows(spec, lb_days, rows, capstone_sync_validation)
+      _process_query_rows(spec, window, rows, capstone_sync_validation)
 
     converged_entities, convergence_events = self.converge_playbook_entities(
         playbook_id=pb_id,
@@ -1639,7 +2032,14 @@ class PlaybookRunner:
         "total_matches_found": total_matches,
         "total_matches_emitted": total_emitted,
         "total_matches_suppressed_dedup": total_suppressed,
+        "total_matches_below_writeback_cri": total_below_writeback,
+        "total_capstone_rows_below_loopback_gate": total_below_loopback,
         "total_udm_events_generated": total_udm_generated,
+        "writeback_cri_threshold": writeback_threshold,
+        "loopback_thresholds": {
+            "min_distinct_hits": loopback_min_hits,
+            "sum_z_sq_threshold": loopback_sum_z_sq,
+        },
         "udm_sync_validation": last_udm_sync_validation,
         "converged_entities": converged_entities,
         "ingestion": ingestion_result,

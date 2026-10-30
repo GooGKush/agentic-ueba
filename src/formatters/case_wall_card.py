@@ -7,31 +7,35 @@ Formats comprehensive SOC Flight Cards in Markdown for Google Chronicle SOAR
 Case Walls, detailing the problem statement, tested hypotheses (H0 vs H1),
 evidentiary defense, calibrated confidence scale, underlying UDM touchpoints,
 statistical metrics table, and defended follow-up hypotheses.
+
+CRI values, bands, verdicts and action guidance come from src/harness_truth.py;
+a missing CRI renders N/A (NOT_EVALUATED), never a nominal 0/100.
 """
 
 import html
 import re
 from typing import Any, Dict, List, Optional
+from src import harness_truth
 from src.models import StrategyDirective
+
+# Harness CRI band codes (harness_truth.cri_band) that are a binary risk finding (RISK:<code> tag).
+RISK_FINDING_BANDS = ("CRITICAL", "HIGH")
 
 
 class CaseWallCardFormatter:
   """Formats structured, visual, markdown-based flight cards for Case Wall comments."""
 
   @staticmethod
-  def render_risk_bar(cri: float) -> str:
-    """Generates a Unicode calibrated risk index meter bar."""
-    filled_blocks = min(10, max(0, int(round(cri / 10.0))))
+  def render_risk_bar(cri: Any) -> str:
+    """Unicode Calibrated Risk Index meter with the harness band label and verdict (N/A when missing)."""
+    value = harness_truth.coerce_cri(cri)
+    _, label, emoji = harness_truth.cri_band(value)
+    verdict = harness_truth.verdict_for(value)
+    if value is None:
+      return f"`N/A` [{'░' * 10}] {emoji} **NOT EVALUATED** (`{verdict}`)"
+    filled_blocks = min(10, max(0, int(round(value / 10.0))))
     bar = "█" * filled_blocks + "░" * (10 - filled_blocks)
-    if cri >= 80:
-      badge = "🔴 **CRITICAL OUTLIER**"
-    elif cri >= 60:
-      badge = "🟠 **HIGH OUTLIER**"
-    elif cri >= 40:
-      badge = "🟡 **MEDIUM ELEVATION**"
-    else:
-      badge = "🟢 **NOMINAL BASELINE**"
-    return f"`{cri:.0f}/100` [{bar}] {badge}"
+    return f"`{harness_truth.format_cri(value)}/100` [{bar}] {emoji} **{label.upper()}** (`{verdict}`)"
 
   @staticmethod
   def render_confidence_bar(score: float, band: str = "AUTO_EXECUTE") -> str:
@@ -81,7 +85,7 @@ class CaseWallCardFormatter:
   @classmethod
   def build_case_tags(
       cls,
-      calibrated_risk_index: float,
+      calibrated_risk_index: Any,
       primary_vector: Optional[str] = None,
       model_name: Optional[str] = None,
       target_metric: Optional[str] = None,
@@ -92,9 +96,11 @@ class CaseWallCardFormatter:
     """Builds the deterministic Case Wall tag taxonomy for filtering cases of interest.
 
     Taxonomy:
-    1. Binary Risk Finding Tag (emitted strictly when a risk finding exists, CRI >= 60):
-       - `RISK:CRITICAL` (CRI >= 80)
-       - `RISK:HIGH` (60 <= CRI < 80)
+    1. Binary Risk Finding Tag (emitted strictly when a risk finding exists: the harness High or
+       Critical CRI band, harness_truth.cri_band):
+       - `RISK:CRITICAL` (Critical band, CRI 90-100)
+       - `RISK:HIGH` (High band, CRI 70-89)
+       Medium and lower bands and a missing CRI (N/A) carry no risk tag.
     2. Common Vector Tag (shared across 360° Radar and deep-dive models when a finding or second-order hunt occurs):
        - `VECTOR:<SECTOR>` (e.g. `VECTOR:EGRESS`, `VECTOR:AUTH`, `VECTOR:CLOUD`, `VECTOR:WORKSPACE`,
          `VECTOR:DNS`, `VECTOR:WEB`, `VECTOR:FLOWS`, `VECTOR:ALERTS`, `VECTOR:ENDPOINT`, `VECTOR:MULTI_SECTOR`)
@@ -102,17 +108,15 @@ class CaseWallCardFormatter:
        - `SECOND_ORDER_HUNT`
     """
     tags: List[str] = []
-    cri = float(calibrated_risk_index or 0.0)
+    band_code = harness_truth.cri_band(calibrated_risk_index)[0]
     is_tier2 = second_order_ran or (
         investigation_tier in ("TIER_2_DEEP_DIVE", "TIER_2B_PIVOT")
     )
-    has_finding = cri >= 60.0
+    has_finding = band_code in RISK_FINDING_BANDS
 
     # 1. Binary Risk Finding Taxonomy (Critical vs High)
-    if cri >= 80.0:
-      tags.append("RISK:CRITICAL")
-    elif cri >= 60.0:
-      tags.append("RISK:HIGH")
+    if has_finding:
+      tags.append(f"RISK:{band_code}")
 
     # 2. Common Vector Tag (emitted when there is a finding, outlier, or second-order hunt)
     if has_finding or is_outlier or is_tier2:
@@ -133,7 +137,7 @@ class CaseWallCardFormatter:
   def render_tags_line(tags: List[str]) -> str:
     """Renders tags as inline code badges for Case Wall filtering."""
     if not tags:
-      return "`NONE (Nominal Baseline)`"
+      return "`NONE`"
     return " ".join(f"`{t}`" for t in tags)
 
   @classmethod
@@ -142,7 +146,7 @@ class CaseWallCardFormatter:
       target_entity: str,
       entity_type: str,
       model_name: str,
-      calibrated_risk_index: float,
+      calibrated_risk_index: Any,
       is_outlier: bool,
       case_id: Optional[str] = None,
       evaluated_window: str = "7-Day Sliding Horizon",
@@ -281,16 +285,27 @@ class CaseWallCardFormatter:
 
     if soc_guidance:
       lines.append(f"> {soc_guidance}")
-    elif is_outlier:
+    elif harness_truth.coerce_cri(calibrated_risk_index) is None:
       lines.append(
-          f"> **ESCALATION RECOMMENDED**: Telemetry for `{target_entity}` satisfies the alternative hypothesis ($H_1$) with CRI score {calibrated_risk_index:.0f}/100. "
-          f"Investigate downstream lateral connections and stage credential/host containment playbooks."
+          f"> **NOT EVALUATED**: No Calibrated Risk Index for `{target_entity}` (CRI N/A). "
+          f"{harness_truth.action_guidance(None)}"
       )
     else:
-      lines.append(
-          f"> **BENIGN / NOMINAL ACTIVITY**: Telemetry for `{target_entity}` supports the null hypothesis ($H_0$) with CRI score {calibrated_risk_index:.0f}/100. "
-          f"No containment actions required. Logged as baseline operational activity."
+      _, band_label, band_emoji = harness_truth.cri_band(calibrated_risk_index)
+      cri_assessment = (
+          f"CRI {harness_truth.format_cri(calibrated_risk_index)}/100 ({band_emoji} {band_label}, "
+          f"verdict `{harness_truth.verdict_for(calibrated_risk_index)}`)"
       )
+      if is_outlier:
+        lines.append(
+            f"> **ESCALATION RECOMMENDED**: Telemetry for `{target_entity}` satisfies the alternative hypothesis ($H_1$) with {cri_assessment}. "
+            f"{harness_truth.action_guidance(calibrated_risk_index)}"
+        )
+      else:
+        lines.append(
+            f"> **BENIGN / NOMINAL ACTIVITY**: Telemetry for `{target_entity}` supports the null hypothesis ($H_0$) with {cri_assessment}. "
+            f"{harness_truth.action_guidance(calibrated_risk_index)}"
+        )
 
     # 🧭 Recommended Avenues to Pursue (with Structured Hypothesis Defense & Confidence Scores)
     avenues = directive.recommended_avenues if directive and directive.recommended_avenues else []

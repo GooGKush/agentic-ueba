@@ -5,7 +5,7 @@
 
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -35,6 +35,22 @@ try:
   dotenv.load_dotenv()
 except ImportError:
   pass
+
+
+def _harness_anomaly_threshold(tier: Optional[str] = None) -> float:
+  """Anomaly (Z) threshold of a harness sensitivity tier; the default tier when `tier` is None.
+
+  Imported lazily: src.harness_truth imports get_skills_root from this module.
+  """
+  from src import harness_truth
+  _, thresholds = harness_truth.constants().resolve_sensitivity_thresholds(tier)
+  return float(thresholds["anomaly_threshold"])
+
+
+def _env_float(name: str, default: Callable[[], float]) -> float:
+  """Float from environment variable `name`, else the lazily computed `default()`."""
+  raw = os.environ.get(name, "").strip()
+  return float(raw) if raw else default()
 
 
 class TenantConfig(BaseModel):
@@ -105,11 +121,15 @@ class TenantConfig(BaseModel):
   fleet_360_interval_seconds: int = Field(
       default_factory=lambda: int(os.environ.get("FLEET_360_INTERVAL_SECONDS", "14400"))
   )
+  # Radar score gates default to the harness sensitivity tiers: a sector spike breaches at the
+  # default (BALANCED) anomaly threshold; context spokes are included at the HIGH_RECALL one.
   fleet_360_spike_threshold_z: float = Field(
-      default_factory=lambda: float(os.environ.get("FLEET_360_SPIKE_THRESHOLD_Z", "3.0"))
+      default_factory=lambda: _env_float("FLEET_360_SPIKE_THRESHOLD_Z", _harness_anomaly_threshold)
   )
   fleet_360_spoke_inclusion_z: float = Field(
-      default_factory=lambda: float(os.environ.get("FLEET_360_SPOKE_INCLUSION_Z", "2.0"))
+      default_factory=lambda: _env_float(
+          "FLEET_360_SPOKE_INCLUSION_Z", lambda: _harness_anomaly_threshold("HIGH_RECALL")
+      )
   )
   fleet_360_min_observed: int = Field(
       default_factory=lambda: int(os.environ.get("FLEET_360_MIN_OBSERVED", "5"))

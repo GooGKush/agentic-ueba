@@ -17,8 +17,8 @@ Welcome to **Agentic UEBA** (`secops-agentic-hunter`). This document defines the
 │    - 30-day metrics.* baselines across 38 Malachite metrics & 11 KillChainArchetypes   │
 │    - 18 mathematical models & 34 templates (Quantile/IQR/Skew, MAD, Peer, CUSUM, 360°) │
 │  • Micro / Windowed Plane (secops-statistical-hunter v2.9.0+):                         │
-│    - Bounded (<= 14d) raw UDM statistical & structural models across 24 archetypes     │
-│    - Tukey/Bowley Skew Fences, Markov, Shannon, C2 CV, Fano, Zipf, EWMA, Geo, PCR, Lag │
+│    - Bounded (<= 14d) raw UDM statistical & structural models, 27 active archetypes    │
+│    - Tukey/Bowley Skew Fences, Markov, Shannon, C2 CV, Fano, Zipf, EWMA, PCR, Lag      │
 │  • Normalization Layer: Calibrated Risk Index (CRI in [0, 100], Sigmoid alpha = 0.6)   │
 │                                                                                        │
 │                   │ (CleanHandOffPayload / UDM Loopback / %ueba_hunt_bridge)           │
@@ -68,7 +68,7 @@ flowchart TD
 
     subgraph Harness ["3. Bilateral UEBA Harness & Safety Gates"]
         M1["RiskMetricsEngine (35d metrics.*, 38 Metrics, 11 KillChains, %DataTable)"]
-        M2["StatsHunterEngine (<=14d Raw UDM Guardrail, 23 Archetypes)"]
+        M2["StatsHunterEngine (<=14d Raw UDM Guardrail, 27 Active Archetypes)"]
         M3["DynamicProtocolAdapter + Gemini ReAct (3 Python Hybrid Tools)"]
         QG["QueryIntegrityGate (AST, Slot, Entity, %DataTable & Backend Error QA)"]
         SEM["PipelineRunner (Semaphore=6 udm_search + secops-ueba-io ThreadPool)"]
@@ -103,7 +103,7 @@ flowchart TD
 * **Role**: Coordinates continuous background loops alongside live HTTP and MCP requests inside a single stateful container instance (`--min-instances=1 --max-instances=1 --no-cpu-throttling`).
 * **Responsibilities**:
   * **60s SOAR Case Scanner (`_run_loop` + `_worker_loop`)**: Polls open SOAR cases (`list_cases`), inspects raw connector telemetry (`get_connector_event`), deduplicates against `_in_flight_case_ids` and `data/watchdog_state.json`, and dispatches unseen cases to `WATCHDOG_WORKER_CONCURRENCY=3` workers.
-  * **4h Fleetwide 360° Sweep (`_fleet_360_loop`)**: Runs $O(1)$ Mode A fleetwide sector queries across `USER` (6 sectors) and `ASSET` (6 sectors), enforcing intra-day escalation deduplication (`should_emit_fleet_360`: emits once per UTC day unless a new sector breaches $\ge 3.0\sigma$ or Euclidean $D$ escalates by $\ge +2.0\sigma$).
+  * **4h Fleetwide 360° Sweep (`_fleet_360_loop`)**: Runs $O(1)$ Mode A fleetwide sector queries across `USER` (6 sectors) and `ASSET` (6 sectors), enforcing intra-day escalation deduplication (`should_emit_fleet_360`: emits once per UTC day unless a new sector breaches the spike threshold or Euclidean $D$ reaches a higher harness CRI band).
   * **Parallel Playbook Scheduler (`_playbook_loop`)**: Runs up to `SECOPS_PLAYBOOK_CONCURRENCY=6` due Markdown playbooks concurrently with per-playbook `asyncio.Lock` guards (`SKIPPED_CONCURRENT` on overlap) so playbooks sleeping at 2–22.5 minute UDM indexing barriers hold zero `udm_search` semaphore slots.
   * **Global API & Thread Isolation (`PipelineRunner`)**: Enforces a process-wide `asyncio.Semaphore` (`SECOPS_MAX_CONCURRENT_UDM_SEARCHES=6`) across every `udm_search` call and offloads synchronous `ImportEvents` uploads, Malachite AST validation, ADC OAuth refreshes, and disk state writes onto `secops-ueba-io` worker threads.
 
@@ -111,16 +111,18 @@ flowchart TD
 
 ### Subsystem 2: Statistical Evaluator, Warrant Analyzer & Epistemic Pivot Engine (`src/risk_metrics_engine.py`, `src/stats_hunter_engine.py`, `src/strategy_decider.py`)
 * **Statistical Gate & Calibrated Risk Index (CRI)**:
+  * **Harness truth (`src/harness_truth.py`)**: the single runtime source of harness truth. It loads the CRI formula and bands, sensitivity tiers, loopback / write-back thresholds, Mode B/C caps and the retired-model registries from the skills and defines the band verdict / action mapping and the Mode A, Entity Graph and raw-baseline windows; no subsystem re-declares them.
   * Evaluates personal 30-day drift ($Z_{\text{Self}}$), peer cohort divergence ($Z_{\text{Peer}}$), and multi-sector Euclidean threat distance $D = \sqrt{\sum \max(0, Z_i)^2}$.
-  * Normalizes anomaly scores into the **Calibrated Risk Index ($\text{CRI} \in [0, 100]$)**:
+  * Normalizes anomaly scores into the **Calibrated Risk Index ($\text{CRI} \in [0, 100]$)**, with a zero floor ($\text{CRI} = 0$ for $Z \le 0$) and `N/A` when the score is missing or invalid (never a nominal `0`):
     $$
-    \text{CRI}(Z) = \text{round}\left(\frac{100}{1 + \exp(-0.6 \cdot (Z - 3.0))}\right)
+    \text{CRI}(Z) = \text{round}\left(\frac{100}{1 + \exp(-0.6 \cdot (Z - 3.0))}\right), \quad Z > 0
     $$
-  * Classifies outliers at $\text{CRI} \ge 46$ ($Z \ge 3.0\sigma$).
-  * **Root Significance Gate (`PipelineRunner.GATE_DEFAULTS`)**: Every `secops-risk-metrics-multistage` template carries an explicit root `condition:` (`anomaly_threshold = 3.0`, `fold_change_threshold = 2.0`, `fusion_threshold_sq = 9.0` i.e. $D \ge 3.0$, `robust_threshold = 3.5`) aligned with the Python evaluator so nominal entities are filtered server-side without dropping borderline outliers.
+  * Bands: `0–25` Nominal, `26–45` Low Drift, `46–69` Medium Outlier, `70–89` High Threat, `90–100` Critical Outlier ($Z = 3.0\sigma$ maps to CRI 50). Verdict / action: Critical → `CRITICAL_OUTLIER` + the domain containment action; High / Medium → `HIGH_OUTLIER` / `MEDIUM_OUTLIER` + `INVESTIGATE`; Low / Nominal / N/A → `LOW_OUTLIER` / `NOMINAL_BASELINE` / `NOT_EVALUATED` + `MONITOR`. Actions are recommendations only; agentic_ueba never executes containment.
+  * **Root Significance Gate (harness sensitivity tier, `RiskMetricsEngine.gate_thresholds()`)**: Every `secops-risk-metrics-multistage` template carries an explicit root `condition:` filled from `ueba_constants.resolve_sensitivity_thresholds()` (BALANCED: `anomaly_threshold = 3.0`, `fold_change_threshold = 2.0`, `fusion_threshold_sq = 12.25` i.e. $D^2 \ge 12.25$ ($D \ge 3.5$), `robust_threshold = 3.5`) aligned with the Python evaluator so nominal entities are filtered server-side without dropping borderline outliers.
 * **Telemetry Physics & Window Guardrail**:
   * **Macro Plane (`RiskMetricsEngine`)**: Queries pre-computed `metrics.*` daily rollups over `35d` windows across all **38 Malachite catalog metrics**.
-  * **Micro Plane (`StatsHunterEngine`)**: Hard-clamps raw UDM statistical queries to **`<= 14 days`** (`enforce_telemetry_physics_window`) and shifts Entity Context Graph (`DERIVED_CONTEXT` / `GLOBAL_CONTEXT`) windows back `48h` (`D-2`) when required, preventing 1M-row raw scan timeouts across all **23 canonical `secops-statistical-hunter` archetypes**.
+  * **Micro Plane (`StatsHunterEngine`)**: Hard-clamps raw UDM statistical queries to **`<= 14 days`** (`enforce_telemetry_physics_window`), preventing 1M-row raw scan timeouts across all **27 active `secops-statistical-hunter` archetypes** (`IMPOSSIBLE_TRAVEL_GEO_VELOCITY` is retired).
+  * **Entity Context Graph joins** (`DERIVED_CONTEXT` / `GLOBAL_CONTEXT`): Mode A runs from `D-2 00:00:00Z` to `D+1 00:00:00Z` with every raw-event stage pinned to the scored day D (`timestamp.get_date(metadata.event_timestamp.seconds) = "<D>"`; `harness_truth.ecg_window` / `event_day_pin`).
 * **Confidence-Gated Warrant & Bidirectional Epistemic Pivot (`StrategyDecider`)**:
   * **Email-to-`user.userid` Resolution (`resolve_user_identifier`)**: Resolves corporate email addresses (`*@*`, excluding GCP service accounts) to canonical UDM `user.userid` identifiers prior to `metrics.*` execution.
   * **360° Warrant Synthesis (`analyze_360_insights`)**: Extracts `$z`, `$obs`, `$avg`, and `$std` across 6 `USER` spokes (`Auth`, 4-family `Cloud` CRUD, `Workspace`, `Egress`, `DNS`, `Web`) and 6 `ASSET` spokes (`Auth`, `Egress`, `DNS`, `Flows`, `Alerts`, `Web`), flagging `subthreshold_sectors` ($1.25 \le Z < 2.0$), `variance_masked_sectors` ($1.25 \le Z < 3.0$ with $\sigma \ge \max(1.5\mu, 5.0)$), and `dormant_awakening_sectors` ($\text{obs} > 0, \mu < 1.0, Z \ge 1.5$).
@@ -129,7 +131,7 @@ flowchart TD
     * `run_killchain_archetype()`: Executes all **11 MITRE ATT&CK `KillChainArchetype` pipelines** (`CREDENTIAL_ACCESS_TO_EXECUTION`, `INITIAL_ACCESS_TO_DISCOVERY`, `EXECUTION_TO_C2_DNS`, `EXECUTION_TO_EXFILTRATION`, `CREDENTIAL_ACCESS_TO_LATERAL_MOVEMENT`, `CLOUD_DISCOVERY_TO_COLLECTION`, `DEFENSE_EVASION_ALERT_TO_EXFILTRATION`, `C2_BEACON_TO_RARE_DESTINATION_EXFIL`, `WORKSPACE_HOARDING_TO_EGRESS`, `EXFILTRATION_OVER_WEB_SERVICE`, `RECON_TO_INITIAL_ACCESS`, plus cross-sector resource-to-execution routing).
     * `run_workspace_triad()`: 3-Stage `PART_OF_THE_WHOLE_TRIAD_MULTILEVEL` decomposing Workspace downloads, permission changes, and outbound emails against enterprise peers.
     * `run_cloud_repository_scope()`, `run_failure_ratio_surge()`, `run_alert_surge()`, and `run_data_table_bridge()` (`%ueba_hunt_bridge.<column>` persistent table joins).
-    * Mathematical assumption pivots for refuted/masked Tier 2A outcomes: 4-Stage Non-Parametric `MAD`, `TWO_PART_HURDLE`, `MACD_MOMENTUM_VELOCITY`, `CIRCADIAN_VON_MISES`, and Cross-Entity `USER` $\leftrightarrow$ `ASSET`/`IP` bridges.
+    * Mathematical assumption pivots for refuted/masked Tier 2A outcomes: 4-Stage Non-Parametric `MAD`, `TWO_PART_HURDLE`, `MACD_MOMENTUM_VELOCITY`, `HOUR_OF_DAY_PROFILE` (replaces the retired `CIRCADIAN_VON_MISES`), and Cross-Entity `USER` $\leftrightarrow$ `ASSET`/`IP` bridges.
 
 ---
 
@@ -248,12 +250,13 @@ agentic_ueba/
 │   ├── __init__.py
 │   ├── _bootstrap.py                   # Runtime path & virtualenv bootstrapper
 │   ├── config.py                       # Multi-tenant configuration & ADC Bearer token generator
+│   ├── harness_truth.py                # Single runtime source of harness truth (CRI, bands, verdicts/actions, thresholds, retired models, windows)
 │   ├── models.py                       # Pydantic schemas (JITHuntRequest, JITHuntResponse, CleanHandOffPayload)
 │   ├── server.py                       # Dual FastMCP (22 tools on /mcp) + Starlette REST Gateway (14 routes)
 │   ├── autonomous_hunter.py            # 3-Stage investigation orchestrator, Bilateral mode, & Gemini ReAct loop
 │   ├── strategy_decider.py             # 360° warrant analyzer, confidence scorer, & Tier 2A -> Tier 2B pivot router
 │   ├── risk_metrics_engine.py          # 30d UEBA engine (38 metrics, 11 KillChains, %DataTable bridge, Fleet 360°)
-│   ├── stats_hunter_engine.py          # Bounded <=14d raw UDM engine (23 archetypes: C2 CV, Fano, Shannon, Markov, Zipf, EWMA, Geo, PCR)
+│   ├── stats_hunter_engine.py          # Bounded <=14d raw UDM engine (27 active archetypes: C2 CV, Fano, Shannon, Markov, Zipf, EWMA, PCR)
 │   ├── playbook_runner.py              # 3-Wave Markdown playbook engine (Stage A -> UDM -> Stage B -> Capstone & ETag cache)
 │   ├── pipeline_runner.py              # Template renderer, Malachite AST bridge, global udm_search governor, & IO thread pool
 │   ├── query_integrity_gate.py         # Pre-dispatch AST/entity/slot/Data-Table validator & post-execution backend error gate

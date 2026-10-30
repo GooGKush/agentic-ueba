@@ -1,10 +1,19 @@
 # Copyright 2026 Google LLC. All Rights Reserved.
 # Author: Greg Kushmerek
 
-"""Pydantic data models and Clean Hand-Off (CH) contracts for Agentic UEBA."""
+"""Pydantic data models and Clean Hand-Off (CH) contracts for Agentic UEBA.
+
+Verdicts, severities and recommended actions use the harness CRI bands
+(src/harness_truth.py); a missing CRI (None) is the harness N/A band.
+"""
 
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
+
+from src import harness_truth
+
+# Band verdict vocabulary (harness_truth.BAND_VERDICTS), for field documentation.
+_BAND_VERDICTS_DOC = " | ".join(dict.fromkeys(harness_truth.BAND_VERDICTS.values()))
 
 
 class MetricEvaluation(BaseModel):
@@ -16,8 +25,18 @@ class MetricEvaluation(BaseModel):
   cohort_peer_mean: Optional[float] = None
   cohort_peer_stddev: Optional[float] = None
   peer_z_score: Optional[float] = None
-  cri_score: int
-  severity: str  # "NOMINAL" | "LOW_OUTLIER" | "MEDIUM_OUTLIER" | "HIGH_OUTLIER" | "CRITICAL_OUTLIER"
+  cri_score: Optional[int] = Field(
+      ...,
+      description="Calibrated Risk Index 0..100 (harness calculate_cri); null = N/A (missing data or error).",
+  )
+  severity: Optional[str] = Field(
+      default=None,
+      description=f"CRI band verdict ({_BAND_VERDICTS_DOC}); defaults to harness_truth.verdict_for(cri_score).",
+  )
+
+  def model_post_init(self, __context: Any) -> None:
+    if not self.severity:
+      self.severity = harness_truth.verdict_for(self.cri_score)
 
 
 class CleanHandOffPayload(BaseModel):
@@ -30,7 +49,10 @@ class CleanHandOffPayload(BaseModel):
   outlier_topology: str = "UNKNOWN"
   mitre_tactics_mapped: List[str] = Field(default_factory=list)
   recommended_swarm_playbook: str = "DEFAULT_INVESTIGATION"
-  escalation_action: str = "MONITOR"
+  escalation_action: str = Field(
+      default_factory=lambda: harness_truth.recommended_action(None),
+      description="Recommended escalation (harness_truth.recommended_action); defaults to the action for an unscored finding.",
+  )
 
 
 class CandidateHypothesis(BaseModel):
@@ -168,9 +190,26 @@ class JITHuntRequest(BaseModel):
 
 
 class TriageSummary(BaseModel):
-  """Machine-readable triage summary for Playbook automated branching and containment."""
-  calibrated_risk_index: float = Field(ge=0.0, le=100.0)
-  verdict: str  # "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "BENIGN"
+  """Machine-readable triage summary for Playbook automated branching and containment.
+
+  `verdict` and `recommended_action` follow the harness CRI bands: when omitted they default
+  to harness_truth.verdict_for() / recommended_action() of `calibrated_risk_index` (None is
+  the N/A band: NOT_EVALUATED / MONITOR). Actions are recommendations only; agentic_ueba never
+  executes containment.
+  """
+  calibrated_risk_index: Optional[float] = Field(
+      ...,
+      ge=0.0,
+      le=100.0,
+      description="Calibrated Risk Index 0..100 (harness calculate_cri); null = N/A (missing data or error).",
+  )
+  verdict: Optional[str] = Field(
+      default=None,
+      description=(
+          f"CRI band verdict ({_BAND_VERDICTS_DOC}); defaults to "
+          "harness_truth.verdict_for(calibrated_risk_index)."
+      ),
+  )
   is_outlier: bool
   primary_vector: str
   common_vector: str = Field(
@@ -185,9 +224,19 @@ class TriageSummary(BaseModel):
       default_factory=list,
       description="Filterable case tags: binary risk finding (RISK:CRITICAL | RISK:HIGH), common vector (VECTOR:<SECTOR>), and SECOND_ORDER_HUNT",
   )
-  top_z_score: float
+  top_z_score: Optional[float] = Field(
+      ...,
+      description="Top Z / Z-equivalent score of the hunt; null when the hunt was not evaluated.",
+  )
   radar_dimensions: Dict[str, float] = Field(default_factory=dict)
-  recommended_action: str
+  recommended_action: Optional[str] = Field(
+      default=None,
+      description=(
+          "Recommended action by CRI band: the domain containment action only at Critical, "
+          "INVESTIGATE at High/Medium, MONITOR below and for N/A; defaults to "
+          "harness_truth.recommended_action(calibrated_risk_index)."
+      ),
+  )
   entities_to_quarantine: List[str] = Field(
       default_factory=list,
       description="Specific user accounts, hostnames, or IPs recommended for automated containment",
@@ -199,6 +248,10 @@ class TriageSummary(BaseModel):
 
   def model_post_init(self, __context: Any) -> None:
     from src.formatters.case_wall_card import CaseWallCardFormatter
+    if not self.verdict:
+      self.verdict = harness_truth.verdict_for(self.calibrated_risk_index)
+    if not self.recommended_action:
+      self.recommended_action = harness_truth.recommended_action(self.calibrated_risk_index)
     if not self.common_vector or self.common_vector == "NONE":
       self.common_vector = CaseWallCardFormatter.normalize_common_vector(
           raw_vector=self.primary_vector

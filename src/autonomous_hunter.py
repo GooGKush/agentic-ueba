@@ -6,6 +6,11 @@
 Connects to Google SecOps OneMCP as an MCP Client, executes multi-stage statistical
 and behavioral risk analytics via Gemini 2.5 Pro, and returns structured Clean Hand-Off
 payloads along with full 6-pillar forensic reports to SecOps Playbooks and cases.
+
+Verdicts, recommended actions, CRI bands, write-back gates, retired models and
+Mode A / Entity Graph windows come from the remediated UEBA harness via
+`src.harness_truth`. Recommended actions are recommendations only: this engine
+never executes containment.
 """
 
 import src._bootstrap
@@ -16,7 +21,7 @@ import logging
 import math
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import google.auth
 from google.auth.transport.requests import Request
@@ -33,6 +38,7 @@ except ImportError:
   except ImportError:
     from mcp.client.sse import sse_client as streamable_http_client
 
+from src import harness_truth
 from src.config import TenantConfig, get_skills_root
 from src.dynamic_protocol_adapter import DynamicProtocolAdapter
 from src.models import (
@@ -51,6 +57,216 @@ from src.formatters.case_wall_card import CaseWallCardFormatter
 
 
 logger = logging.getLogger("AutonomousHunter")
+
+# secops-statistical-hunter model the hunter runs for hour-of-day / circadian intents.
+HOUR_OF_DAY_PROFILE = "HOUR_OF_DAY_PROFILE"
+HOUR_OF_DAY_QUERY = "hour_of_day_profile"
+
+# Active models this hunter can execute in place of a retired one, mapped to the dispatch query
+# of the path that runs them. A retired model is routed to one of these only when the skill's
+# own retirement message (harness_truth.retirement_message) names it as the replacement.
+_REPLACEMENT_QUERIES: Dict[str, str] = {
+    HOUR_OF_DAY_PROFILE: HOUR_OF_DAY_QUERY,
+    "STANDARD_Z_SCORE": "dynamic_metric",
+    "DUAL_SECTOR_FUSION_3STAGE": "sector_fusion",
+}
+
+# Entity-level containment recommendation for paths without a narrower domain action.
+GENERIC_CONTAINMENT_ACTION = "QUARANTINE"
+
+# The harness's response kinds (CONTAIN / INVESTIGATE / MONITOR); a domain action that is one of
+# these is not a containment action.
+_HARNESS_RESPONSE_KINDS = frozenset(kind for kind, _ in harness_truth.BAND_RESPONSES.values())
+
+
+class TriageDecision(NamedTuple):
+  """Harness verdict and recommended action for one CRI value."""
+
+  cri: Optional[int]  # harness-coerced CRI (0..100); None when missing or invalid
+  verdict: str  # harness_truth.verdict_for
+  action: str  # harness_truth.recommended_action (domain containment only at Critical)
+  contain: bool  # True only when the harness recommends a containment action
+
+  @property
+  def cri_value(self) -> float:
+    """CRI for the numeric TriageSummary / card schema; 0.0 when not evaluated (verdict NOT_EVALUATED)."""
+    return float(self.cri) if self.cri is not None else 0.0
+
+
+def decide(cri: Any, containment_action: str) -> TriageDecision:
+  """Verdict and recommended action for `cri`, from the harness bands (missing CRI never escalates)."""
+  value = harness_truth.coerce_cri(cri)
+  action = harness_truth.recommended_action(value, containment_action=containment_action)
+  band_kind = harness_truth.BAND_RESPONSES[harness_truth.cri_band(value)[0]][0]
+  contain = band_kind == "CONTAIN" and action not in _HARNESS_RESPONSE_KINDS
+  return TriageDecision(value, harness_truth.verdict_for(value), action, contain)
+
+
+def _alertable(cri: Any) -> bool:
+  """True when the harness recommends more than monitoring (Medium band and above)."""
+  return harness_truth.recommended_action(cri) != "MONITOR"
+
+
+def _max_cri(*values: Any) -> Optional[int]:
+  """Highest evaluated CRI among `values`; None when none of them was evaluated."""
+  evaluated = [c for c in (harness_truth.coerce_cri(v) for v in values) if c is not None]
+  return max(evaluated) if evaluated else None
+
+
+def _soc_guidance(decision: TriageDecision, finding: str = "") -> str:
+  """Case Wall guidance: the finding, the harness band verdict and action, and the recommendation-only note."""
+  _, label, emoji = harness_truth.cri_band(decision.cri)
+  lead = f"{finding.strip()} " if finding and finding.strip() else ""
+  return (
+      f"{lead}{emoji} {label} (CRI {harness_truth.format_cri(decision.cri)}, verdict `{decision.verdict}`): "
+      f"recommended action `{decision.action}`. {harness_truth.action_guidance(decision.cri)}"
+  )
+
+
+def _report_footer(decision: TriageDecision) -> str:
+  """Markdown footer stating the harness verdict and the recommendation-only action."""
+  return (
+      f"**Harness Verdict**: `{decision.verdict}` (CRI {harness_truth.format_cri(decision.cri)}) | "
+      f"**Recommended Action**: `{decision.action}`\n\n> {harness_truth.action_guidance(decision.cri)}"
+  )
+
+
+def _name_tokens(name: Any) -> List[str]:
+  """`name` plus its whitespace/comma separated tokens (model names, archetypes, queries)."""
+  raw = str(getattr(name, "value", name) or "").strip()
+  if not raw:
+    return []
+  return [raw] + [t for t in re.split(r"[\s,;]+", raw) if t and t != raw]
+
+
+def retirement_route(*names: Any) -> Tuple[Optional[str], Optional[str]]:
+  """(skill retirement message, runnable replacement) for the first retired name among `names`.
+
+  The replacement is the first model of `_REPLACEMENT_QUERIES` that the skill's own retirement
+  message names and that is itself active, or None when this hunter has no path for it.
+  """
+  for name in names:
+    for token in _name_tokens(name):
+      message = harness_truth.retirement_message(token)
+      if message:
+        named = sorted(
+            (message.find(model), model)
+            for model in _REPLACEMENT_QUERIES
+            if model in message and not harness_truth.is_retired(model)
+        )
+        return message, (named[0][1] if named else None)
+  return None, None
+
+
+def _is_hour_of_day_query(query: str) -> bool:
+  return any(k in query for k in (HOUR_OF_DAY_QUERY, "hour_of_day", "circadian", "von_mises"))
+
+
+def _macro_evaluated_day(result: Dict[str, Any]) -> str:
+  """Scored UTC day of a macro (metrics.*) result: the engine's evaluated day, else the Mode A day."""
+  return str(result.get("evaluated_day") or harness_truth.mode_a_day().isoformat())
+
+
+def _secondary_sweep_z_gate() -> float:
+  """Top-sector |Z| that warrants a Tier 2 sweep: the harness HIGH_RECALL anomaly threshold."""
+  _, thresholds = harness_truth.constants().resolve_sensitivity_thresholds("HIGH_RECALL")
+  return float(thresholds["anomaly_threshold"])
+
+
+def _sector_assessment(sector: str, z_val: Any, variance_masked: set, dormant: set) -> str:
+  """Per-sector radar assessment from the sector's harness CRI band."""
+  sector_cri = harness_truth.calculate_cri(z_val)
+  _, label, emoji = harness_truth.cri_band(sector_cri)
+  banded = f"{emoji} {label} (CRI {harness_truth.format_cri(sector_cri)})"
+  if _alertable(sector_cri):
+    return banded
+  if sector in variance_masked:
+    return "🔎 Sub-Threshold Drift (Variance-Masked)"
+  if sector in dormant:
+    return "🔎 Dormant Baseline Awakening"
+  return banded
+
+
+def _finite_float(value: Any, default: float = 0.0) -> float:
+  try:
+    parsed = float(value)
+  except (TypeError, ValueError):
+    return default
+  return parsed if math.isfinite(parsed) else default
+
+
+# Engine results carry None (or NaN) for a CRI or a model metric that was not evaluated (e.g. a micro helper
+# without enough evidence, or a template model with zero rows). Those values render as the harness N/A, never
+# through float() or a format spec.
+
+
+def _na() -> str:
+  """The harness rendering of a value that was not evaluated ("N/A")."""
+  return harness_truth.format_cri(None)
+
+
+def _num_or_none(value: Any) -> Optional[float]:
+  """A finite float, or None when the value is missing, not evaluated or not numeric."""
+  if value is None or isinstance(value, bool):
+    return None
+  parsed = _finite_float(value, default=math.nan)
+  return None if math.isnan(parsed) else parsed
+
+
+def _fmt(value: Any, spec: str, unit: str = "") -> str:
+  """`value` formatted with `spec` plus `unit`, or N/A when it was not evaluated."""
+  num = _num_or_none(value)
+  return _na() if num is None else f"{format(num, spec)}{unit}"
+
+
+def _show(value: Any, unit: str = "") -> str:
+  """`value` as reported plus `unit`, or N/A when it is missing or not a finite number."""
+  if value is None or (isinstance(value, str) and not value.strip()):
+    return _na()
+  if isinstance(value, float) and not math.isfinite(value):
+    return _na()
+  return f"{value}{unit}"
+
+
+_TEX_SIGMA = "\\sigma"  # KaTeX sigma unit for _math_value
+
+
+def _math_value(symbol: str, value: Any, spec: str, unit: str = "") -> str:
+  """`$symbol = value unit$` (KaTeX), or plain `symbol = N/A` when the value was not evaluated."""
+  num = _num_or_none(value)
+  return f"{symbol} = {_na()}" if num is None else f"${symbol} = {format(num, spec)}{unit}$"
+
+
+def _rows(result: Dict[str, Any]) -> int:
+  """Evaluated row count of an engine result (0 when missing)."""
+  return int(_finite_float(result.get("stats_rows")))
+
+
+def _finite_dims(scores: Dict[str, Any]) -> Dict[str, float]:
+  """Radar dimensions that were evaluated (sectors without a finite score are left out)."""
+  return {name: num for name, num in ((k, _num_or_none(v)) for k, v in (scores or {}).items()) if num is not None}
+
+
+def _hod_score(result: Dict[str, Any]) -> Optional[float]:
+  """HOUR_OF_DAY_PROFILE's native score (primary_score), else its Z-equivalent; None when not evaluated."""
+  score = _num_or_none(result.get("primary_score"))
+  return score if score is not None else _num_or_none(result.get("top_z_score"))
+
+
+def _not_evaluated_finding(result: Dict[str, Any], what: str) -> Optional[str]:
+  """Finding for a hunt the engine reported as not evaluated (insufficient evidence), else None."""
+  reason = result.get("not_evaluated_reason")
+  return f"{what} was not evaluated ({reason})." if reason else None
+
+
+def _apply_escalation(triage: TriageSummary, decision: TriageDecision, entity: str, primary_vector: str) -> None:
+  """Raises a Tier 1 triage to a confirmed Tier 2 outlier at the harness verdict and action for its CRI."""
+  triage.is_outlier = True
+  triage.calibrated_risk_index = decision.cri_value
+  triage.verdict = decision.verdict
+  triage.recommended_action = decision.action
+  triage.entities_to_quarantine = [entity] if decision.contain else []
+  triage.primary_vector = primary_vector
 
 
 class AutonomousHunterEngine:
@@ -137,26 +353,29 @@ class AutonomousHunterEngine:
         return x, y
 
       angles = [0, 60, 120, 180, 240, 300]
+      # A sector score that was not evaluated (None / NaN) is drawn at the centre and labelled N/A.
       if is_host:
         spokes = [
-            ("🔑 Host Auth", float(telemetry_data.get("Auth", 0.0))),
-            ("🌐 Network Egress", float(telemetry_data.get("Egress", 0.0))),
-            ("📡 DNS Queries", float(telemetry_data.get("DNS", 0.0))),
-            ("🔀 Outbound Flows", float(telemetry_data.get("Flows", 0.0))),
-            ("🚨 Security Alerts", float(telemetry_data.get("Alerts", 0.0))),
-            ("🕸️ Web & Proxy", float(telemetry_data.get("Web", 0.0))),
+            ("🔑 Host Auth", telemetry_data.get("Auth", 0.0)),
+            ("🌐 Network Egress", telemetry_data.get("Egress", 0.0)),
+            ("📡 DNS Queries", telemetry_data.get("DNS", 0.0)),
+            ("🔀 Outbound Flows", telemetry_data.get("Flows", 0.0)),
+            ("🚨 Security Alerts", telemetry_data.get("Alerts", 0.0)),
+            ("🕸️ Web & Proxy", telemetry_data.get("Web", 0.0)),
         ]
         entity_badge = "ASSET"
       else:
         spokes = [
-            ("🔑 Authentication", float(telemetry_data.get("Auth", 0.0))),
-            ("☁️ Cloud CRUD", float(telemetry_data.get("Cloud", 0.0))),
-            ("📁 Workspace Exfil", float(telemetry_data.get("Workspace", 0.0))),
-            ("🌐 Network Egress", float(telemetry_data.get("Egress", 0.0))),
-            ("📡 DNS Queries", float(telemetry_data.get("DNS", 0.0))),
-            ("🕸️ Web & Proxy", float(telemetry_data.get("Web", 0.0))),
+            ("🔑 Authentication", telemetry_data.get("Auth", 0.0)),
+            ("☁️ Cloud CRUD", telemetry_data.get("Cloud", 0.0)),
+            ("📁 Workspace Exfil", telemetry_data.get("Workspace", 0.0)),
+            ("🌐 Network Egress", telemetry_data.get("Egress", 0.0)),
+            ("📡 DNS Queries", telemetry_data.get("DNS", 0.0)),
+            ("🕸️ Web & Proxy", telemetry_data.get("Web", 0.0)),
         ]
         entity_badge = "USER"
+      labels = [_fmt(z_val, "+.2f", "σ") for _, z_val in spokes]
+      spokes = [(name, _finite_float(z_val)) for name, z_val in spokes]
 
       spoke_points = [get_point(z_val, ang) for (_, z_val), ang in zip(spokes, angles)]
       polygon_points = " ".join(f"{x},{y}" for x, y in spoke_points)
@@ -186,12 +405,12 @@ class AutonomousHunterEngine:
   <line x1="250" y1="250" x2="{get_point(3.0, 180)[0]}" y2="{get_point(3.0, 180)[1]}" stroke="#30363d" stroke-width="1.2"/>
   <line x1="250" y1="250" x2="{get_point(3.0, 240)[0]}" y2="{get_point(3.0, 240)[1]}" stroke="#30363d" stroke-width="1.2"/>
   <line x1="250" y1="250" x2="{get_point(3.0, 300)[0]}" y2="{get_point(3.0, 300)[1]}" stroke="#30363d" stroke-width="1.2"/>
-  <text x="250" y="70" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[0][0]} (Z = {spokes[0][1]:+.2f}σ)</text>
-  <text x="395" y="165" text-anchor="start" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[1][0]} (Z = {spokes[1][1]:+.2f}σ)</text>
-  <text x="395" y="340" text-anchor="start" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[2][0]} (Z = {spokes[2][1]:+.2f}σ)</text>
-  <text x="250" y="425" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[3][0]} (Z = {spokes[3][1]:+.2f}σ)</text>
-  <text x="105" y="340" text-anchor="end" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[4][0]} (Z = {spokes[4][1]:+.2f}σ)</text>
-  <text x="105" y="165" text-anchor="end" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[5][0]} (Z = {spokes[5][1]:+.2f}σ)</text>
+  <text x="250" y="70" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[0][0]} (Z = {labels[0]})</text>
+  <text x="395" y="165" text-anchor="start" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[1][0]} (Z = {labels[1]})</text>
+  <text x="395" y="340" text-anchor="start" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[2][0]} (Z = {labels[2]})</text>
+  <text x="250" y="425" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[3][0]} (Z = {labels[3]})</text>
+  <text x="105" y="340" text-anchor="end" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[4][0]} (Z = {labels[4]})</text>
+  <text x="105" y="165" text-anchor="end" fill="#c9d1d9" font-size="11" font-weight="600">{spokes[5][0]} (Z = {labels[5]})</text>
   <polygon points="{polygon_points}" fill="url(#radarGlow)" stroke="#00e5ff" stroke-width="2"/>
 </svg>""".strip()
       return svg_output
@@ -371,7 +590,7 @@ class AutonomousHunterEngine:
     """Attaches post-execution outcome classification and MITRE ATT&CK progression to directive."""
     if not directive or not isinstance(sec_res, dict):
       return
-    rows = int(sec_res.get("stats_rows", 0))
+    rows = _rows(sec_res)
     is_outlier = bool(sec_res.get("is_outlier", False))
     if rows == 0 or not is_outlier:
       outcome_class = "CLEAN_OR_SUBTHRESHOLD"
@@ -396,7 +615,22 @@ class AutonomousHunterEngine:
       req: JITHuntRequest,
       directive: Any,
   ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Executes a Tier 2A or Tier 2B StrategyDirective and returns (result_dict, markdown_card)."""
+    """Executes a Tier 2A or Tier 2B StrategyDirective and returns (result_dict, markdown_card).
+
+    A directive naming a retired model runs the replacement that the skill's own retirement
+    message names (when this hunter has a path for it) and is skipped otherwise. Each card's
+    guidance carries the harness verdict and recommended action for the result's CRI.
+    """
+    retired_note, replacement = retirement_route(getattr(directive, "model_name", None), directive.directive_query)
+    route_note = ""
+    if retired_note:
+      if replacement is None:
+        logger.warning(f"Skipping retired secondary directive (no runnable replacement): {retired_note}")
+        return None, None
+      logger.info(f"Routing retired secondary directive to the skill-named replacement {replacement}: {retired_note}")
+      directive.model_name = replacement
+      directive.directive_query = _REPLACEMENT_QUERIES[replacement]
+      route_note = f"Requested model retired by the harness: {retired_note} Executed `{replacement}` instead."
     sec_query = (directive.directive_query or "").lower().strip()
     target_metric = getattr(directive, "target_metric", None)
     fusion_metrics = getattr(directive, "fusion_metrics", None) or []
@@ -414,12 +648,12 @@ class AutonomousHunterEngine:
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), GENERIC_CONTAINMENT_ACTION)
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
           {
-              "metric": f"**MITRE Kill-Chain Archetype (`{sec_res['archetype']}`)**",
-              "observed": f"`{sec_res['composite_threat_score']:.2f}σ`",
+              "metric": f"**MITRE Kill-Chain Archetype (`{sec_res.get('archetype') or archetype_name}`)**",
+              "observed": f"`{_fmt(sec_res.get('composite_threat_score'), '.2f', 'σ')}`",
               "threshold": "$\\ge 3.00\\sigma$",
               "assessment": "⚠️ Multi-Stage Kill-Chain Progression" if sec_outlier else "✅ Uncorrelated Kill-Chain Stages",
           },
@@ -434,10 +668,11 @@ class AutonomousHunterEngine:
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
       )
@@ -450,12 +685,12 @@ class AutonomousHunterEngine:
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), GENERIC_CONTAINMENT_ACTION)
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
           {
               "metric": "**Workspace Triad Composite ($Z_{triad}$)**",
-              "observed": f"`{sec_res['composite_z_score']:+.2f}σ`",
+              "observed": f"`{_fmt(sec_res.get('composite_z_score'), '+.2f', 'σ')}`",
               "threshold": "$\\ge 3.00\\sigma$",
               "assessment": "⚠️ Coordinated Insider Triad Outlier" if sec_outlier else "✅ Within Peer Cohort Triad",
           },
@@ -463,17 +698,18 @@ class AutonomousHunterEngine:
               "metric": "**Evaluated Workspace Vectors**",
               "observed": "`downloads` + `changes` + `emails`",
               "threshold": "Template: `part_of_the_whole_triad_3stage.yl2`",
-              "assessment": f"Observed Volume = `{sec_res.get('observed_value', 0.0):.1f}`",
+              "assessment": f"Observed Volume = `{_fmt(sec_res.get('observed_value'), '.1f')}`",
           },
       ]
       sec_report = CaseWallCardFormatter.format_card(
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
       )
@@ -488,19 +724,19 @@ class AutonomousHunterEngine:
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), "REVOKE_IAM_ROLES")
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
           {
               "metric": f"**Cloud Repository Scope (`mode={mode}`)**",
-              "observed": f"`{sec_res['top_z_score']:+.2f}σ` (Fold = `{sec_res.get('fold_change', 0.0):.2f}x`)",
+              "observed": f"`{_fmt(sec_res.get('top_z_score'), '+.2f', 'σ')}` (Fold = `{_fmt(sec_res.get('fold_change'), '.2f', 'x')}`)",
               "threshold": "$\\ge 3.00\\sigma$",
               "assessment": "⚠️ Out-of-Scope Repository Enumeration" if sec_outlier else "✅ Nominal Cloud Scope",
           },
           {
               "metric": "**Evaluated Metric Family**",
               "observed": f"`{sec_res.get('metric', 'resource_read_total')}`",
-              "threshold": f"Observed: `{sec_res.get('observed_events', 0.0):.1f}`",
+              "threshold": f"Observed: `{_fmt(sec_res.get('observed_events'), '.1f')}`",
               "assessment": "Cloud Resource Read / Permission Scope",
           },
       ]
@@ -508,10 +744,11 @@ class AutonomousHunterEngine:
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
       )
@@ -528,12 +765,12 @@ class AutonomousHunterEngine:
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), GENERIC_CONTAINMENT_ACTION)
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
           {
               "metric": f"**Failure Ratio Surge (`{fail_m}`)**",
-              "observed": f"`{sec_res['top_z_score']:+.2f}σ` (Fail Ratio = `{sec_res.get('failure_ratio', 0.0):.2%}`)",
+              "observed": f"`{_fmt(sec_res.get('top_z_score'), '+.2f', 'σ')}` (Fail Ratio = `{_fmt(sec_res.get('failure_ratio'), '.2%')}`)",
               "threshold": "$\\ge 3.00\\sigma$",
               "assessment": "⚠️ Acute Error / Access Denied Surge" if sec_outlier else "✅ Nominal Error Ratio",
           },
@@ -548,10 +785,11 @@ class AutonomousHunterEngine:
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
       )
@@ -565,12 +803,12 @@ class AutonomousHunterEngine:
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), GENERIC_CONTAINMENT_ACTION)
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
           {
               "metric": "**Security Alert Surge (`alert_event_name_count`)**",
-              "observed": f"`{sec_res['top_z_score']:+.2f}σ` (`{sec_res.get('observed_alerts', 0.0):.0f}` alerts)",
+              "observed": f"`{_fmt(sec_res.get('top_z_score'), '+.2f', 'σ')}` (`{_fmt(sec_res.get('observed_alerts'), '.0f')}` alerts)",
               "threshold": "$\\ge 3.00\\sigma$",
               "assessment": "⚠️ Multi-Rule Alert Accumulation" if sec_outlier else "✅ Baseline Alert Volume",
           },
@@ -585,10 +823,11 @@ class AutonomousHunterEngine:
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
       )
@@ -607,12 +846,12 @@ class AutonomousHunterEngine:
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), GENERIC_CONTAINMENT_ACTION)
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
           {
               "metric": "**Composite Fusion Score ($D$)**",
-              "observed": f"`{sec_res['composite_threat_score']:.2f}σ`",
+              "observed": f"`{_fmt(sec_res.get('composite_threat_score'), '.2f', 'σ')}`",
               "threshold": "$\\ge 3.00\\sigma$",
               "assessment": "⚠️ Multi-Sector Kill-Chain Convergence" if sec_outlier else "✅ Uncorrelated Sector Baseline",
           },
@@ -620,17 +859,18 @@ class AutonomousHunterEngine:
               "metric": "**Fused Telemetry Vectors**",
               "observed": f"`{metrics_pair[0]}` + `{metrics_pair[1]}`",
               "threshold": f"Template: `{sec_res.get('template_name', 'dual_sector_fusion_3stage.yl2')}`",
-              "assessment": f"Z_A = {sec_res.get('sector_a_z', 0.0):+.2f}σ | Z_B = {sec_res.get('sector_b_z', 0.0):+.2f}σ",
+              "assessment": f"Z_A = {_fmt(sec_res.get('sector_a_z'), '+.2f', 'σ')} | Z_B = {_fmt(sec_res.get('sector_b_z'), '+.2f', 'σ')}",
           },
       ]
       sec_report = CaseWallCardFormatter.format_card(
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
       )
@@ -645,18 +885,18 @@ class AutonomousHunterEngine:
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), "THROTTLE_EGRESS")
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
           {
               "metric": f"**MACD Momentum Score (`{m_name}`)**",
-              "observed": f"`{sec_res['macd_momentum_score']:+.2f}σ`",
+              "observed": f"`{_fmt(sec_res.get('macd_momentum_score'), '+.2f', 'σ')}`",
               "threshold": "$> 3.00\\sigma$",
               "assessment": "⚠️ Acute Regime Acceleration" if sec_outlier else "✅ Stable Velocity Regime",
           },
           {
               "metric": "**Fast Z vs Slow Z Spine**",
-              "observed": f"Fast Z = `{sec_res['fast_z']:+.2f}σ` | Slow Z = `{sec_res['slow_z']:+.2f}σ`",
+              "observed": f"Fast Z = `{_fmt(sec_res.get('fast_z'), '+.2f', 'σ')}` | Slow Z = `{_fmt(sec_res.get('slow_z'), '+.2f', 'σ')}`",
               "threshold": "30-Day Pre-Computed Anchor",
               "assessment": "Dual-Spine Momentum Divergence",
           },
@@ -665,48 +905,52 @@ class AutonomousHunterEngine:
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
       )
       return sec_res, sec_report
 
-    if "circadian" in sec_query or "von_mises" in sec_query:
-      m_name = target_metric or "auth_attempts_total"
-      sec_res = await RiskMetricsEngine(tenant).run_circadian_von_mises(
+    if _is_hour_of_day_query(sec_query):
+      sec_res = await StatsHunterEngine(tenant).run_dynamic_archetype_pipeline(
           session=session,
           entity=exec_entity,
-          metric_name=m_name,
+          archetype=HOUR_OF_DAY_PROFILE,
+          entity_type=exec_entity_type,
+          event_type="USER_LOGIN",
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
-      sec_outlier = sec_res["is_outlier"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), "FORCE_MFA_CHALLENGE")
+      sec_outlier = bool(sec_res.get("is_outlier", False))
+      hod_score = _hod_score(sec_res)
       sec_rows = [
           {
-              "metric": f"**Circadian Threat Score (`{m_name}`)**",
-              "observed": f"`{sec_res['circadian_threat_score']:.2f}`",
-              "threshold": "$\\ge 50.0$",
-              "assessment": "⚠️ Off-Hours Diurnal Phase Anomaly" if sec_outlier else "✅ Normal Working Schedule",
+              "metric": f"**Hour-of-Day Profile Score (`{sec_res.get('score_metric') or 'hod_z_score'}`)**",
+              "observed": f"`{_fmt(hod_score, '+.2f')}`",
+              "threshold": f"$\\ge {harness_truth.constants().DEFAULT_ANOMALY_THRESHOLD:.2f}$",
+              "assessment": "⚠️ Out-of-Profile Hour-of-Day Activity" if sec_outlier else "✅ Within Learned 24-Bin Profile",
           },
           {
-              "metric": "**Hourly Z-Score**",
-              "observed": f"`{sec_res['hourly_z']:+.2f}σ` (Hour `{sec_res.get('event_hour', 'UTC')}` UTC)",
-              "threshold": "$> 2.50\\sigma$",
-              "assessment": "Circular von Mises Phase Evaluation",
+              "metric": "**Evaluated Hour Buckets**",
+              "observed": f"`{_rows(sec_res)}`",
+              "threshold": "Learned 24-Bin UTC Hour-of-Day Profile",
+              "assessment": f"`secops-statistical-hunter` `{HOUR_OF_DAY_PROFILE}`",
           },
       ]
       sec_report = CaseWallCardFormatter.format_card(
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
       )
@@ -719,18 +963,18 @@ class AutonomousHunterEngine:
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), "REVOKE_IAM_ROLES")
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
           {
               "metric": "**Cloud CRUD Z-Score ($Z$)**",
-              "observed": f"`{sec_res['top_z_score']:+.2f}σ`",
+              "observed": f"`{_fmt(sec_res.get('top_z_score'), '+.2f', 'σ')}`",
               "threshold": "$|Z| \\le 3.0\\sigma$",
               "assessment": "⚠️ IAM / Resource Mutation Surge" if sec_outlier else "✅ Normal Cloud Operations",
           },
           {
               "metric": "**Mutations Observed**",
-              "observed": f"`{sec_res.get('observed_events', 0)}` events",
+              "observed": f"`{_show(sec_res.get('observed_events', 0))}` events",
               "threshold": "30-Day Historical Baseline",
               "assessment": "Significant Departure" if sec_outlier else "Baseline",
           },
@@ -739,10 +983,11 @@ class AutonomousHunterEngine:
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
       )
@@ -767,18 +1012,18 @@ class AutonomousHunterEngine:
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), "INVESTIGATE")
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
           {
               "metric": f"**Metric Deviation (`{m_name}`)**",
-              "observed": f"`{sec_res['top_z_score']:+.2f}σ`",
+              "observed": f"`{_fmt(sec_res.get('top_z_score'), '+.2f', 'σ')}`",
               "threshold": "$> 3.00\\sigma$",
               "assessment": "⚠️ Situational Metric Outlier" if sec_outlier else "✅ Within 30-Day Baseline",
           },
           {
               "metric": "**Observed Metric Volume**",
-              "observed": f"`{sec_res.get('observed_value', 0.0):.1f}`",
+              "observed": f"`{_fmt(sec_res.get('observed_value'), '.1f')}`",
               "threshold": f"Model: `{str(stat_model).upper()}`",
               "assessment": "Pre-Computed Malachite Metric Evaluation",
           },
@@ -787,10 +1032,11 @@ class AutonomousHunterEngine:
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
           second_order_ran=True,
@@ -804,18 +1050,18 @@ class AutonomousHunterEngine:
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), "ISOLATE_HOST")
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
           {
               "metric": "**Coefficient of Variation ($CV$)**",
-              "observed": f"`{sec_res['coefficient_of_variation']:.3f}`",
+              "observed": f"`{_fmt(sec_res.get('coefficient_of_variation'), '.3f')}`",
               "threshold": "$\\le 0.20$",
               "assessment": "⚠️ Low Jitter / Robotic Regularity" if sec_outlier else "✅ Normal Jitter Variance",
           },
           {
               "metric": "**Target Destination**",
-              "observed": f"`{sec_res['target_destination']}`",
+              "observed": f"`{_show(sec_res.get('target_destination'))}`",
               "threshold": "N/A",
               "assessment": "Suspected C2 Exfiltration Socket" if sec_outlier else "Benign Traffic",
           },
@@ -824,10 +1070,11 @@ class AutonomousHunterEngine:
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
       )
@@ -840,19 +1087,19 @@ class AutonomousHunterEngine:
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), "LOCK_ACCOUNT")
       sec_outlier = sec_res["is_outlier"]
-      fano = float(sec_res.get("top_fano", 1.0))
+      fano = _num_or_none(sec_res.get("top_fano"))
       sec_rows = [
           {
               "metric": "**Fano Factor ($F = \\sigma^2 / \\mu$)**",
-              "observed": f"`{fano:.2f}`",
+              "observed": f"`{_fmt(fano, '.2f')}`",
               "threshold": "$> 4.00$",
               "assessment": "⚠️ Acute Clustered Spray Dispersion" if sec_outlier else "✅ Nominal Poisson Baseline",
           },
           {
               "metric": "**Evaluated Auth Events**",
-              "observed": f"`{sec_res.get('stats_rows', 0)}`",
+              "observed": f"`{_rows(sec_res)}`",
               "threshold": "Baseline",
               "assessment": "Authentication Failure Volatility",
           },
@@ -861,10 +1108,11 @@ class AutonomousHunterEngine:
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
       )
@@ -877,12 +1125,12 @@ class AutonomousHunterEngine:
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), "TERMINATE_PROCESS")
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
           {
               "metric": "**Shannon Entropy ($H$)**",
-              "observed": f"`{sec_res['shannon_entropy_score']:.2f}` bits/char",
+              "observed": f"`{_fmt(sec_res.get('shannon_entropy_score'), '.2f')}` bits/char",
               "threshold": "$> 6.00$ bits/char",
               "assessment": "⚠️ Obfuscated / Encoded Command Payload" if sec_outlier else "✅ Standard Text Entropy",
           },
@@ -897,10 +1145,11 @@ class AutonomousHunterEngine:
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
       )
@@ -913,18 +1162,18 @@ class AutonomousHunterEngine:
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), "ISOLATE_HOST")
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
           {
               "metric": "**Information Surprisal**",
-              "observed": f"`{sec_res['surprisal_score']:.2f}` bits",
+              "observed": f"`{_fmt(sec_res.get('surprisal_score'), '.2f')}` bits",
               "threshold": "$> 4.00$ bits",
               "assessment": "⚠️ Rare Living-off-the-Land Transition" if sec_outlier else "✅ Standard Process Transition",
           },
           {
               "metric": "**Observed Transition**",
-              "observed": f"`{sec_res.get('parent_process', 'UNKNOWN')}` ➔ `{sec_res.get('child_process', 'UNKNOWN')}`",
+              "observed": f"`{sec_res.get('parent_process') or 'UNKNOWN'}` ➔ `{sec_res.get('child_process') or 'UNKNOWN'}`",
               "threshold": "$P(\\text{Child}|\\text{Parent}) > 0.05$",
               "assessment": "Parent-Child Process Lineage",
           },
@@ -933,10 +1182,11 @@ class AutonomousHunterEngine:
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
       )
@@ -949,18 +1199,18 @@ class AutonomousHunterEngine:
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), "ISOLATE_HOST")
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
           {
               "metric": "**Zipf Rarity Score**",
-              "observed": f"`{sec_res['zipf_rarity_score']:.2f}`",
+              "observed": f"`{_fmt(sec_res.get('zipf_rarity_score'), '.2f')}`",
               "threshold": "$> 3.50$",
               "assessment": "⚠️ Long-Tail Fleet Outlier" if sec_outlier else "✅ Common Fleet Software",
           },
           {
               "metric": "**Top Rare Binary**",
-              "observed": f"`{sec_res.get('rare_binary', 'UNKNOWN')}`",
+              "observed": f"`{sec_res.get('rare_binary') or 'UNKNOWN'}`",
               "threshold": "$\\le 2$ Fleet Hosts",
               "assessment": "Isolated Execution Image",
           },
@@ -969,10 +1219,11 @@ class AutonomousHunterEngine:
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
       )
@@ -985,18 +1236,18 @@ class AutonomousHunterEngine:
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), "RATE_LIMIT_ENTITY")
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
           {
               "metric": "**EWMA Velocity Score**",
-              "observed": f"`{sec_res['ewma_velocity_score']:+.2f}σ`",
+              "observed": f"`{_fmt(sec_res.get('ewma_velocity_score'), '+.2f', 'σ')}`",
               "threshold": "$> 3.00\\sigma$",
               "assessment": "⚠️ Intraday Kinetic Burst Surge" if sec_outlier else "✅ Nominal Intraday Rate",
           },
           {
               "metric": "**Evaluated Buckets**",
-              "observed": f"`{sec_res.get('stats_rows', 0)}`",
+              "observed": f"`{_rows(sec_res)}`",
               "threshold": "Trailing Hourly Baseline",
               "assessment": "Exponential Smoothing Divergence",
           },
@@ -1005,46 +1256,11 @@ class AutonomousHunterEngine:
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
-          directive=directive,
-          metrics_table_rows=sec_rows,
-      )
-      return sec_res, sec_report
-
-    if "impossible_travel" in sec_query or "geo_velocity" in sec_query:
-      sec_res = await StatsHunterEngine(tenant).run_impossible_travel_velocity(
-          session=session,
-          user_id=exec_entity,
-          lookback_days=req.lookback_days,
-      )
-      self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
-      sec_outlier = sec_res["is_outlier"]
-      sec_rows = [
-          {
-              "metric": "**Geodesic Travel Velocity**",
-              "observed": f"`{sec_res['velocity_kmh']:.2f}` km/h (`{sec_res.get('distance_km', 0.0):.1f}` km)",
-              "threshold": "$\\ge 800.0$ km/h",
-              "assessment": "⚠️ Impossible Travel Anomaly" if sec_outlier else "✅ Plausible Travel Speed",
-          },
-          {
-              "metric": "**Evaluated Auth Sessions**",
-              "observed": f"`{sec_res.get('stats_rows', 0)}`",
-              "threshold": "Haversine Geodesic Distance",
-              "assessment": "Cross-Location Session Evaluation",
-          },
-      ]
-      sec_report = CaseWallCardFormatter.format_card(
-          target_entity=exec_entity,
-          entity_type=exec_entity_type,
-          model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
-          is_outlier=sec_outlier,
-          case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
       )
@@ -1057,18 +1273,18 @@ class AutonomousHunterEngine:
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), "ISOLATE_HOST")
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
           {
               "metric": "**Producer-Consumer Ratio Z ($Z_{PCR}$)**",
-              "observed": f"`{sec_res['pcr_z_score']:+.2f}σ` (Ratio = `{sec_res.get('producer_ratio', 0.0):.3f}`)",
+              "observed": f"`{_fmt(sec_res.get('pcr_z_score'), '+.2f', 'σ')}` (Ratio = `{_fmt(sec_res.get('producer_ratio'), '.3f')}`)",
               "threshold": "$\\ge 3.00\\sigma$",
               "assessment": "⚠️ Endpoint Producer Role Inversion" if sec_outlier else "✅ Standard Consumer Ratio",
           },
           {
               "metric": "**Evaluated Buckets**",
-              "observed": f"`{sec_res.get('stats_rows', 0)}`",
+              "observed": f"`{_rows(sec_res)}`",
               "threshold": "Directional Byte Asymmetry",
               "assessment": "Outbound vs Inbound Byte Ratio",
           },
@@ -1077,10 +1293,11 @@ class AutonomousHunterEngine:
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
       )
@@ -1093,18 +1310,18 @@ class AutonomousHunterEngine:
           lookback_days=req.lookback_days,
       )
       self._annotate_directive_post_data(directive, sec_res)
-      sec_cri = sec_res["calibrated_risk_index"]
+      sec_decision = decide(sec_res.get("calibrated_risk_index"), GENERIC_CONTAINMENT_ACTION)
       sec_outlier = sec_res["is_outlier"]
       sec_rows = [
           {
               "metric": "**Poisson Arrival Rarity ($Z_{poisson}$)**",
-              "observed": f"`{sec_res['poisson_z']:+.2f}σ`",
+              "observed": f"`{_fmt(sec_res.get('poisson_z'), '+.2f', 'σ')}`",
               "threshold": "$\\ge 3.50\\sigma$",
               "assessment": "⚠️ Rare Command Arrival Surge" if sec_outlier else "✅ Nominal Arrival Rate",
           },
           {
               "metric": "**Evaluated Buckets**",
-              "observed": f"`{sec_res.get('stats_rows', 0)}`",
+              "observed": f"`{_rows(sec_res)}`",
               "threshold": "Quiet Historical Baseline",
               "assessment": "Discrete Poisson Rarity",
           },
@@ -1113,10 +1330,11 @@ class AutonomousHunterEngine:
           target_entity=exec_entity,
           entity_type=exec_entity_type,
           model_name=directive.model_name,
-          calibrated_risk_index=float(sec_cri),
+          calibrated_risk_index=sec_decision.cri_value,
+          soc_guidance=_soc_guidance(sec_decision, route_note),
           is_outlier=sec_outlier,
           case_id=req.case_id,
-          rows_count=sec_res.get("stats_rows", 0),
+          rows_count=_rows(sec_res),
           directive=directive,
           metrics_table_rows=sec_rows,
       )
@@ -1212,6 +1430,16 @@ class AutonomousHunterEngine:
           if not req.skill or req.skill == "auto":
             skill_name = decided_skill
 
+        # Retired models never run: route to the replacement the skill's retirement message names,
+        # or leave the query to the ReAct loop (which is told the model is retired).
+        retired_note, replacement = retirement_route(query_str)
+        route_note = ""
+        if retired_note:
+          logger.warning(f"Requested hunt model is retired by the harness: {retired_note}")
+          if replacement:
+            route_note = f"Requested model retired by the harness: {retired_note} Executed `{replacement}` instead."
+            query_str = _REPLACEMENT_QUERIES[replacement]
+
         # --- 1. Deterministic Fast-Path: Decoupled 360° Behavioral Risk Radar ---
         if query_str in ("profile_360_risk", "360_risk", "radar_360") or (req.skill == "risk-metrics" and not req.query):
           try:
@@ -1236,28 +1464,34 @@ class AutonomousHunterEngine:
                 radar_result["sector_z_scores"],
                 entity_type=req.entity_type,
             )
-            cri = radar_result["calibrated_risk_index"]
-            verdict = radar_result["verdict"]
+            radar_decision = decide(radar_result.get("calibrated_risk_index"), GENERIC_CONTAINMENT_ACTION)
+            cri = radar_decision.cri
             top_sector = radar_result["top_sector"]
+            evaluated_day = _macro_evaluated_day(radar_result)
 
             alert_list = req.alerts or [{"name": req.alert_name or "", "description": req.alert_description or ""}]
             conn_list = req.connector_events or []
-            radar_insights = StrategyDecider.analyze_360_insights(
-                radar_result=radar_result,
-                ctx={
-                    "case_title": req.alert_name or "",
-                    "case_description": req.alert_description or "",
-                    "alerts": [a.get("name") or a.get("displayName", "") for a in alert_list],
-                    "primary_entity": req.target_entity,
-                },
-                entity_type=req.entity_type,
-            )
+            try:
+              radar_insights = StrategyDecider.analyze_360_insights(
+                  radar_result=radar_result,
+                  ctx={
+                      "case_title": req.alert_name or "",
+                      "case_description": req.alert_description or "",
+                      "alerts": [a.get("name") or a.get("displayName", "") for a in alert_list],
+                      "primary_entity": req.target_entity,
+                  },
+                  entity_type=req.entity_type,
+              )
+            except Exception as insights_err:
+              # Insights are advisory (e.g. a radar without a CRI); never let them bypass the fast path.
+              logger.warning(f"360 radar insights unavailable ({insights_err}); continuing without them.")
+              radar_insights = {}
             if req.directive:
               req.directive.radar_insights = radar_insights
 
             # --- Tier 2 Secondary Sweep Evaluation & Hypothesis Defense ---
             is_tier1 = not req.directive or getattr(req.directive, "investigation_tier", "TIER_1_BASELINE") == "TIER_1_BASELINE"
-            top_z = abs(float(radar_result["sector_z_scores"].get(top_sector, 0.0)))
+            top_z = abs(_finite_float(radar_result["sector_z_scores"].get(top_sector)))
             alert_corpus = f"{req.alert_name or ''} {req.alert_description or ''}".lower()
             kinetic_trigger = any(
                 k in alert_corpus for k in (
@@ -1269,8 +1503,8 @@ class AutonomousHunterEngine:
             needs_secondary = is_tier1 and (
                 radar_result["is_outlier"]
                 or bool(radar_insights.get("secondary_warranted", False))
-                or top_z >= 2.0
-                or float(cri) >= 40.0
+                or top_z >= _secondary_sweep_z_gate()
+                or _alertable(cri)
                 or kinetic_trigger
             )
 
@@ -1304,43 +1538,33 @@ class AutonomousHunterEngine:
             sector_metrics_map = radar_result.get("sector_metrics", {})
             vm_sectors = set(radar_insights.get("variance_masked_sectors", []) or [])
             da_sectors = set(radar_insights.get("dormant_awakening_sectors", []) or [])
+            band_floors = "/".join(str(low) for low, *_ in harness_truth.cri_bands()[1:])
             sector_rows = [
                 {
                     "metric": f"**{s_name} Sector** (`{sector_metrics_map.get(s_name, 'metrics')}`)",
-                    "observed": f"Z = {z_val:+.2f} ({radar_result['sector_observed_counts'].get(s_name, 0)} events)",
-                    "threshold": "|Z| <= 2.0σ",
-                    "assessment": (
-                        "⚠️ Significant Behavioral Drift"
-                        if abs(z_val) > 2.0
-                        else (
-                            "🔎 Sub-Threshold Drift (Variance-Masked)"
-                            if s_name in vm_sectors
-                            else (
-                                "🔎 Dormant Baseline Awakening"
-                                if s_name in da_sectors
-                                else "✅ Nominal Baseline"
-                            )
-                        )
-                    ),
+                    "observed": f"Z = {_fmt(z_val, '+.2f')} ({_show(radar_result['sector_observed_counts'].get(s_name, 0))} events)",
+                    "threshold": f"Sector CRI bands {band_floors}",
+                    "assessment": _sector_assessment(s_name, z_val, vm_sectors, da_sectors),
                 }
                 for s_name, z_val in radar_result["sector_z_scores"].items()
             ]
+            radar_finding = (
+                f"Highest-drift sector `{top_sector}` (Composite Euclidean Distance D = {_fmt(radar_result.get('composite_d'), '.2f')})."
+                if radar_result["is_outlier"] else
+                "All evaluated behavioral sectors conform to the 30-day baseline."
+            )
             markdown_report = CaseWallCardFormatter.format_card(
                 target_entity=req.target_entity,
                 entity_type=req.entity_type,
                 model_name="360_DECOUPLED_RADAR",
-                calibrated_risk_index=float(cri),
+                calibrated_risk_index=radar_decision.cri_value,
                 is_outlier=radar_result["is_outlier"],
                 case_id=req.case_id,
-                rows_count=sum(radar_result["sector_observed_counts"].values()),
+                evaluated_window=f"UTC day {evaluated_day}",
+                rows_count=sum(int(_finite_float(v)) for v in radar_result["sector_observed_counts"].values()),
                 directive=req.directive,
                 metrics_table_rows=sector_rows,
-                soc_guidance=(
-                    f"Investigate high-drift sector `{top_sector}` (Composite Euclidean Distance D = {radar_result['composite_d']:.2f}). "
-                    "Stage user containment if unauthorized data exfiltration or credential rotation is confirmed."
-                    if radar_result["is_outlier"] else
-                    "All evaluated behavioral sectors conform to 30-day baseline. No containment needed."
-                ),
+                soc_guidance=_soc_guidance(radar_decision, radar_finding),
                 primary_vector=top_sector,
                 second_order_ran=will_run_second_order,
             )
@@ -1358,21 +1582,24 @@ class AutonomousHunterEngine:
               )
               case_wall_updated = True
               spike_z_gate = float(getattr(tenant, "fleet_360_spike_threshold_z", 3.0))
+              # UDM write-back of the finding requires the harness write-back CRI as well as the D gate.
               if (
-                  float(radar_result.get("composite_d", 0.0)) >= spike_z_gate
+                  _finite_float(radar_result.get("composite_d")) >= spike_z_gate
+                  and cri is not None
+                  and cri >= harness_truth.writeback_cri_threshold()
                   and bool(getattr(tenant, "fleet_360_enabled", False))
                   and bool(getattr(tenant, "fleet_360_ingest_events", True))
               ):
                 try:
                   rm_eng = RiskMetricsEngine(tenant)
                   now_dt = datetime.now(timezone.utc)
-                  eval_day = str(radar_result.get("evaluated_day") or now_dt.strftime("%Y-%m-%d"))
+                  eval_day = evaluated_day
                   sec_map = {
                       s: {
-                          "z": float(z_v),
-                          "obs": float(radar_result.get("sector_observed_counts", {}).get(s, 0)),
-                          "avg": float(radar_result.get("sector_baseline_avg", {}).get(s, 0.0)),
-                          "std": float(radar_result.get("sector_baseline_std", {}).get(s, 0.0)),
+                          "z": _finite_float(z_v),
+                          "obs": _finite_float(radar_result.get("sector_observed_counts", {}).get(s, 0)),
+                          "avg": _finite_float(radar_result.get("sector_baseline_avg", {}).get(s, 0.0)),
+                          "std": _finite_float(radar_result.get("sector_baseline_std", {}).get(s, 0.0)),
                       }
                       for s, z_v in radar_result.get("sector_z_scores", {}).items()
                   }
@@ -1380,8 +1607,8 @@ class AutonomousHunterEngine:
                       entity_id=str(radar_result.get("entity") or req.target_entity),
                       entity_type=req.entity_type,
                       sectors=sec_map,
-                      composite_d=float(radar_result["composite_d"]),
-                      composite_cri=int(cri),
+                      composite_d=_finite_float(radar_result.get("composite_d")),
+                      composite_cri=cri,
                       campaign_id=f"case-360-{req.case_id}-{eval_day}",
                       run_timestamp_iso=now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
                       evaluated_day=eval_day,
@@ -1392,16 +1619,16 @@ class AutonomousHunterEngine:
                   logger.warning(f"Case 360 UDM event ingestion skipped for case {req.case_id}: {ingest_err}")
 
             triage = TriageSummary(
-                calibrated_risk_index=float(cri),
-                verdict=verdict,
+                calibrated_risk_index=radar_decision.cri_value,
+                verdict=radar_decision.verdict,
                 is_outlier=radar_result["is_outlier"],
                 primary_vector=f"{top_sector}_behavioral_drift",
                 common_vector=CaseWallCardFormatter.normalize_common_vector(raw_vector=top_sector),
                 second_order_ran=will_run_second_order,
-                top_z_score=float(radar_result["sector_z_scores"].get(top_sector, 0.0)),
-                radar_dimensions=radar_result["sector_z_scores"],
-                recommended_action="QUARANTINE" if cri >= 80 else ("INVESTIGATE" if cri >= 60 else "MONITOR"),
-                entities_to_quarantine=[req.target_entity] if radar_result["is_outlier"] else [],
+                top_z_score=_num_or_none(radar_result["sector_z_scores"].get(top_sector)),
+                radar_dimensions=_finite_dims(radar_result["sector_z_scores"]),
+                recommended_action=radar_decision.action,
+                entities_to_quarantine=[req.target_entity] if radar_decision.contain else [],
                 mitre_tactics=["TA0001", "TA0006"] if radar_result["is_outlier"] else [],
             )
 
@@ -1433,29 +1660,31 @@ class AutonomousHunterEngine:
                   )
                   secondary_hunts_run += 1
 
-                  if sec_res is not None and int(sec_res.get("stats_rows", 0)) == 0:
+                  if sec_res is not None and _rows(sec_res) == 0:
                     empty_families.add(StrategyDecider.family_for_query(tier2_directive.directive_query))
 
-                  if sec_report and req.post_to_case_wall:
-                    await session.call_tool(
-                        "create_case_comment",
-                        {
-                            "projectId": tenant.project_id,
-                            "customerId": tenant.customer_id,
-                            "region": tenant.region,
-                            "caseId": str(req.case_id),
-                            "comment": self.sanitize_case_comment(sec_report),
-                        },
-                    )
+                  if sec_report:
+                    if req.post_to_case_wall:
+                      await session.call_tool(
+                          "create_case_comment",
+                          {
+                              "projectId": tenant.project_id,
+                              "customerId": tenant.customer_id,
+                              "region": tenant.region,
+                              "caseId": str(req.case_id),
+                              "comment": self.sanitize_case_comment(sec_report),
+                          },
+                      )
                     markdown_report = f"{markdown_report}\n\n---\n\n{sec_report}"
-                    sec_cri = float(sec_res.get("calibrated_risk_index", 0.0)) if sec_res else 0.0
-                    sec_outlier = bool(sec_res.get("is_outlier", False)) if sec_res else False
-                    cri = max(cri, sec_cri)
-                    if sec_outlier:
-                      triage.is_outlier = True
-                      triage.calibrated_risk_index = float(cri)
-                      triage.verdict = "CRITICAL_OUTLIER" if cri >= 80 else "HIGH_OUTLIER"
-                      triage.primary_vector = f"tier2a_{tier2_directive.model_name.lower()}"
+                  if sec_res is not None:
+                    cri = _max_cri(cri, sec_res.get("calibrated_risk_index"))
+                    if bool(sec_res.get("is_outlier", False)):
+                      _apply_escalation(
+                          triage,
+                          decide(cri, GENERIC_CONTAINMENT_ACTION),
+                          req.target_entity,
+                          f"tier2a_{tier2_directive.model_name.lower()}",
+                      )
 
                   # Evaluate Bounded Tier 2B Epistemic Pivot (Refutation Pivot or Multi-Sector Fusion Pivot)
                   if sec_res is not None and secondary_hunts_run < StrategyDecider.MAX_SECONDARY_HUNTS:
@@ -1494,26 +1723,28 @@ class AutonomousHunterEngine:
                           directive=pivot_directive,
                       )
                       secondary_hunts_run += 1
-                      if piv_report and req.post_to_case_wall:
-                        await session.call_tool(
-                            "create_case_comment",
-                            {
-                                "projectId": tenant.project_id,
-                                "customerId": tenant.customer_id,
-                                "region": tenant.region,
-                                "caseId": str(req.case_id),
-                                "comment": self.sanitize_case_comment(piv_report),
-                            },
-                        )
+                      if piv_report:
+                        if req.post_to_case_wall:
+                          await session.call_tool(
+                              "create_case_comment",
+                              {
+                                  "projectId": tenant.project_id,
+                                  "customerId": tenant.customer_id,
+                                  "region": tenant.region,
+                                  "caseId": str(req.case_id),
+                                  "comment": self.sanitize_case_comment(piv_report),
+                              },
+                          )
                         markdown_report = f"{markdown_report}\n\n---\n\n{piv_report}"
-                        piv_cri = float(piv_res.get("calibrated_risk_index", 0.0)) if piv_res else 0.0
-                        piv_outlier = bool(piv_res.get("is_outlier", False)) if piv_res else False
-                        cri = max(cri, piv_cri)
-                        if piv_outlier:
-                          triage.is_outlier = True
-                          triage.calibrated_risk_index = float(cri)
-                          triage.verdict = "CRITICAL_OUTLIER" if cri >= 80 else "HIGH_OUTLIER"
-                          triage.primary_vector = f"tier2b_{pivot_directive.model_name.lower()}"
+                      if piv_res is not None:
+                        cri = _max_cri(cri, piv_res.get("calibrated_risk_index"))
+                        if bool(piv_res.get("is_outlier", False)):
+                          _apply_escalation(
+                              triage,
+                              decide(cri, GENERIC_CONTAINMENT_ACTION),
+                              req.target_entity,
+                              f"tier2b_{pivot_directive.model_name.lower()}",
+                          )
 
                   if secondary_hunts_run > 0:
                     triage.second_order_ran = True
@@ -1538,7 +1769,7 @@ class AutonomousHunterEngine:
             clean_hand_off = CleanHandOffPayload(
                 target_entity=req.target_entity,
                 entity_type=req.entity_type,
-                evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                evaluated_window=evaluated_day,
                 primary_model="secops-risk-metrics-multistage",
                 outlier_topology=f"{top_sector.upper()}_DRIFT",
                 mitre_tactics_mapped=triage.mitre_tactics,
@@ -1570,19 +1801,18 @@ class AutonomousHunterEngine:
                 src_ip=req.target_entity,
                 lookback_days=req.lookback_days,
             )
-            cri = jitter_result["calibrated_risk_index"]
-            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
-            rows_count = jitter_result.get("stats_rows", 0)
+            decision = decide(jitter_result.get("calibrated_risk_index"), "ISOLATE_HOST")
+            rows_count = _rows(jitter_result)
             jitter_rows = [
                 {
                     "metric": "**Coefficient of Variation ($CV$)**",
-                    "observed": f"`{jitter_result['coefficient_of_variation']:.3f}`",
+                    "observed": f"`{_fmt(jitter_result.get('coefficient_of_variation'), '.3f')}`",
                     "threshold": "$\\le 0.300$",
                     "assessment": "⚠️ Low Jitter / Periodic Beaconing" if jitter_result["is_outlier"] else "✅ High Jitter (Stochastic / Irregular)",
                 },
                 {
                     "metric": "**Top Target Destination**",
-                    "observed": f"`{jitter_result.get('target_destination', 'UNKNOWN')}`",
+                    "observed": f"`{jitter_result.get('target_destination') or 'UNKNOWN'}`",
                     "threshold": "External IP",
                     "assessment": "Primary Egress Communication Endpoint",
                 },
@@ -1597,18 +1827,20 @@ class AutonomousHunterEngine:
                 target_entity=req.target_entity,
                 entity_type=req.entity_type,
                 model_name="C2_BEACONING_JITTER",
-                calibrated_risk_index=float(cri),
+                calibrated_risk_index=decision.cri_value,
                 is_outlier=jitter_result["is_outlier"],
                 case_id=req.case_id,
                 rows_count=rows_count,
                 directive=req.directive,
                 metrics_table_rows=jitter_rows,
-                soc_guidance=(
-                    f"Outbound network traffic to `{jitter_result.get('target_destination')}` exhibits rigid periodicity ($CV = {jitter_result['coefficient_of_variation']:.3f}$). "
-                    "Host quarantine and perimeter IP block recommended."
-                    if jitter_result["is_outlier"] else
-                    f"Outbound connection intervals exhibit high timing jitter ($CV = {jitter_result['coefficient_of_variation']:.3f}$), typical of normal cloud applications and distributed polling. No beaconing detected."
-                ),
+                soc_guidance=_soc_guidance(decision, (
+                    _not_evaluated_finding(jitter_result, "Beaconing regularity")
+                    or (
+                        f"Outbound network traffic to `{jitter_result.get('target_destination') or 'UNKNOWN'}` exhibits rigid periodicity ({_math_value('CV', jitter_result.get('coefficient_of_variation'), '.3f')})."
+                        if jitter_result["is_outlier"] else
+                        f"Outbound connection intervals exhibit high timing jitter ({_math_value('CV', jitter_result.get('coefficient_of_variation'), '.3f')}), typical of normal cloud applications and distributed polling. No beaconing detected."
+                    )
+                )),
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
@@ -1626,13 +1858,13 @@ class AutonomousHunterEngine:
             return JITHuntResponse(
                 status="SUCCESS",
                 triage=TriageSummary(
-                    calibrated_risk_index=float(cri),
-                    verdict=verdict,
+                    calibrated_risk_index=decision.cri_value,
+                    verdict=decision.verdict,
                     is_outlier=jitter_result["is_outlier"],
                     primary_vector="c2_timing_regularity",
-                    top_z_score=float(jitter_result.get("top_z_score", 0.0)),
-                    recommended_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
-                    entities_to_quarantine=[req.target_entity] if jitter_result["is_outlier"] else [],
+                    top_z_score=_num_or_none(jitter_result.get("top_z_score")),
+                    recommended_action=decision.action,
+                    entities_to_quarantine=[req.target_entity] if decision.contain else [],
                     mitre_tactics=["TA0011"] if jitter_result["is_outlier"] else [],
                 ),
                 clean_hand_off=CleanHandOffPayload(
@@ -1643,7 +1875,7 @@ class AutonomousHunterEngine:
                     outlier_topology="C2_REGULARITY",
                     mitre_tactics_mapped=["TA0011"] if jitter_result["is_outlier"] else [],
                     recommended_swarm_playbook="C2_CONTAINMENT",
-                    escalation_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
+                    escalation_action=decision.action,
                 ),
                 forensics=ForensicsSummary(
                     executed_query=jitter_result["executed_query"],
@@ -1664,19 +1896,18 @@ class AutonomousHunterEngine:
                 entity=req.target_entity,
                 lookback_days=req.lookback_days,
             )
-            cri = spray_result["calibrated_risk_index"]
-            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
-            fano = float(spray_result.get("top_fano", 1.0))
+            decision = decide(spray_result.get("calibrated_risk_index"), "LOCK_ACCOUNT")
+            fano = _num_or_none(spray_result.get("top_fano"))
             spray_rows = [
                 {
                     "metric": "**Fano Factor ($F = \\sigma^2 / \\mu$)**",
-                    "observed": f"`{fano:.2f}`",
+                    "observed": f"`{_fmt(fano, '.2f')}`",
                     "threshold": "$> 4.00$",
                     "assessment": "⚠️ Severe Overdispersion (Clustered Spray)" if spray_result["is_outlier"] else "✅ Poisson Dispersion (Nominal Rate)",
                 },
                 {
                     "metric": "**Evaluated Auth Events**",
-                    "observed": f"`{spray_result.get('stats_rows', 0)}` events",
+                    "observed": f"`{_rows(spray_result)}` events",
                     "threshold": "$\\ge 10$ events",
                     "assessment": "Observed Sample Window",
                 },
@@ -1685,17 +1916,17 @@ class AutonomousHunterEngine:
                 target_entity=req.target_entity,
                 entity_type=req.entity_type,
                 model_name="POISSON_BURST_CLUSTERING",
-                calibrated_risk_index=float(cri),
+                calibrated_risk_index=decision.cri_value,
                 is_outlier=spray_result["is_outlier"],
                 case_id=req.case_id,
-                rows_count=spray_result.get("stats_rows", 0),
+                rows_count=_rows(spray_result),
                 directive=req.directive,
                 metrics_table_rows=spray_rows,
-                soc_guidance=(
-                    f"Detected automated credential spray bursts ($Fano = {fano:.2f}$). Lock account credentials and invalidate active OAuth/SAML tokens."
+                soc_guidance=_soc_guidance(decision, (
+                    f"Detected automated credential spray bursts ({_math_value('Fano', fano, '.2f')})."
                     if spray_result["is_outlier"] else
-                    f"Authentication failures show no statistical clustering ($Fano = {fano:.2f}$), consistent with random user typing mistakes."
-                ),
+                    f"Authentication failures show no statistical clustering ({_math_value('Fano', fano, '.2f')}), consistent with random user typing mistakes."
+                )),
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
@@ -1713,13 +1944,13 @@ class AutonomousHunterEngine:
             return JITHuntResponse(
                 status="SUCCESS",
                 triage=TriageSummary(
-                    calibrated_risk_index=float(cri),
-                    verdict=verdict,
+                    calibrated_risk_index=decision.cri_value,
+                    verdict=decision.verdict,
                     is_outlier=spray_result["is_outlier"],
                     primary_vector="poisson_burst_clustering",
-                    top_z_score=float(spray_result.get("top_fano", 0.0)),
-                    recommended_action="LOCK_ACCOUNT" if cri >= 80 else "MONITOR",
-                    entities_to_quarantine=[req.target_entity] if spray_result["is_outlier"] else [],
+                    top_z_score=_num_or_none(spray_result.get("top_z_score")),
+                    recommended_action=decision.action,
+                    entities_to_quarantine=[req.target_entity] if decision.contain else [],
                     mitre_tactics=["TA0006"] if spray_result["is_outlier"] else [],
                 ),
                 clean_hand_off=CleanHandOffPayload(
@@ -1730,7 +1961,7 @@ class AutonomousHunterEngine:
                     outlier_topology="POISSON_BURST",
                     mitre_tactics_mapped=["TA0006"] if spray_result["is_outlier"] else [],
                     recommended_swarm_playbook="CREDENTIAL_SPRAY_REMEDIATION",
-                    escalation_action="LOCK_ACCOUNT" if cri >= 80 else "MONITOR",
+                    escalation_action=decision.action,
                 ),
                 forensics=ForensicsSummary(
                     executed_query=spray_result["executed_query"],
@@ -1751,19 +1982,18 @@ class AutonomousHunterEngine:
                 username=req.target_entity,
                 lookback_days=req.lookback_days,
             )
-            cri = cloud_result["calibrated_risk_index"]
-            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
-            top_z = float(cloud_result.get("top_z_score", 0.0))
+            decision = decide(cloud_result.get("calibrated_risk_index"), "REVOKE_IAM_ROLES")
+            top_z = _num_or_none(cloud_result.get("top_z_score"))
             cloud_rows = [
                 {
                     "metric": "**Cloud Mutation Z-Score**",
-                    "observed": f"`{top_z:+.2f}σ`",
+                    "observed": f"`{_fmt(top_z, '+.2f', 'σ')}`",
                     "threshold": "$> 3.00\\sigma$",
                     "assessment": "⚠️ Significant Administrative Mutation" if cloud_result["is_outlier"] else "✅ Within Baseline Volatility",
                 },
                 {
                     "metric": "**Observed Cloud Modifications**",
-                    "observed": f"`{cloud_result.get('observed_events', 0)}` mutations",
+                    "observed": f"`{_show(cloud_result.get('observed_events', 0))}` mutations",
                     "threshold": "Historical 30-Day Mean",
                     "assessment": "Cloud Resource Write Events",
                 },
@@ -1772,17 +2002,17 @@ class AutonomousHunterEngine:
                 target_entity=req.target_entity,
                 entity_type=req.entity_type,
                 model_name="CLOUD_CRUD_SURGE",
-                calibrated_risk_index=float(cri),
+                calibrated_risk_index=decision.cri_value,
                 is_outlier=cloud_result["is_outlier"],
                 case_id=req.case_id,
-                rows_count=cloud_result.get("observed_events", 0),
+                rows_count=int(_finite_float(cloud_result.get("observed_events"))),
                 directive=req.directive,
                 metrics_table_rows=cloud_rows,
-                soc_guidance=(
-                    f"Abnormal cloud infrastructure creation/permission spike ($Z = {top_z:+.2f}\\sigma$). Audit IAM changes and newly deployed cloud workloads."
+                soc_guidance=_soc_guidance(decision, (
+                    f"Abnormal cloud infrastructure creation/permission spike ({_math_value('Z', top_z, '+.2f', _TEX_SIGMA)}). Audit IAM changes and newly deployed cloud workloads."
                     if cloud_result["is_outlier"] else
-                    f"Cloud resource management operations ($Z = {top_z:+.2f}\\sigma$) match expected deployment baselines."
-                ),
+                    f"Cloud resource management operations ({_math_value('Z', top_z, '+.2f', _TEX_SIGMA)}) match expected deployment baselines."
+                )),
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
@@ -1800,24 +2030,24 @@ class AutonomousHunterEngine:
             return JITHuntResponse(
                 status="SUCCESS",
                 triage=TriageSummary(
-                    calibrated_risk_index=float(cri),
-                    verdict=verdict,
+                    calibrated_risk_index=decision.cri_value,
+                    verdict=decision.verdict,
                     is_outlier=cloud_result["is_outlier"],
                     primary_vector="cloud_crud_surge",
-                    top_z_score=float(cloud_result.get("top_z_score", 0.0)),
-                    recommended_action="REVOKE_IAM_ROLES" if cri >= 80 else "MONITOR",
-                    entities_to_quarantine=[req.target_entity] if cloud_result["is_outlier"] else [],
+                    top_z_score=_num_or_none(cloud_result.get("top_z_score")),
+                    recommended_action=decision.action,
+                    entities_to_quarantine=[req.target_entity] if decision.contain else [],
                     mitre_tactics=["TA0003", "TA0004"] if cloud_result["is_outlier"] else [],
                 ),
                 clean_hand_off=CleanHandOffPayload(
                     target_entity=req.target_entity,
                     entity_type=req.entity_type,
-                    evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    evaluated_window=_macro_evaluated_day(cloud_result),
                     primary_model="secops-risk-metrics-multistage",
                     outlier_topology="CLOUD_CRUD_SURGE",
                     mitre_tactics_mapped=["TA0003", "TA0004"] if cloud_result["is_outlier"] else [],
                     recommended_swarm_playbook="IAM_ABUSE_INVESTIGATION",
-                    escalation_action="REVOKE_IAM_ROLES" if cri >= 80 else "MONITOR",
+                    escalation_action=decision.action,
                 ),
                 forensics=ForensicsSummary(
                     executed_query=cloud_result["executed_query"],
@@ -1830,48 +2060,53 @@ class AutonomousHunterEngine:
                 f"Deterministic Cloud CRUD fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
             )
 
-        # --- 5. Deterministic Fast-Path: Circadian von Mises Temporal Anomaly ---
-        elif "circadian" in query_str or "von_mises" in query_str:
+        # --- 5. Deterministic Fast-Path: Hour-of-Day Profile (secops-statistical-hunter) ---
+        # Off-hours / circadian intents run HOUR_OF_DAY_PROFILE, the model the skills name as the
+        # replacement for the retired CIRCADIAN_VON_MISES / HOURLY_TEMPORAL_ZSCORE / geo-velocity paths.
+        elif _is_hour_of_day_query(query_str):
           try:
-            m_name = getattr(req.directive, "target_metric", None) or "auth_attempts_total"
-            circ_result = await RiskMetricsEngine(tenant).run_circadian_von_mises(
+            hod_result = await StatsHunterEngine(tenant).run_dynamic_archetype_pipeline(
                 session=session,
                 entity=req.target_entity,
-                metric_name=m_name,
+                archetype=HOUR_OF_DAY_PROFILE,
+                entity_type=req.entity_type,
+                event_type="USER_LOGIN",
                 lookback_days=req.lookback_days,
             )
-            cri = circ_result["calibrated_risk_index"]
-            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
-            hourly_z = float(circ_result.get("hourly_z", 0.0))
-            circ_rows = [
+            decision = decide(hod_result.get("calibrated_risk_index"), "FORCE_MFA_CHALLENGE")
+            hod_outlier = bool(hod_result.get("is_outlier", False))
+            hod_score = _hod_score(hod_result)
+            rows_count = _rows(hod_result)
+            hod_rows = [
                 {
-                    "metric": "**Circadian Threat Score**",
-                    "observed": f"`{circ_result.get('circadian_threat_score', 0)}`",
-                    "threshold": "$\\ge 50$",
-                    "assessment": "⚠️ Off-Hours / Temporal Outlier" if circ_result["is_outlier"] else "✅ Active Working Hours",
+                    "metric": f"**Hour-of-Day Profile Score (`{hod_result.get('score_metric') or 'hod_z_score'}`)**",
+                    "observed": f"`{_fmt(hod_score, '+.2f')}`",
+                    "threshold": f"$\\ge {harness_truth.constants().DEFAULT_ANOMALY_THRESHOLD:.2f}$",
+                    "assessment": "⚠️ Out-of-Profile Hour-of-Day Activity" if hod_outlier else "✅ Within Learned 24-Bin Profile",
                 },
                 {
-                    "metric": "**Hourly Z-Score**",
-                    "observed": f"`{hourly_z:+.2f}σ`",
-                    "threshold": "$> 2.50\\sigma$",
-                    "assessment": f"Event Hour: {circ_result.get('event_hour', 'UTC')} UTC",
+                    "metric": "**Evaluated Hour Buckets**",
+                    "observed": f"`{rows_count}` rows",
+                    "threshold": "Learned 24-Bin UTC Hour-of-Day Profile",
+                    "assessment": f"`secops-statistical-hunter` `{HOUR_OF_DAY_PROFILE}`",
                 },
             ]
+            hod_finding = (
+                f"Login activity for `{req.target_entity}` fell outside its learned 24-bin hour-of-day profile (score = {_fmt(hod_score, '+.2f')})."
+                if hod_outlier else
+                f"Login timing for `{req.target_entity}` is consistent with its learned 24-bin hour-of-day profile."
+            )
             markdown_report = CaseWallCardFormatter.format_card(
                 target_entity=req.target_entity,
                 entity_type=req.entity_type,
-                model_name="CIRCADIAN_VON_MISES",
-                calibrated_risk_index=float(cri),
-                is_outlier=circ_result["is_outlier"],
+                model_name=HOUR_OF_DAY_PROFILE,
+                calibrated_risk_index=decision.cri_value,
+                is_outlier=hod_outlier,
                 case_id=req.case_id,
-                rows_count=1,
+                rows_count=rows_count,
                 directive=req.directive,
-                metrics_table_rows=circ_rows,
-                soc_guidance=(
-                    f"Activity occurred at a statistically rare circadian angle for this identity ($Z = {hourly_z:+.2f}\\sigma$). Verify user physical travel or remote session legitimacy."
-                    if circ_result["is_outlier"] else
-                    f"Activity timing is consistent with user normal diurnal schedule ($Z = {hourly_z:+.2f}\\sigma$)."
-                ),
+                metrics_table_rows=hod_rows,
+                soc_guidance=_soc_guidance(decision, f"{route_note} {hod_finding}"),
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
@@ -1889,34 +2124,34 @@ class AutonomousHunterEngine:
             return JITHuntResponse(
                 status="SUCCESS",
                 triage=TriageSummary(
-                    calibrated_risk_index=float(cri),
-                    verdict=verdict,
-                    is_outlier=circ_result["is_outlier"],
-                    primary_vector="circadian_temporal_anomaly",
-                    top_z_score=float(circ_result.get("top_z_score", 0.0)),
-                    recommended_action="FORCE_MFA_CHALLENGE" if cri >= 80 else "MONITOR",
-                    entities_to_quarantine=[req.target_entity] if circ_result["is_outlier"] else [],
-                    mitre_tactics=["TA0001"] if circ_result["is_outlier"] else [],
+                    calibrated_risk_index=decision.cri_value,
+                    verdict=decision.verdict,
+                    is_outlier=hod_outlier,
+                    primary_vector="hour_of_day_login_anomaly",
+                    top_z_score=_num_or_none(hod_result.get("top_z_score")),
+                    recommended_action=decision.action,
+                    entities_to_quarantine=[req.target_entity] if decision.contain else [],
+                    mitre_tactics=["TA0001"] if hod_outlier else [],
                 ),
                 clean_hand_off=CleanHandOffPayload(
                     target_entity=req.target_entity,
                     entity_type=req.entity_type,
                     evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                    primary_model="secops-risk-metrics-multistage",
-                    outlier_topology="CIRCADIAN_TEMPORAL_DEPARTURE",
-                    mitre_tactics_mapped=["TA0001"] if circ_result["is_outlier"] else [],
+                    primary_model="secops-statistical-hunter",
+                    outlier_topology="HOUR_OF_DAY_PROFILE_DEPARTURE",
+                    mitre_tactics_mapped=["TA0001"] if hod_outlier else [],
                     recommended_swarm_playbook="OFF_HOURS_ACCESS_CONTAINMENT",
-                    escalation_action="FORCE_MFA_CHALLENGE" if cri >= 80 else "MONITOR",
+                    escalation_action=decision.action,
                 ),
                 forensics=ForensicsSummary(
-                    executed_query=circ_result["executed_query"],
+                    executed_query=hod_result.get("executed_query", ""),
                     markdown_report=markdown_report,
                 ),
                 case_wall_updated=case_wall_updated,
             )
           except Exception as fast_path_err:
             logger.warning(
-                f"Deterministic Circadian fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
+                f"Deterministic Hour-of-Day Profile fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
             )
 
         # --- 6. Deterministic Fast-Path: MACD Momentum Velocity ---
@@ -1929,18 +2164,17 @@ class AutonomousHunterEngine:
                 metric_name=m_name,
                 lookback_days=req.lookback_days,
             )
-            cri = macd_result["calibrated_risk_index"]
-            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            decision = decide(macd_result.get("calibrated_risk_index"), "THROTTLE_EGRESS")
             macd_rows = [
                 {
                     "metric": f"**MACD Momentum Score (`{m_name}`)**",
-                    "observed": f"`{macd_result['macd_momentum_score']:+.2f}σ`",
+                    "observed": f"`{_fmt(macd_result.get('macd_momentum_score'), '+.2f', 'σ')}`",
                     "threshold": "$> 3.00\\sigma$",
                     "assessment": "⚠️ Acute Regime Acceleration" if macd_result["is_outlier"] else "✅ Stable Velocity Regime",
                 },
                 {
                     "metric": "**Fast Z vs Slow Z Spine**",
-                    "observed": f"Fast Z = `{macd_result['fast_z']:+.2f}σ` | Slow Z = `{macd_result['slow_z']:+.2f}σ`",
+                    "observed": f"Fast Z = `{_fmt(macd_result.get('fast_z'), '+.2f', 'σ')}` | Slow Z = `{_fmt(macd_result.get('slow_z'), '+.2f', 'σ')}`",
                     "threshold": "30-Day Pre-Computed Anchor",
                     "assessment": "Dual-Spine Momentum Divergence",
                 },
@@ -1949,12 +2183,13 @@ class AutonomousHunterEngine:
                 target_entity=req.target_entity,
                 entity_type=req.entity_type,
                 model_name="MACD_MOMENTUM_VELOCITY",
-                calibrated_risk_index=float(cri),
+                calibrated_risk_index=decision.cri_value,
                 is_outlier=macd_result["is_outlier"],
                 case_id=req.case_id,
-                rows_count=macd_result.get("stats_rows", 0),
+                rows_count=_rows(macd_result),
                 directive=req.directive,
                 metrics_table_rows=macd_rows,
+                soc_guidance=_soc_guidance(decision),
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
@@ -1972,24 +2207,24 @@ class AutonomousHunterEngine:
             return JITHuntResponse(
                 status="SUCCESS",
                 triage=TriageSummary(
-                    calibrated_risk_index=float(cri),
-                    verdict=verdict,
+                    calibrated_risk_index=decision.cri_value,
+                    verdict=decision.verdict,
                     is_outlier=macd_result["is_outlier"],
                     primary_vector="macd_momentum_acceleration",
-                    top_z_score=float(macd_result.get("top_z_score", 0.0)),
-                    recommended_action="THROTTLE_EGRESS" if cri >= 80 else "MONITOR",
-                    entities_to_quarantine=[req.target_entity] if macd_result["is_outlier"] else [],
+                    top_z_score=_num_or_none(macd_result.get("top_z_score")),
+                    recommended_action=decision.action,
+                    entities_to_quarantine=[req.target_entity] if decision.contain else [],
                     mitre_tactics=["TA0010"] if macd_result["is_outlier"] else [],
                 ),
                 clean_hand_off=CleanHandOffPayload(
                     target_entity=req.target_entity,
                     entity_type=req.entity_type,
-                    evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    evaluated_window=_macro_evaluated_day(macd_result),
                     primary_model="secops-risk-metrics-multistage",
                     outlier_topology="MACD_MOMENTUM_DIVERGENCE",
                     mitre_tactics_mapped=["TA0010"] if macd_result["is_outlier"] else [],
                     recommended_swarm_playbook="EXFILTRATION_MOMENTUM_CONTAINMENT",
-                    escalation_action="THROTTLE_EGRESS" if cri >= 80 else "MONITOR",
+                    escalation_action=decision.action,
                 ),
                 forensics=ForensicsSummary(
                     executed_query=macd_result["executed_query"],
@@ -2010,13 +2245,12 @@ class AutonomousHunterEngine:
                 entity=req.target_entity,
                 lookback_days=req.lookback_days,
             )
-            cri = shannon_result["calibrated_risk_index"]
-            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            decision = decide(shannon_result.get("calibrated_risk_index"), "TERMINATE_PROCESS")
             sample_tok = shannon_result.get("sample_token") or "N/A"
             shannon_rows = [
                 {
                     "metric": "**Shannon Entropy ($H$)**",
-                    "observed": f"`{shannon_result['shannon_entropy_score']:.2f}` bits/char",
+                    "observed": f"`{_fmt(shannon_result.get('shannon_entropy_score'), '.2f')}` bits/char",
                     "threshold": "> 6.00 bits/char",
                     "assessment": "⚠️ Obfuscated / Encrypted Command Payload" if shannon_result["is_outlier"] else "✅ Standard Text Entropy",
                 },
@@ -2028,7 +2262,7 @@ class AutonomousHunterEngine:
                 },
                 {
                     "metric": "**Sampled Executions**",
-                    "observed": f"`{shannon_result.get('stats_rows', 0)}` records",
+                    "observed": f"`{_rows(shannon_result)}` records",
                     "threshold": "$\\ge 1$ required",
                     "assessment": "Process Launch Telemetry",
                 },
@@ -2037,18 +2271,21 @@ class AutonomousHunterEngine:
                 target_entity=req.target_entity,
                 entity_type=req.entity_type,
                 model_name="SHANNON_CHARACTER_ENTROPY",
-                calibrated_risk_index=float(cri),
+                calibrated_risk_index=decision.cri_value,
                 is_outlier=shannon_result["is_outlier"],
                 case_id=req.case_id,
-                rows_count=shannon_result.get("stats_rows", 0),
+                rows_count=_rows(shannon_result),
                 directive=req.directive,
                 metrics_table_rows=shannon_rows,
-                soc_guidance=(
-                    f"Command line on `{req.target_entity}` exhibits high Shannon character-class entropy ($H = {shannon_result['shannon_entropy_score']:.2f}$ bits/char), indicating Base64/XOR obfuscated scripts. "
-                    "Terminate process and extract decoded command buffers."
-                    if shannon_result["is_outlier"] else
-                    f"Command line entropy on `{req.target_entity}` is within expected readable parameter distributions."
-                ),
+                soc_guidance=_soc_guidance(decision, (
+                    _not_evaluated_finding(shannon_result, "Command-line entropy")
+                    or (
+                        f"Command line on `{req.target_entity}` exhibits high Shannon character-class entropy ({_math_value('H', shannon_result.get('shannon_entropy_score'), '.2f')} bits/char), indicating Base64/XOR obfuscated scripts. "
+                        "Extract and review the decoded command buffers."
+                        if shannon_result["is_outlier"] else
+                        f"Command line entropy on `{req.target_entity}` is within expected readable parameter distributions."
+                    )
+                )),
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
@@ -2066,13 +2303,13 @@ class AutonomousHunterEngine:
             return JITHuntResponse(
                 status="SUCCESS",
                 triage=TriageSummary(
-                    calibrated_risk_index=float(cri),
-                    verdict=verdict,
+                    calibrated_risk_index=decision.cri_value,
+                    verdict=decision.verdict,
                     is_outlier=shannon_result["is_outlier"],
                     primary_vector="command_line_obfuscation_entropy",
-                    top_z_score=float(shannon_result.get("top_z_score", 0.0)),
-                    recommended_action="TERMINATE_PROCESS" if cri >= 80 else "MONITOR",
-                    entities_to_quarantine=[req.target_entity] if shannon_result["is_outlier"] else [],
+                    top_z_score=_num_or_none(shannon_result.get("top_z_score")),
+                    recommended_action=decision.action,
+                    entities_to_quarantine=[req.target_entity] if decision.contain else [],
                     mitre_tactics=["TA0005"] if shannon_result["is_outlier"] else [],
                 ),
                 clean_hand_off=CleanHandOffPayload(
@@ -2083,7 +2320,7 @@ class AutonomousHunterEngine:
                     outlier_topology="SHANNON_CHARACTER_ENTROPY",
                     mitre_tactics_mapped=["TA0005"] if shannon_result["is_outlier"] else [],
                     recommended_swarm_playbook="OBFUSCATED_COMMAND_REMEDIATION",
-                    escalation_action="TERMINATE_PROCESS" if cri >= 80 else "MONITOR",
+                    escalation_action=decision.action,
                 ),
                 forensics=ForensicsSummary(
                     executed_query=shannon_result["executed_query"],
@@ -2104,14 +2341,13 @@ class AutonomousHunterEngine:
                 host=req.target_entity,
                 lookback_days=req.lookback_days,
             )
-            cri = markov_result["calibrated_risk_index"]
-            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            decision = decide(markov_result.get("calibrated_risk_index"), "ISOLATE_HOST")
             p_proc = markov_result.get("parent_process") or "UNKNOWN"
             c_proc = markov_result.get("child_process") or "UNKNOWN"
             markov_rows = [
                 {
                     "metric": "**Information Surprisal**",
-                    "observed": f"`{markov_result['surprisal_score']:.2f}` bits",
+                    "observed": f"`{_fmt(markov_result.get('surprisal_score'), '.2f')}` bits",
                     "threshold": "> 4.00 bits",
                     "assessment": "⚠️ Rare Living-off-the-Land Transition" if markov_result["is_outlier"] else "✅ Standard Process Transition",
                 },
@@ -2123,7 +2359,7 @@ class AutonomousHunterEngine:
                 },
                 {
                     "metric": "**Sampled Executions**",
-                    "observed": f"`{markov_result.get('stats_rows', 0)}` records",
+                    "observed": f"`{_rows(markov_result)}` records",
                     "threshold": "$\\ge 1$ required",
                     "assessment": "Process Lineage Telemetry",
                 },
@@ -2132,18 +2368,18 @@ class AutonomousHunterEngine:
                 target_entity=req.target_entity,
                 entity_type=req.entity_type,
                 model_name="MARKOV_TRANSITION_RARITY",
-                calibrated_risk_index=float(cri),
+                calibrated_risk_index=decision.cri_value,
                 is_outlier=markov_result["is_outlier"],
                 case_id=req.case_id,
-                rows_count=markov_result.get("stats_rows", 0),
+                rows_count=_rows(markov_result),
                 directive=req.directive,
                 metrics_table_rows=markov_rows,
-                soc_guidance=(
-                    f"Process lineage `{p_proc}` ➔ `{c_proc}` exhibits extreme surprisal ({markov_result['surprisal_score']:.2f} bits) characteristic of Living-off-the-Land execution. "
-                    "Isolate host and investigate command line arguments."
+                soc_guidance=_soc_guidance(decision, (
+                    f"Process lineage `{p_proc}` ➔ `{c_proc}` exhibits extreme surprisal ({_fmt(markov_result.get('surprisal_score'), '.2f', ' bits')}) characteristic of Living-off-the-Land execution. "
+                    "Investigate the command line arguments."
                     if markov_result["is_outlier"] else
                     f"Process execution transitions on `{req.target_entity}` conform to standard enterprise operational tooling."
-                ),
+                )),
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
@@ -2161,13 +2397,13 @@ class AutonomousHunterEngine:
             return JITHuntResponse(
                 status="SUCCESS",
                 triage=TriageSummary(
-                    calibrated_risk_index=float(cri),
-                    verdict=verdict,
+                    calibrated_risk_index=decision.cri_value,
+                    verdict=decision.verdict,
                     is_outlier=markov_result["is_outlier"],
                     primary_vector="markov_process_transition_rarity",
-                    top_z_score=float(markov_result.get("top_z_score", 0.0)),
-                    recommended_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
-                    entities_to_quarantine=[req.target_entity] if markov_result["is_outlier"] else [],
+                    top_z_score=_num_or_none(markov_result.get("top_z_score")),
+                    recommended_action=decision.action,
+                    entities_to_quarantine=[req.target_entity] if decision.contain else [],
                     mitre_tactics=["TA0002", "TA0005"] if markov_result["is_outlier"] else [],
                 ),
                 clean_hand_off=CleanHandOffPayload(
@@ -2178,7 +2414,7 @@ class AutonomousHunterEngine:
                     outlier_topology="MARKOV_TRANSITION_RARITY",
                     mitre_tactics_mapped=["TA0002", "TA0005"] if markov_result["is_outlier"] else [],
                     recommended_swarm_playbook="LIVING_OFF_THE_LAND_CONTAINMENT",
-                    escalation_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
+                    escalation_action=decision.action,
                 ),
                 forensics=ForensicsSummary(
                     executed_query=markov_result["executed_query"],
@@ -2199,13 +2435,12 @@ class AutonomousHunterEngine:
                 host=req.target_entity,
                 lookback_days=req.lookback_days,
             )
-            cri = zipf_result["calibrated_risk_index"]
-            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            decision = decide(zipf_result.get("calibrated_risk_index"), "ISOLATE_HOST")
             rare_bin = zipf_result.get("rare_binary") or "UNKNOWN"
             zipf_rows = [
                 {
                     "metric": "**Zipf Rarity Score**",
-                    "observed": f"`{zipf_result['zipf_rarity_score']:.2f}`",
+                    "observed": f"`{_fmt(zipf_result.get('zipf_rarity_score'), '.2f')}`",
                     "threshold": "> 3.50",
                     "assessment": "⚠️ Long-Tail Fleet Outlier" if zipf_result["is_outlier"] else "✅ Common Fleet Software",
                 },
@@ -2217,7 +2452,7 @@ class AutonomousHunterEngine:
                 },
                 {
                     "metric": "**Sampled Process Executions**",
-                    "observed": f"`{zipf_result.get('stats_rows', 0)}` records",
+                    "observed": f"`{_rows(zipf_result)}` records",
                     "threshold": "$\\ge 1$ required",
                     "assessment": "Process Launch Telemetry",
                 },
@@ -2226,18 +2461,18 @@ class AutonomousHunterEngine:
                 target_entity=req.target_entity,
                 entity_type=req.entity_type,
                 model_name="ZIPFIAN_PROCESS_RARITY",
-                calibrated_risk_index=float(cri),
+                calibrated_risk_index=decision.cri_value,
                 is_outlier=zipf_result["is_outlier"],
                 case_id=req.case_id,
-                rows_count=zipf_result.get("stats_rows", 0),
+                rows_count=_rows(zipf_result),
                 directive=req.directive,
                 metrics_table_rows=zipf_rows,
-                soc_guidance=(
-                    f"Host `{req.target_entity}` executed rare binary `{rare_bin}` sitting in the extreme asymptotic fleet tail (Zipf Score = {zipf_result['zipf_rarity_score']:.2f}). "
-                    "Isolate host, terminate binary process, and inspect persistence entries."
+                soc_guidance=_soc_guidance(decision, (
+                    f"Host `{req.target_entity}` executed rare binary `{rare_bin}` sitting in the extreme asymptotic fleet tail (Zipf Score = {_fmt(zipf_result.get('zipf_rarity_score'), '.2f')}). "
+                    "Inspect persistence entries for the binary."
                     if zipf_result["is_outlier"] else
                     f"Process execution telemetry on `{req.target_entity}` conforms to common enterprise software distributions."
-                ),
+                )),
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
@@ -2255,13 +2490,13 @@ class AutonomousHunterEngine:
             return JITHuntResponse(
                 status="SUCCESS",
                 triage=TriageSummary(
-                    calibrated_risk_index=float(cri),
-                    verdict=verdict,
+                    calibrated_risk_index=decision.cri_value,
+                    verdict=decision.verdict,
                     is_outlier=zipf_result["is_outlier"],
                     primary_vector="zipfian_rare_tool_execution",
-                    top_z_score=float(zipf_result.get("top_z_score", 0.0)),
-                    recommended_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
-                    entities_to_quarantine=[req.target_entity] if zipf_result["is_outlier"] else [],
+                    top_z_score=_num_or_none(zipf_result.get("top_z_score")),
+                    recommended_action=decision.action,
+                    entities_to_quarantine=[req.target_entity] if decision.contain else [],
                     mitre_tactics=["TA0002"] if zipf_result["is_outlier"] else [],
                 ),
                 clean_hand_off=CleanHandOffPayload(
@@ -2272,7 +2507,7 @@ class AutonomousHunterEngine:
                     outlier_topology="ZIPFIAN_PROCESS_RARITY",
                     mitre_tactics_mapped=["TA0002"] if zipf_result["is_outlier"] else [],
                     recommended_swarm_playbook="RARE_ADMIN_TOOL_REMEDIATION",
-                    escalation_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
+                    escalation_action=decision.action,
                 ),
                 forensics=ForensicsSummary(
                     executed_query=zipf_result["executed_query"],
@@ -2293,15 +2528,15 @@ class AutonomousHunterEngine:
                 entity=req.target_entity,
                 lookback_days=req.lookback_days,
             )
-            cri = ewma_result["calibrated_risk_index"]
-            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            decision = decide(ewma_result.get("calibrated_risk_index"), "RATE_LIMIT_ENTITY")
             markdown_report = (
                 f"# EWMA Burst Velocity Analysis: {req.target_entity}\n\n"
-                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
-                f"**EWMA Velocity Score**: {ewma_result['ewma_velocity_score']}σ\n"
+                f"**Calibrated Risk Index (CRI)**: {harness_truth.format_cri(decision.cri)}/100 ({decision.verdict})\n"
+                f"**EWMA Velocity Score**: {_show(ewma_result.get('ewma_velocity_score'), 'σ')}\n"
                 f"**Is Outlier**: {ewma_result['is_outlier']}\n\n"
                 f"## Forensic Details\n"
-                f"- Evaluated intraday exponential smoothing divergence to capture acute kinetic rate surges.\n"
+                f"- Evaluated intraday exponential smoothing divergence to capture acute kinetic rate surges.\n\n"
+                f"{_report_footer(decision)}\n"
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
@@ -2319,13 +2554,13 @@ class AutonomousHunterEngine:
             return JITHuntResponse(
                 status="SUCCESS",
                 triage=TriageSummary(
-                    calibrated_risk_index=float(cri),
-                    verdict=verdict,
+                    calibrated_risk_index=decision.cri_value,
+                    verdict=decision.verdict,
                     is_outlier=ewma_result["is_outlier"],
                     primary_vector="ewma_kinetic_burst_velocity",
-                    top_z_score=float(ewma_result.get("top_z_score", 0.0)),
-                    recommended_action="RATE_LIMIT_ENTITY" if cri >= 80 else "MONITOR",
-                    entities_to_quarantine=[req.target_entity] if ewma_result["is_outlier"] else [],
+                    top_z_score=_num_or_none(ewma_result.get("top_z_score")),
+                    recommended_action=decision.action,
+                    entities_to_quarantine=[req.target_entity] if decision.contain else [],
                     mitre_tactics=["TA0010"] if ewma_result["is_outlier"] else [],
                 ),
                 clean_hand_off=CleanHandOffPayload(
@@ -2336,7 +2571,7 @@ class AutonomousHunterEngine:
                     outlier_topology="EWMA_BURST_VELOCITY",
                     mitre_tactics_mapped=["TA0010"] if ewma_result["is_outlier"] else [],
                     recommended_swarm_playbook="KINETIC_BURST_CONTAINMENT",
-                    escalation_action="RATE_LIMIT_ENTITY" if cri >= 80 else "MONITOR",
+                    escalation_action=decision.action,
                 ),
                 forensics=ForensicsSummary(
                     executed_query=ewma_result["executed_query"],
@@ -2349,70 +2584,6 @@ class AutonomousHunterEngine:
                 f"Deterministic EWMA fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
             )
 
-        # --- 10B. Deterministic Fast-Path: Impossible Travel Geodesic Velocity ---
-        elif "impossible_travel" in query_str or "geo_velocity" in query_str:
-          try:
-            geo_result = await StatsHunterEngine(tenant).run_impossible_travel_velocity(
-                session=session,
-                user_id=req.target_entity,
-                lookback_days=req.lookback_days,
-            )
-            cri = geo_result["calibrated_risk_index"]
-            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
-            markdown_report = (
-                f"# Impossible Travel Geodesic Velocity Analysis: {req.target_entity}\n\n"
-                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
-                f"**Max Velocity**: {geo_result['max_velocity_kmh']} km/h (Distance: {geo_result['max_distance_km']} km)\n"
-                f"**Is Outlier**: {geo_result['is_outlier']}\n\n"
-                f"## Forensic Details\n"
-                f"- Evaluated geodesic Haversine distance (`math.geo_distance`) and travel speed across consecutive login sessions.\n"
-            )
-            case_wall_updated = False
-            if req.case_id and req.post_to_case_wall:
-              await session.call_tool(
-                  "create_case_comment",
-                  {
-                      "projectId": tenant.project_id,
-                      "customerId": tenant.customer_id,
-                      "region": tenant.region,
-                      "caseId": str(req.case_id),
-                      "comment": self.sanitize_case_comment(markdown_report),
-                  },
-              )
-              case_wall_updated = True
-            return JITHuntResponse(
-                status="SUCCESS",
-                triage=TriageSummary(
-                    calibrated_risk_index=float(cri),
-                    verdict=verdict,
-                    is_outlier=geo_result["is_outlier"],
-                    primary_vector="impossible_travel_geo_velocity",
-                    top_z_score=float(geo_result.get("top_z_score", 0.0)),
-                    recommended_action="REVOKE_SESSIONS" if cri >= 80 else "MONITOR",
-                    entities_to_quarantine=[req.target_entity] if geo_result["is_outlier"] else [],
-                    mitre_tactics=["TA0001", "TA0006"] if geo_result["is_outlier"] else [],
-                ),
-                clean_hand_off=CleanHandOffPayload(
-                    target_entity=req.target_entity,
-                    entity_type=req.entity_type,
-                    evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                    primary_model="secops-statistical-hunter",
-                    outlier_topology="IMPOSSIBLE_TRAVEL_GEO_VELOCITY",
-                    mitre_tactics_mapped=["TA0001", "TA0006"] if geo_result["is_outlier"] else [],
-                    recommended_swarm_playbook="CREDENTIAL_COMPROMISE_CONTAINMENT",
-                    escalation_action="REVOKE_SESSIONS" if cri >= 80 else "MONITOR",
-                ),
-                forensics=ForensicsSummary(
-                    executed_query=geo_result["executed_query"],
-                    markdown_report=markdown_report,
-                ),
-                case_wall_updated=case_wall_updated,
-            )
-          except Exception as fast_path_err:
-            logger.warning(
-                f"Deterministic Impossible Travel fast-path bypassed due to error ({fast_path_err}); falling back to autonomous ReAct."
-            )
-
         # --- 10C. Deterministic Fast-Path: Producer-Consumer Byte Ratio Inversion ---
         elif "producer_consumer" in query_str or "ratio_inversion" in query_str:
           try:
@@ -2421,15 +2592,15 @@ class AutonomousHunterEngine:
                 hostname=req.target_entity,
                 lookback_days=req.lookback_days,
             )
-            cri = pc_result["calibrated_risk_index"]
-            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            decision = decide(pc_result.get("calibrated_risk_index"), "ISOLATE_HOST")
             markdown_report = (
                 f"# Producer-Consumer Byte Ratio Inversion Analysis: {req.target_entity}\n\n"
-                f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})\n"
-                f"**Producer Ratio**: {pc_result['producer_ratio']} (Z-Score: {pc_result['top_z_score']}σ)\n"
+                f"**Calibrated Risk Index (CRI)**: {harness_truth.format_cri(decision.cri)}/100 ({decision.verdict})\n"
+                f"**Producer Ratio**: {_show(pc_result.get('producer_ratio'))} (Z-Score: {_show(pc_result.get('top_z_score'), 'σ')})\n"
                 f"**Is Outlier**: {pc_result['is_outlier']}\n\n"
                 f"## Forensic Details\n"
-                f"- Evaluated directional byte asymmetry (`sent / (sent + recv)`) and outbound byte baseline departure.\n"
+                f"- Evaluated directional byte asymmetry (`sent / (sent + recv)`) and outbound byte baseline departure.\n\n"
+                f"{_report_footer(decision)}\n"
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
@@ -2447,13 +2618,13 @@ class AutonomousHunterEngine:
             return JITHuntResponse(
                 status="SUCCESS",
                 triage=TriageSummary(
-                    calibrated_risk_index=float(cri),
-                    verdict=verdict,
+                    calibrated_risk_index=decision.cri_value,
+                    verdict=decision.verdict,
                     is_outlier=pc_result["is_outlier"],
                     primary_vector="producer_consumer_ratio_inversion",
-                    top_z_score=float(pc_result.get("top_z_score", 0.0)),
-                    recommended_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
-                    entities_to_quarantine=[req.target_entity] if pc_result["is_outlier"] else [],
+                    top_z_score=_num_or_none(pc_result.get("top_z_score")),
+                    recommended_action=decision.action,
+                    entities_to_quarantine=[req.target_entity] if decision.contain else [],
                     mitre_tactics=["TA0009", "TA0010"] if pc_result["is_outlier"] else [],
                 ),
                 clean_hand_off=CleanHandOffPayload(
@@ -2464,7 +2635,7 @@ class AutonomousHunterEngine:
                     outlier_topology="PRODUCER_CONSUMER_RATIO_INVERSION",
                     mitre_tactics_mapped=["TA0009", "TA0010"] if pc_result["is_outlier"] else [],
                     recommended_swarm_playbook="DATA_STAGING_EXFIL_CONTAINMENT",
-                    escalation_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
+                    escalation_action=decision.action,
                 ),
                 forensics=ForensicsSummary(
                     executed_query=pc_result["executed_query"],
@@ -2492,12 +2663,11 @@ class AutonomousHunterEngine:
                 identifier_field=ident_f,
                 lookback_days=req.lookback_days,
             )
-            cri = fus_res["calibrated_risk_index"]
-            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            decision = decide(fus_res.get("calibrated_risk_index"), "QUARANTINE")
             fus_rows = [
                 {
                     "metric": "**Composite Fusion Score ($D$)**",
-                    "observed": f"`{fus_res['composite_threat_score']:.2f}σ`",
+                    "observed": f"`{_fmt(fus_res.get('composite_threat_score'), '.2f', 'σ')}`",
                     "threshold": "$\\ge 3.00\\sigma$",
                     "assessment": "⚠️ Multi-Sector Kill-Chain Convergence" if fus_res["is_outlier"] else "✅ Uncorrelated Sector Baseline",
                 },
@@ -2505,19 +2675,20 @@ class AutonomousHunterEngine:
                     "metric": "**Fused Telemetry Vectors**",
                     "observed": f"`{f_metrics[0]}` + `{f_metrics[1]}`",
                     "threshold": f"Template: `{fus_res.get('template_name', 'dual_sector_fusion_3stage.yl2')}`",
-                    "assessment": f"Z_A = {fus_res.get('sector_a_z', 0.0):+.2f}σ | Z_B = {fus_res.get('sector_b_z', 0.0):+.2f}σ",
+                    "assessment": f"Z_A = {_fmt(fus_res.get('sector_a_z'), '+.2f', 'σ')} | Z_B = {_fmt(fus_res.get('sector_b_z'), '+.2f', 'σ')}",
                 },
             ]
             markdown_report = CaseWallCardFormatter.format_card(
                 target_entity=req.target_entity,
                 entity_type=req.entity_type,
                 model_name=fus_res.get("model", "DUAL_SECTOR_FUSION_3STAGE"),
-                calibrated_risk_index=float(cri),
+                calibrated_risk_index=decision.cri_value,
                 is_outlier=fus_res["is_outlier"],
                 case_id=req.case_id,
-                rows_count=fus_res.get("stats_rows", 0),
+                rows_count=_rows(fus_res),
                 directive=req.directive,
                 metrics_table_rows=fus_rows,
+                soc_guidance=_soc_guidance(decision, route_note),
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
@@ -2535,24 +2706,24 @@ class AutonomousHunterEngine:
             return JITHuntResponse(
                 status="SUCCESS",
                 triage=TriageSummary(
-                    calibrated_risk_index=float(cri),
-                    verdict=verdict,
+                    calibrated_risk_index=decision.cri_value,
+                    verdict=decision.verdict,
                     is_outlier=fus_res["is_outlier"],
                     primary_vector="multi_sector_fusion_convergence",
-                    top_z_score=float(fus_res.get("top_z_score", 0.0)),
-                    recommended_action="QUARANTINE" if cri >= 80 else "MONITOR",
-                    entities_to_quarantine=[req.target_entity] if fus_res["is_outlier"] else [],
+                    top_z_score=_num_or_none(fus_res.get("top_z_score")),
+                    recommended_action=decision.action,
+                    entities_to_quarantine=[req.target_entity] if decision.contain else [],
                     mitre_tactics=["TA0001", "TA0010"] if fus_res["is_outlier"] else [],
                 ),
                 clean_hand_off=CleanHandOffPayload(
                     target_entity=req.target_entity,
                     entity_type=req.entity_type,
-                    evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    evaluated_window=_macro_evaluated_day(fus_res),
                     primary_model="secops-risk-metrics-multistage",
                     outlier_topology="MULTI_SECTOR_FUSION",
                     mitre_tactics_mapped=["TA0001", "TA0010"] if fus_res["is_outlier"] else [],
                     recommended_swarm_playbook="KILL_CHAIN_CONVERGENCE_CONTAINMENT",
-                    escalation_action="QUARANTINE" if cri >= 80 else "MONITOR",
+                    escalation_action=decision.action,
                 ),
                 forensics=ForensicsSummary(
                     executed_query=fus_res["executed_query"],
@@ -2581,18 +2752,17 @@ class AutonomousHunterEngine:
                 model=stat_model,
                 lookback_days=req.lookback_days,
             )
-            cri = dyn_res["calibrated_risk_index"]
-            verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+            decision = decide(dyn_res.get("calibrated_risk_index"), "INVESTIGATE")
             dyn_rows = [
                 {
                     "metric": f"**Metric Deviation (`{m_name}`)**",
-                    "observed": f"`{dyn_res['top_z_score']:+.2f}σ`",
+                    "observed": f"`{_fmt(dyn_res.get('top_z_score'), '+.2f', 'σ')}`",
                     "threshold": "$> 3.00\\sigma$",
                     "assessment": "⚠️ Situational Metric Outlier" if dyn_res["is_outlier"] else "✅ Within 30-Day Baseline",
                 },
                 {
                     "metric": "**Observed Metric Volume**",
-                    "observed": f"`{dyn_res.get('observed_value', 0.0):.1f}`",
+                    "observed": f"`{_fmt(dyn_res.get('observed_value'), '.1f')}`",
                     "threshold": f"Model: `{stat_model.upper()}`",
                     "assessment": "Pre-Computed Malachite Metric Evaluation",
                 },
@@ -2601,12 +2771,13 @@ class AutonomousHunterEngine:
                 target_entity=req.target_entity,
                 entity_type=req.entity_type,
                 model_name=dyn_res.get("model", "DYNAMIC_METRIC_BASELINE"),
-                calibrated_risk_index=float(cri),
+                calibrated_risk_index=decision.cri_value,
                 is_outlier=dyn_res["is_outlier"],
                 case_id=req.case_id,
-                rows_count=dyn_res.get("stats_rows", 0),
+                rows_count=_rows(dyn_res),
                 directive=req.directive,
                 metrics_table_rows=dyn_rows,
+                soc_guidance=_soc_guidance(decision, route_note),
             )
             case_wall_updated = False
             if req.case_id and req.post_to_case_wall:
@@ -2624,24 +2795,24 @@ class AutonomousHunterEngine:
             return JITHuntResponse(
                 status="SUCCESS",
                 triage=TriageSummary(
-                    calibrated_risk_index=float(cri),
-                    verdict=verdict,
+                    calibrated_risk_index=decision.cri_value,
+                    verdict=decision.verdict,
                     is_outlier=dyn_res["is_outlier"],
                     primary_vector=f"dynamic_metric_{m_name}",
-                    top_z_score=float(dyn_res.get("top_z_score", 0.0)),
-                    recommended_action="INVESTIGATE" if cri >= 60 else "MONITOR",
-                    entities_to_quarantine=[req.target_entity] if dyn_res["is_outlier"] else [],
+                    top_z_score=_num_or_none(dyn_res.get("top_z_score")),
+                    recommended_action=decision.action,
+                    entities_to_quarantine=[req.target_entity] if decision.contain else [],
                     mitre_tactics=["TA0009", "TA0010"] if dyn_res["is_outlier"] else [],
                 ),
                 clean_hand_off=CleanHandOffPayload(
                     target_entity=req.target_entity,
                     entity_type=req.entity_type,
-                    evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    evaluated_window=_macro_evaluated_day(dyn_res),
                     primary_model="secops-risk-metrics-multistage",
                     outlier_topology=f"DYNAMIC_METRIC_{m_name.upper()}",
                     mitre_tactics_mapped=["TA0009", "TA0010"] if dyn_res["is_outlier"] else [],
                     recommended_swarm_playbook="SITUATIONAL_METRIC_INVESTIGATION",
-                    escalation_action="INVESTIGATE" if cri >= 60 else "MONITOR",
+                    escalation_action=decision.action,
                 ),
                 forensics=ForensicsSummary(
                     executed_query=dyn_res["executed_query"],
@@ -2713,12 +2884,19 @@ class AutonomousHunterEngine:
         start_dt = end_dt - timedelta(days=req.lookback_days)
         start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         end_iso = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        mode_a_start, mode_a_end = harness_truth.mode_a_window()
+        ecg_start, ecg_end = harness_truth.ecg_window()
 
         prompt_lines = [
             f"EXECUTE AUTONOMOUS JIT THREAT INVESTIGATION:",
             f"- Target Entity: {req.target_entity} (Type: {req.entity_type})",
             f"- Investigation Horizon: {start_iso} to {end_iso}",
+            f"- Mode A Scored Day (30d metrics.* baselines): startTime={mode_a_start}, endTime={mode_a_end} (last complete UTC day)",
+            f"- Entity Graph Joins (Mode A): startTime={ecg_start}, endTime={ecg_end}; pin every event stage with "
+            f"`{harness_truth.event_day_pin()}`",
         ]
+        if retired_note:
+          prompt_lines.append(f"- Retired Model Requested: {retired_note}")
         if req.query:
           prompt_lines.append(f"- Playbook Investigative Directive: \"{req.query}\"")
         if req.case_id:
@@ -2744,6 +2922,7 @@ class AutonomousHunterEngine:
           )
         prompt_lines.extend([
             "6. Conclude your final response with a ```json_triage ... ``` block containing structured CRI and verdict, followed by the complete 6-pillar forensic report.",
+            f"7. {harness_truth.RECOMMENDATION_NOTE} Report containment only as a recommended action; never execute it.",
         ])
 
         initial_prompt = "\n".join(prompt_lines)
@@ -2831,11 +3010,21 @@ class AutonomousHunterEngine:
               )
 
             final_text = response.text or ""
+            # Build the harness-derived response first so an automatic Case Wall post carries the
+            # harness verdict, recommended action and recommendation-only note.
+            final_response = self._build_hunt_response(
+                final_text=final_text,
+                executed_query=executed_query,
+                radar_svg=radar_svg,
+                case_wall_updated=case_wall_updated,
+                req=req,
+                skill_name=skill_name,
+            )
             if req.case_id and req.post_to_case_wall and not case_wall_updated:
               logger.info(
                   f"ReAct agent did not explicitly call create_case_comment; automatically posting report to Case {req.case_id} wall."
               )
-              clean_comment = self.sanitize_case_comment(final_text)
+              clean_comment = self.sanitize_case_comment(final_response.forensics.markdown_report)
               await session.call_tool(
                   "create_case_comment",
                   {
@@ -2846,16 +3035,7 @@ class AutonomousHunterEngine:
                       "comment": clean_comment,
                   },
               )
-              case_wall_updated = True
-
-            final_response = self._build_hunt_response(
-                final_text=final_text,
-                executed_query=executed_query,
-                radar_svg=radar_svg,
-                case_wall_updated=case_wall_updated,
-                req=req,
-                skill_name=skill_name,
-            )
+              final_response.case_wall_updated = True
             react_success = True
             logger.info(f"Autonomous ReAct hunt completed successfully with model: {model_candidate}")
             break
@@ -2887,21 +3067,21 @@ class AutonomousHunterEngine:
               req.target_entity,
               radar_result["sector_z_scores"],
           )
-          cri = radar_result["calibrated_risk_index"]
-          verdict = radar_result["verdict"]
+          decision = decide(radar_result.get("calibrated_risk_index"), GENERIC_CONTAINMENT_ACTION)
           top_sector = radar_result["top_sector"]
 
           report_lines = [
               f"# 360° Decoupled Behavioral Risk Radar (Deterministic Fallback): {req.target_entity}",
               "> [!WARNING] Gemini LLM quota was temporarily exhausted; automatically triaged via 30-day precomputed metrics.",
-              f"**Calibrated Risk Index (CRI)**: {cri}/100 ({verdict})",
-              f"**Top Risk Sector**: {top_sector} (Composite Distance D: {radar_result['composite_d']})",
+              f"**Calibrated Risk Index (CRI)**: {harness_truth.format_cri(decision.cri)}/100 ({decision.verdict})",
+              f"**Top Risk Sector**: {top_sector} (Composite Distance D: {_show(radar_result.get('composite_d'))})",
               "",
               "## Forensic Sector Analysis",
           ]
           for s_name, z_val in radar_result["sector_z_scores"].items():
             obs = radar_result["sector_observed_counts"].get(s_name, 0)
-            report_lines.append(f"- **{s_name}**: Z-score = {z_val:+.2f} (Observed: {obs})")
+            report_lines.append(f"- **{s_name}**: Z-score = {_fmt(z_val, '+.2f')} (Observed: {_show(obs)})")
+          report_lines.extend(["", _report_footer(decision)])
 
           markdown_report = "\n".join(report_lines)
           case_wall_updated = False
@@ -2921,25 +3101,25 @@ class AutonomousHunterEngine:
           return JITHuntResponse(
               status="SUCCESS",
               triage=TriageSummary(
-                  calibrated_risk_index=float(cri),
-                  verdict=verdict,
+                  calibrated_risk_index=decision.cri_value,
+                  verdict=decision.verdict,
                   is_outlier=radar_result["is_outlier"],
                   primary_vector=f"{top_sector}_behavioral_drift",
-                  top_z_score=float(radar_result["sector_z_scores"].get(top_sector, 0.0)),
-                  radar_dimensions=radar_result["sector_z_scores"],
-                  recommended_action="QUARANTINE" if cri >= 80 else ("INVESTIGATE" if cri >= 60 else "MONITOR"),
-                  entities_to_quarantine=[req.target_entity] if radar_result["is_outlier"] else [],
+                  top_z_score=_num_or_none(radar_result["sector_z_scores"].get(top_sector)),
+                  radar_dimensions=_finite_dims(radar_result["sector_z_scores"]),
+                  recommended_action=decision.action,
+                  entities_to_quarantine=[req.target_entity] if decision.contain else [],
                   mitre_tactics=["TA0001", "TA0006"] if radar_result["is_outlier"] else [],
               ),
               clean_hand_off=CleanHandOffPayload(
                   target_entity=req.target_entity,
                   entity_type=req.entity_type,
-                  evaluated_window=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                  evaluated_window=_macro_evaluated_day(radar_result),
                   primary_model="secops-risk-metrics-multistage",
                   outlier_topology=f"{top_sector.upper()}_DRIFT",
                   mitre_tactics_mapped=["TA0001", "TA0006"] if radar_result["is_outlier"] else [],
                   recommended_swarm_playbook="DECOUPLED_RADAR_INVESTIGATION",
-                  escalation_action="QUARANTINE" if cri >= 80 else ("INVESTIGATE" if cri >= 60 else "MONITOR"),
+                  escalation_action=decision.action,
               ),
               forensics=ForensicsSummary(
                   executed_query="360° Decoupled Sector Micro-Queries (Auth, Cloud, Workspace, Egress, DNS)",
@@ -2954,12 +3134,12 @@ class AutonomousHunterEngine:
               src_ip=req.target_entity,
               lookback_days=req.lookback_days,
           )
-          cri = jitter_result["calibrated_risk_index"]
-          verdict = "CRITICAL_OUTLIER" if cri >= 80 else ("HIGH_OUTLIER" if cri >= 60 else "NOMINAL_BASELINE")
+          decision = decide(jitter_result.get("calibrated_risk_index"), "ISOLATE_HOST")
           markdown_report = (
               f"# C2 Beaconing Jitter Analysis (Deterministic Fallback): {req.target_entity}\n\n"
               f"> [!WARNING] Gemini LLM quota was temporarily exhausted; automatically triaged via statistical hunting.\n"
-              f"**CRI**: {cri}/100\n**Is Outlier**: {jitter_result['is_outlier']}"
+              f"**CRI**: {harness_truth.format_cri(decision.cri)}/100\n**Is Outlier**: {jitter_result['is_outlier']}\n\n"
+              f"{_report_footer(decision)}"
           )
           case_wall_updated = False
           if req.case_id and req.post_to_case_wall:
@@ -2977,13 +3157,13 @@ class AutonomousHunterEngine:
           return JITHuntResponse(
               status="SUCCESS",
               triage=TriageSummary(
-                  calibrated_risk_index=float(cri),
-                  verdict=verdict,
+                  calibrated_risk_index=decision.cri_value,
+                  verdict=decision.verdict,
                   is_outlier=jitter_result["is_outlier"],
                   primary_vector="c2_timing_regularity",
-                  top_z_score=float(jitter_result.get("top_z_score", 0.0)),
-                  recommended_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
-                  entities_to_quarantine=[req.target_entity] if jitter_result["is_outlier"] else [],
+                  top_z_score=_num_or_none(jitter_result.get("top_z_score")),
+                  recommended_action=decision.action,
+                  entities_to_quarantine=[req.target_entity] if decision.contain else [],
                   mitre_tactics=["TA0011"] if jitter_result["is_outlier"] else [],
               ),
               clean_hand_off=CleanHandOffPayload(
@@ -2994,7 +3174,7 @@ class AutonomousHunterEngine:
                   outlier_topology="C2_REGULARITY",
                   mitre_tactics_mapped=["TA0011"] if jitter_result["is_outlier"] else [],
                   recommended_swarm_playbook="C2_CONTAINMENT",
-                  escalation_action="ISOLATE_HOST" if cri >= 80 else "MONITOR",
+                  escalation_action=decision.action,
               ),
               forensics=ForensicsSummary(
                   executed_query=jitter_result["executed_query"],
@@ -3012,7 +3192,13 @@ class AutonomousHunterEngine:
       req: JITHuntRequest,
       skill_name: str,
   ) -> JITHuntResponse:
-    """Extracts structured triage JSON and packages final response."""
+    """Extracts structured triage JSON and packages final response.
+
+    The CRI is taken from the json_triage block (missing or invalid CRI is NOT_EVALUATED and never
+    escalates); the verdict and recommended action come from the harness bands, never from the
+    LLM's own verdict string. The LLM's action is kept only as the domain containment action that
+    the harness recommends at the Critical band.
+    """
     final_text = DynamicProtocolAdapter.sanitize_bq_backend_references(final_text)
     # Attempt to extract json_triage code block
     triage_data = {}
@@ -3022,37 +3208,40 @@ class AutonomousHunterEngine:
         triage_data = json.loads(json_match.group(1))
       except Exception:
         pass
+    if not isinstance(triage_data, dict):
+      triage_data = {}
 
-    cri = float(triage_data.get("calibrated_risk_index", 0.0))
+    cri = harness_truth.coerce_cri(triage_data.get("calibrated_risk_index"))
     if not cri and "cri" in triage_data:
-      cri = float(triage_data["cri"])
+      alt_cri = harness_truth.coerce_cri(triage_data.get("cri"))
+      if alt_cri is not None:
+        cri = alt_cri
 
-    verdict = triage_data.get("verdict", "NOMINAL_BASELINE")
-    if cri >= 80:
-      verdict = "CRITICAL_OUTLIER"
-    elif cri >= 60:
-      verdict = "HIGH_OUTLIER"
-    elif cri >= 46:
-      verdict = "MEDIUM_OUTLIER"
+    llm_action = str(triage_data.get("recommended_action") or "").strip().upper()
+    containment = llm_action if llm_action and llm_action not in _HARNESS_RESPONSE_KINDS else GENERIC_CONTAINMENT_ACTION
+    decision = decide(cri, containment)
 
-    is_outlier = cri >= 46
-    top_z = float(triage_data.get("top_z_score", 0.0))
+    is_outlier = _alertable(decision.cri)
+    top_z = _finite_float(triage_data.get("top_z_score"))
     primary_vector = triage_data.get("primary_vector", "multi_sector")
     radar_dims = triage_data.get("radar_dimensions", {})
-    recommended_action = triage_data.get("recommended_action", "MONITOR")
-    entities_to_quarantine = triage_data.get("entities_to_quarantine", [])
-    if not entities_to_quarantine and is_outlier:
-      entities_to_quarantine = [req.target_entity]
+    entities_to_quarantine = triage_data.get("entities_to_quarantine") or []
+    if not isinstance(entities_to_quarantine, list):
+      entities_to_quarantine = []
+    if decision.contain:
+      entities_to_quarantine = entities_to_quarantine or [req.target_entity]
+    else:
+      entities_to_quarantine = []
     mitre_tactics = triage_data.get("mitre_tactics", [])
 
     triage_summary = TriageSummary(
-        calibrated_risk_index=cri,
-        verdict=verdict,
+        calibrated_risk_index=decision.cri_value,
+        verdict=decision.verdict,
         is_outlier=is_outlier,
         primary_vector=primary_vector,
         top_z_score=top_z,
         radar_dimensions=radar_dims,
-        recommended_action=recommended_action,
+        recommended_action=decision.action,
         entities_to_quarantine=entities_to_quarantine,
         mitre_tactics=mitre_tactics,
     )
@@ -3065,12 +3254,12 @@ class AutonomousHunterEngine:
         outlier_topology=primary_vector.upper(),
         mitre_tactics_mapped=mitre_tactics,
         recommended_swarm_playbook=triage_data.get("swarm_playbook", "DEFAULT_INVESTIGATION"),
-        escalation_action=recommended_action,
+        escalation_action=decision.action,
     )
 
     forensics = ForensicsSummary(
         executed_query=executed_query,
-        markdown_report=final_text,
+        markdown_report=f"{final_text.rstrip()}\n\n---\n\n{_report_footer(decision)}",
         radar_svg=radar_svg,
     )
 

@@ -6,6 +6,10 @@
 Exposes the autonomous JIT Threat Hunting Engine over two concurrent protocols:
 1. REST Webhook (/api/v1/hunt/jit) for SecOps SOAR Playbooks using HTTP actions.
 2. Model Context Protocol (/mcp via SSE / Streamable HTTP) for Agent-to-Agent invocations.
+
+Score thresholds, verdicts / recommended actions and retired models come from
+src/harness_truth.py. A retired model never runs: its tool (or request) returns the
+skill's retirement message and the replacement tool that message points to.
 """
 
 import src._bootstrap
@@ -15,15 +19,16 @@ from datetime import datetime, timezone
 import json
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from src import harness_truth
 from src.autonomous_hunter import AutonomousHunterEngine
 from src.config import TenantConfig, get_skills_root
-from src.models import JITHuntRequest, JITHuntResponse
+from src.models import ForensicsSummary, JITHuntRequest, JITHuntResponse, TriageSummary
 from src.watchdog import WatchdogDaemon
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -39,6 +44,103 @@ mcp = FastMCP(
     name="SecOps-Agentic-UEBA-Hunter",
     instructions="Autonomous JIT Threat Hunter embedding SecOps Risk Metrics and Statistical Hunter skills."
 )
+
+RETIRED_MODEL_STATUS = "RETIRED_MODEL"
+
+# Active models a skill retirement message can hand off to, with the MCP tool that runs each one here.
+_REPLACEMENT_TOOLS: Dict[str, str] = {
+    "HOUR_OF_DAY_PROFILE": "hunt_hour_of_day_profile",
+}
+
+
+# --- 0. Harness helpers ---
+
+def _score_threshold(score_key: str) -> float:
+  """Alert threshold of a model's native score, from the harness score-semantics registry."""
+  return harness_truth.constants().get_score_semantics(score_key).threshold
+
+
+def _first_retirement(*names: Optional[str]) -> Optional[str]:
+  """The skill's retirement message for the first retired model / template name, else None."""
+  for name in names:
+    message = harness_truth.retirement_message(name) if name else None
+    if message:
+      return message
+  return None
+
+
+def _replacement(message: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+  """(model, MCP tool) of the first active replacement that a retirement message names and this server runs."""
+  if not message:
+    return None, None
+  named = sorted(
+      (message.find(model), model)
+      for model in _REPLACEMENT_TOOLS
+      if model in message and not harness_truth.is_retired(model)
+  )
+  if not named:
+    return None, None
+  model = named[0][1]
+  return model, _REPLACEMENT_TOOLS[model]
+
+
+def _tool_description(model_name: str, active_description: str) -> str:
+  """MCP tool description; a retired model's tool states the skill's retirement message instead."""
+  message = harness_truth.retirement_message(model_name)
+  if message:
+    return f"RETIRED — returns this message without running a hunt: {message}"
+  return active_description
+
+
+def _retired_tool_description(model_name: str) -> str:
+  """Description of a retired model's tool: the refusal, the skill's message and the replacement tool."""
+  message = harness_truth.retirement_message(model_name) or f"{model_name} is not provided by agentic_ueba."
+  model, tool = _replacement(message)
+  pointer = f" Replacement tool: `{tool}` ({model})." if tool else ""
+  return f"RETIRED — returns this message without running a hunt: {message}{pointer}"
+
+
+def _not_evaluated_response(message: str, status: str) -> Dict[str, Any]:
+  """JITHuntResponse payload for a hunt that never ran: CRI N/A and the harness N/A verdict / action."""
+  triage = TriageSummary(
+      calibrated_risk_index=None,
+      verdict=harness_truth.verdict_for(None),
+      is_outlier=False,
+      primary_vector="NONE",
+      top_z_score=None,
+      recommended_action=harness_truth.recommended_action(None),
+  )
+  return JITHuntResponse(
+      status=status,
+      triage=triage,
+      forensics=ForensicsSummary(executed_query="", markdown_report=message),
+      error_message=message,
+  ).model_dump()
+
+
+def _retired_response(message: str) -> Dict[str, Any]:
+  """Not-evaluated payload for a retired model, naming the replacement model and tool when this server has one."""
+  payload = _not_evaluated_response(message, RETIRED_MODEL_STATUS)
+  payload["replacement_model"], payload["replacement_tool"] = _replacement(message)
+  return payload
+
+
+def _retired_tool_response(model_name: str) -> Dict[str, Any]:
+  """A retired model's tool: agentic_ueba has no execution path for the model, so nothing ever runs."""
+  message = harness_truth.retirement_message(model_name) or (
+      f"{model_name} is not provided by agentic_ueba; no hunt was run.")
+  logger.warning(f"Refusing retired model tool {model_name}: {message}")
+  return _retired_response(message)
+
+
+async def _run_model_hunt(model_name: Optional[str], req: JITHuntRequest) -> Dict[str, Any]:
+  """Runs a model-specific hunt unless the harness has retired the model (or its query alias)."""
+  retired = _first_retirement(model_name, req.query)
+  if retired:
+    logger.warning(f"Refusing retired model {model_name or req.query!r}: {retired}")
+    return _retired_response(retired)
+  resp = await engine.execute_jit_hunt(req)
+  return resp.model_dump()
 
 
 # --- 1. MCP Tools (Agent-to-Agent Communication) ---
@@ -98,12 +200,12 @@ async def profile_360_risk(
     customer_id: Optional[str] = None,
     region: Optional[str] = None,
 ) -> Dict[str, Any]:
-  """Executes a decoupled 360-degree behavioral risk radar profile across all 5 canonical sectors."""
+  """Executes a decoupled 360-degree behavioral risk radar profile across every canonical radar sector (templates/radar_360/)."""
   req = JITHuntRequest(
       target_entity=username,
       entity_type="USER",
       alert_name="360° Behavioral Risk Profiling",
-      alert_description="Decoupled multi-sector behavioral health check across Auth, Cloud, Workspace, Egress, and DNS.",
+      alert_description="Decoupled multi-sector behavioral health check across every canonical 360° radar sector query in templates/radar_360/.",
       case_id=case_id,
       skill="risk-metrics",
       lookback_days=lookback_days,
@@ -119,14 +221,14 @@ async def profile_360_risk(
 @mcp.tool()
 async def run_fleet_360_sweep(
     entity_types: str = "USER,ASSET",
-    spike_threshold_z: float = 3.0,
-    spoke_inclusion_z: float = 2.0,
-    min_observed: int = 5,
-    max_outliers_per_sector: int = 250,
+    spike_threshold_z: Optional[float] = None,
+    spoke_inclusion_z: Optional[float] = None,
+    min_observed: Optional[int] = None,
+    max_outliers_per_sector: Optional[int] = None,
     ingest_events: bool = True,
     lookback_days: int = 1,
 ) -> Dict[str, Any]:
-  """Executes a deterministic Mode A fleetwide 360° behavioral risk radar sweep across all entities and emits one BEHAVIORAL_RISK_RADAR_360 UDM event for each entity with a vector spike >= spike_threshold_z."""
+  """Executes a deterministic Mode A fleetwide 360° behavioral risk radar sweep across all entities and emits one BEHAVIORAL_RISK_RADAR_360 UDM event for each entity with a sector spike at or above spike_threshold_z. Omitted gates and caps use the tenant configuration, whose score gates default to the harness sensitivity tiers."""
   types_list = [t.strip().upper() for t in entity_types.split(",") if t.strip()]
   return await watchdog.run_fleet_360_sweep_once(
       entity_types=types_list or ["USER", "ASSET"],
@@ -146,47 +248,57 @@ async def scan_open_cases(limit: int = 5) -> Dict[str, Any]:
   return {"status": "SUCCESS", "cases_triaged": len(results), "results": results}
 
 
-@mcp.tool()
+@mcp.tool(description=_tool_description(
+    "C2_BEACONING_JITTER",
+    "Statistical Hunter: Detects robotic C2 beaconing timing regularity via the inter-arrival Coefficient "
+    f"of Variation (CV <= {_score_threshold('cv')} by default, from the harness score semantics).",
+))
 async def hunt_c2_jitter(
     src_ip: str,
-    min_conns: int = 25,
-    cv_threshold: float = 0.20,
+    min_conns: Optional[int] = None,
+    cv_threshold: Optional[float] = None,
     case_id: Optional[str] = None,
     post_to_case_wall: bool = True,
 ) -> Dict[str, Any]:
-  """Statistical Hunter: Detects robotic C2 beaconing timing regularity via Coefficient of Variation (CV <= 0.20)."""
+  """C2_BEACONING_JITTER hunt; an omitted CV gate is the harness default, omitted min_conns the skill's tier."""
+  cv = _score_threshold("cv") if cv_threshold is None else cv_threshold
+  directive = f"Hunt for C2 beaconing with CV <= {cv}"
+  if min_conns is not None:
+    directive += f" and min connections >= {min_conns}"
   req = JITHuntRequest(
       target_entity=src_ip,
       entity_type="IP",
       alert_name="C2 Beaconing Jitter Investigation",
-      query=f"Hunt for C2 beaconing with CV <= {cv_threshold} and min connections >= {min_conns}",
+      query=directive,
       skill="stats-hunter",
       case_id=case_id,
       post_to_case_wall=post_to_case_wall,
   )
-  resp = await engine.execute_jit_hunt(req)
-  return resp.model_dump()
+  return await _run_model_hunt("C2_BEACONING_JITTER", req)
 
 
-@mcp.tool()
+@mcp.tool(description=_tool_description(
+    "POISSON_BURST_CLUSTERING",
+    "Statistical Hunter: Detects credential spray burst waves via zero-inclusive Poisson Fano Factor "
+    f"dispersion (F >= {_score_threshold('fano_factor')}, from the harness score semantics).",
+))
 async def hunt_poisson_burst(
     entity: str,
     event_type: str = "USER_LOGIN",
     case_id: Optional[str] = None,
     post_to_case_wall: bool = True,
 ) -> Dict[str, Any]:
-  """Statistical Hunter: Detects credential spray burst waves via Poisson Fano Factor dispersion (F > 4.0)."""
+  """POISSON_BURST_CLUSTERING hunt gated at the harness Fano factor threshold."""
   req = JITHuntRequest(
       target_entity=entity,
       entity_type="USER",
       alert_name="Poisson Burst Spray Investigation",
-      query=f"Hunt for Poisson burst clustering over {event_type} with Fano factor > 4.0",
+      query=f"Hunt for Poisson burst clustering over {event_type} with Fano factor >= {_score_threshold('fano_factor')}",
       skill="stats-hunter",
       case_id=case_id,
       post_to_case_wall=post_to_case_wall,
   )
-  resp = await engine.execute_jit_hunt(req)
-  return resp.model_dump()
+  return await _run_model_hunt("POISSON_BURST_CLUSTERING", req)
 
 
 @mcp.tool()
@@ -205,8 +317,7 @@ async def hunt_cloud_crud(
       case_id=case_id,
       post_to_case_wall=post_to_case_wall,
   )
-  resp = await engine.execute_jit_hunt(req)
-  return resp.model_dump()
+  return await _run_model_hunt(None, req)
 
 
 @mcp.tool()
@@ -226,62 +337,84 @@ async def hunt_hybrid_enrichment(
       case_id=case_id,
       post_to_case_wall=post_to_case_wall,
   )
-  resp = await engine.execute_jit_hunt(req)
-  return resp.model_dump()
+  return await _run_model_hunt(None, req)
 
 
-@mcp.tool()
+@mcp.tool(description=_tool_description(
+    "HOUR_OF_DAY_PROFILE",
+    "Statistical Hunter: Learned 24-bin hour-of-day profile (HOUR_OF_DAY_PROFILE) scores each hour of an "
+    "entity's login activity out-of-sample against its own per-hour baseline "
+    f"(hod_z_score >= {_score_threshold('hod_z_score')}, from the harness score semantics). The skills name it "
+    "as the replacement for the retired off-hours and geo-velocity models.",
+))
+async def hunt_hour_of_day_profile(
+    username: str,
+    case_id: Optional[str] = None,
+    lookback_days: int = 14,
+    post_to_case_wall: bool = True,
+) -> Dict[str, Any]:
+  """HOUR_OF_DAY_PROFILE hunt (secops-statistical-hunter); lookback_days is capped at the micro-plane window."""
+  req = JITHuntRequest(
+      target_entity=username,
+      entity_type="USER",
+      alert_name="Hour-of-Day Profile Investigation (HOUR_OF_DAY_PROFILE)",
+      query="hour_of_day_profile",
+      skill="stats-hunter",
+      lookback_days=lookback_days,
+      case_id=case_id,
+      post_to_case_wall=post_to_case_wall,
+  )
+  return await _run_model_hunt("HOUR_OF_DAY_PROFILE", req)
+
+
+@mcp.tool(description=_retired_tool_description("CIRCADIAN_VON_MISES"))
 async def hunt_circadian_von_mises(
     username: str,
     case_id: Optional[str] = None,
     lookback_days: int = 14,
     post_to_case_wall: bool = True,
 ) -> Dict[str, Any]:
-  """Risk Metrics: Evaluates off-hours temporal departures using 24-hour circular von Mises clock."""
-  req = JITHuntRequest(
-      target_entity=username,
-      entity_type="USER",
-      alert_name="Circadian von Mises Temporal Anomaly",
-      query="circadian_von_mises",
-      skill="risk-metrics",
-      lookback_days=lookback_days,
-      case_id=case_id,
-      post_to_case_wall=post_to_case_wall,
-  )
-  resp = await engine.execute_jit_hunt(req)
-  return resp.model_dump()
+  """Retired model tool: returns the skill's retirement message and replacement; never runs a hunt."""
+  del username, case_id, lookback_days, post_to_case_wall
+  return _retired_tool_response("CIRCADIAN_VON_MISES")
 
 
-@mcp.tool()
+@mcp.tool(description=_tool_description(
+    "MACD_MOMENTUM_VELOCITY",
+    "Risk Metrics: Above-Historical-Max Z (MACD_MOMENTUM_VELOCITY) flags days whose volume breaks out "
+    "above both the 30-day mean and the 30-day historical maximum (linear peak exceedance).",
+))
 async def hunt_macd_momentum(
     entity: str,
     case_id: Optional[str] = None,
     lookback_days: int = 14,
     post_to_case_wall: bool = True,
 ) -> Dict[str, Any]:
-  """Risk Metrics: Detects instantaneous momentum acceleration diverging from 30-day anchor."""
+  """Above-Historical-Max Z hunt (formerly MACD Momentum Velocity)."""
   req = JITHuntRequest(
       target_entity=entity,
       entity_type="USER",
-      alert_name="MACD Momentum Velocity Divergence",
+      alert_name="Above-Historical-Max Z Investigation (MACD_MOMENTUM_VELOCITY)",
       query="macd_momentum",
       skill="risk-metrics",
       lookback_days=lookback_days,
       case_id=case_id,
       post_to_case_wall=post_to_case_wall,
   )
-  resp = await engine.execute_jit_hunt(req)
-  return resp.model_dump()
+  return await _run_model_hunt("MACD_MOMENTUM_VELOCITY", req)
 
 
-@mcp.tool()
+@mcp.tool(description=_tool_description(
+    "SHANNON_ENTROPY_CHARACTER",
+    "Statistical Hunter: Detects obfuscated command lines or DGA payloads via Shannon Character Entropy.",
+))
 async def hunt_shannon_entropy(
     entity: str,
     case_id: Optional[str] = None,
     lookback_days: int = 7,
     post_to_case_wall: bool = True,
 ) -> Dict[str, Any]:
-  """Statistical Hunter: Detects obfuscated command lines or DGA payloads via Shannon Character Entropy."""
+  """SHANNON_ENTROPY_CHARACTER hunt."""
   req = JITHuntRequest(
       target_entity=entity,
       entity_type="HOST",
@@ -292,18 +425,20 @@ async def hunt_shannon_entropy(
       case_id=case_id,
       post_to_case_wall=post_to_case_wall,
   )
-  resp = await engine.execute_jit_hunt(req)
-  return resp.model_dump()
+  return await _run_model_hunt("SHANNON_ENTROPY_CHARACTER", req)
 
 
-@mcp.tool()
+@mcp.tool(description=_tool_description(
+    "MARKOV_2GRAM_TRANSITION_RARITY",
+    "Statistical Hunter: Detects rare Living-off-the-Land process transitions via Markov 2-Gram Surprisal.",
+))
 async def hunt_markov_transition(
     host: str,
     case_id: Optional[str] = None,
     lookback_days: int = 7,
     post_to_case_wall: bool = True,
 ) -> Dict[str, Any]:
-  """Statistical Hunter: Detects rare Living-off-the-Land process transitions via Markov 2-Gram Surprisal."""
+  """MARKOV_2GRAM_TRANSITION_RARITY hunt."""
   req = JITHuntRequest(
       target_entity=host,
       entity_type="HOST",
@@ -314,18 +449,20 @@ async def hunt_markov_transition(
       case_id=case_id,
       post_to_case_wall=post_to_case_wall,
   )
-  resp = await engine.execute_jit_hunt(req)
-  return resp.model_dump()
+  return await _run_model_hunt("MARKOV_2GRAM_TRANSITION_RARITY", req)
 
 
-@mcp.tool()
+@mcp.tool(description=_tool_description(
+    "ZIPFIAN_PROCESS_RARITY",
+    "Statistical Hunter: Detects rare administrative tools in the enterprise Zipfian power-law long tail.",
+))
 async def hunt_zipfian_rarity(
     host: str,
     case_id: Optional[str] = None,
     lookback_days: int = 7,
     post_to_case_wall: bool = True,
 ) -> Dict[str, Any]:
-  """Statistical Hunter: Detects rare administrative tools in the enterprise Zipfian power-law long tail."""
+  """ZIPFIAN_PROCESS_RARITY hunt."""
   req = JITHuntRequest(
       target_entity=host,
       entity_type="HOST",
@@ -336,18 +473,20 @@ async def hunt_zipfian_rarity(
       case_id=case_id,
       post_to_case_wall=post_to_case_wall,
   )
-  resp = await engine.execute_jit_hunt(req)
-  return resp.model_dump()
+  return await _run_model_hunt("ZIPFIAN_PROCESS_RARITY", req)
 
 
-@mcp.tool()
+@mcp.tool(description=_tool_description(
+    "EWMA_BURST_VELOCITY",
+    "Statistical Hunter: Detects acute intraday kinetic rate surges via EWMA Velocity Divergence.",
+))
 async def hunt_ewma_burst(
     entity: str,
     case_id: Optional[str] = None,
     lookback_days: int = 7,
     post_to_case_wall: bool = True,
 ) -> Dict[str, Any]:
-  """Statistical Hunter: Detects acute intraday kinetic rate surges via EWMA Velocity Divergence."""
+  """EWMA_BURST_VELOCITY hunt."""
   req = JITHuntRequest(
       target_entity=entity,
       entity_type="IP",
@@ -358,40 +497,34 @@ async def hunt_ewma_burst(
       case_id=case_id,
       post_to_case_wall=post_to_case_wall,
   )
-  resp = await engine.execute_jit_hunt(req)
-  return resp.model_dump()
+  return await _run_model_hunt("EWMA_BURST_VELOCITY", req)
 
 
-@mcp.tool()
+@mcp.tool(description=_retired_tool_description("IMPOSSIBLE_TRAVEL_GEO_VELOCITY"))
 async def hunt_impossible_travel(
     username: str,
     case_id: Optional[str] = None,
     lookback_days: int = 14,
     post_to_case_wall: bool = True,
 ) -> Dict[str, Any]:
-  """Statistical Hunter (v2.8.0): Detects supersonic geodesic travel velocity (math.geo_distance >= 900 km/h) across consecutive logins."""
-  req = JITHuntRequest(
-      target_entity=username,
-      entity_type="USER",
-      alert_name="Impossible Travel Geodesic Velocity Investigation",
-      query="impossible_travel",
-      skill="stats-hunter",
-      lookback_days=lookback_days,
-      case_id=case_id,
-      post_to_case_wall=post_to_case_wall,
-  )
-  resp = await engine.execute_jit_hunt(req)
-  return resp.model_dump()
+  """Retired model tool: returns the skill's retirement message and replacement; never runs a hunt."""
+  del username, case_id, lookback_days, post_to_case_wall
+  return _retired_tool_response("IMPOSSIBLE_TRAVEL_GEO_VELOCITY")
 
 
-@mcp.tool()
+@mcp.tool(description=_tool_description(
+    "PRODUCER_CONSUMER_RATIO_INVERSION",
+    "Statistical Hunter: Detects endpoints shifting from net data consumers to net data producers "
+    f"(producer ratio sent/(sent+received) >= {_score_threshold('producer_ratio')}, from the harness "
+    "score semantics, with a ratio-inversion Z-score spike).",
+))
 async def hunt_producer_consumer_inversion(
     host: str,
     case_id: Optional[str] = None,
     lookback_days: int = 14,
     post_to_case_wall: bool = True,
 ) -> Dict[str, Any]:
-  """Statistical Hunter (v2.8.0): Detects endpoints shifting from net data consumers to net data producers (sent/total bytes >= 0.80 + Z-score spike)."""
+  """PRODUCER_CONSUMER_RATIO_INVERSION hunt."""
   req = JITHuntRequest(
       target_entity=host,
       entity_type="HOST",
@@ -402,11 +535,15 @@ async def hunt_producer_consumer_inversion(
       case_id=case_id,
       post_to_case_wall=post_to_case_wall,
   )
-  resp = await engine.execute_jit_hunt(req)
-  return resp.model_dump()
+  return await _run_model_hunt("PRODUCER_CONSUMER_RATIO_INVERSION", req)
 
 
-@mcp.tool()
+@mcp.tool(description=_tool_description(
+    "QUANTILE_IQR_SKEW",
+    "Risk Metrics (v2.2.0) / Statistical Hunter (v2.9.0): Evaluates 1-Stage Empirical Quantiles "
+    "(window.percentile), Bowley Quartile Skewness, Moors Tail-Heaviness, and Hubert-Vandervieren "
+    "Skewness-Adjusted Tukey Fences.",
+))
 async def hunt_quantile_tukey_fences(
     entity: str,
     entity_type: str = "ASSET",
@@ -415,7 +552,7 @@ async def hunt_quantile_tukey_fences(
     lookback_days: int = 30,
     post_to_case_wall: bool = True,
 ) -> Dict[str, Any]:
-  """Risk Metrics (v2.2.0) / Statistical Hunter (v2.9.0): Evaluates 1-Stage Empirical Quantiles (window.percentile), Bowley Quartile Skewness, Moors Tail-Heaviness, and Hubert-Vandervieren Skewness-Adjusted Tukey Fences."""
+  """QUANTILE_IQR_SKEW hunt."""
   from src.models import StrategyDirective
 
   directive = StrategyDirective(
@@ -435,8 +572,7 @@ async def hunt_quantile_tukey_fences(
       post_to_case_wall=post_to_case_wall,
       directive=directive,
   )
-  resp = await engine.execute_jit_hunt(req)
-  return resp.model_dump()
+  return await _run_model_hunt("QUANTILE_IQR_SKEW", req)
 
 
 @mcp.tool()
@@ -458,7 +594,15 @@ async def compile_hunt_pipeline(
     window_days: int = 1,
     sensitivity: str = "BALANCED",
 ) -> Dict[str, Any]:
-  """Python Hybrid Engine (v2.0.0): Compiles an AST-validated multi-stage YARA-L 2.0 hunt pipeline, Pre-Flight specification card, and 1-shot probe query."""
+  """Python Hybrid Engine (v2.0.0): Compiles an AST-validated multi-stage YARA-L 2.0 hunt pipeline, Pre-Flight specification card, and 1-shot probe query. Retired models or architectures return the skill's retirement message."""
+  retired = _first_retirement(statistical_model, architecture)
+  if retired:
+    return {
+        "status": RETIRED_MODEL_STATUS,
+        "error_message": retired,
+        "statistical_model": statistical_model,
+        "architecture": architecture,
+    }
   from src.pipeline_runner import PipelineRunner
   he = PipelineRunner(tenant_config).get_hybrid_engine()
   metric_list = [m.strip() for m in metrics.split(",") if m.strip()] if isinstance(metrics, str) else metrics
@@ -584,7 +728,12 @@ async def jit_playbook_endpoint(request: Request) -> JSONResponse:
     body = await request.json()
     req = JITHuntRequest(**body)
     logger.info(f"Incoming JIT Playbook Request for entity: {req.target_entity} (Case: {req.case_id})")
-    
+
+    retired = _first_retirement(req.query, req.directive.model_name if req.directive else None)
+    if retired:
+      logger.warning(f"Rejecting JIT request for a retired model: {retired}")
+      return JSONResponse(_retired_response(retired), status_code=400)
+
     resp: JITHuntResponse = await engine.execute_jit_hunt(req)
     if req.case_id:
       try:
@@ -595,7 +744,11 @@ async def jit_playbook_endpoint(request: Request) -> JSONResponse:
                 "case_title": req.alert_name or "JIT Playbook Investigation",
                 "entity": req.target_entity,
                 "entity_type": req.entity_type,
-                "strategy": resp.clean_hand_off.outlier_topology or req.query or "JIT_HUNT",
+                "strategy": (
+                    (resp.clean_hand_off.outlier_topology if resp.clean_hand_off else None)
+                    or req.query
+                    or "JIT_HUNT"
+                ),
                 "cri": resp.triage.calibrated_risk_index,
                 "verdict": resp.triage.verdict,
                 "primary_vector": resp.triage.primary_vector,
@@ -617,21 +770,7 @@ async def jit_playbook_endpoint(request: Request) -> JSONResponse:
       sub_errors = [f"{type(sub).__name__}: {sub}" for sub in e.exceptions]
       error_msg = f"{error_msg} (Sub-exceptions: {'; '.join(sub_errors)})"
     logger.exception(f"JIT Playbook execution failed: {error_msg}")
-    return JSONResponse(
-        {
-            "status": "ERROR",
-            "error_message": error_msg,
-            "triage": {
-                "calibrated_risk_index": 0.0,
-                "verdict": "ERROR",
-                "is_outlier": False,
-                "primary_vector": "NONE",
-                "top_z_score": 0.0,
-                "recommended_action": "MANUAL_REVIEW",
-            },
-        },
-        status_code=500,
-    )
+    return JSONResponse(_not_evaluated_response(error_msg, "ERROR"), status_code=500)
 
 
 @mcp.custom_route("/healthz", methods=["GET"])

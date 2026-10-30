@@ -14,6 +14,25 @@ BAD_ARG = re.compile(r"[a-z_.]+:\s*(\$[a-z_]+|\"[^\"]*\")")
 OUTCOME_VAR = re.compile(r"^\s*\$([a-zA-Z0-9_]+)\s*=", re.MULTILINE)
 
 
+def _outcome_blocks(query):
+  """Every outcome: block (each named stage and the root) as text, comments removed.
+
+  The canonical Cloud CRUD sector (templates/radar_360/user_2_cloud_risk.yl2) has two stages plus a
+  root, so the 20-variable limit is checked per block rather than on a single stage/root split.
+  """
+  code = "\n".join(re.sub(r"//[^\n]*", "", ln) for ln in query.splitlines())
+  blocks = []
+  for m in re.finditer(r"^\s*outcome:\s*\n", code, re.M):
+    body = []
+    for line in code[m.end():].splitlines():
+      if re.match(r"^\s*(condition|order|limit|match|outcome):", line) or line.strip().startswith("}") \
+          or re.match(r"^\s*stage\s+\w+", line):
+        break
+      body.append(line)
+    blocks.append("\n".join(body))
+  return blocks
+
+
 def _render_all():
   eng = RiskMetricsEngine()
   captured = []
@@ -86,11 +105,10 @@ def test_cloud_crud_outcomes_within_compiler_limit():
   eng.runner.execute_query_via_mcp = fake_exec
   asyncio.run(eng.run_cloud_crud_surge(None, "user.a"))
   query = captured[0]
-  stage_body, root = query.split("\n}\n", 1)
-  stage_outcome = stage_body.split("outcome:", 1)[1]
-  root_outcome = root.split("outcome:", 1)[1].split("order:", 1)[0]
-  assert len(OUTCOME_VAR.findall(stage_outcome)) <= 20
-  assert len(OUTCOME_VAR.findall(root_outcome)) <= 20
+  blocks = _outcome_blocks(query)
+  assert len(blocks) >= 2
+  for block in blocks:
+    assert len(OUTCOME_VAR.findall(block)) <= 20
   assert "if(if(" not in query
   for fam in ("resource_read_total", "resource_written_total",
               "resource_deletion_total", "resource_creation_total"):
@@ -111,11 +129,10 @@ def test_360_radar_cloud_spoke_4family_and_outcome_limits():
   fleet_cloud_q = eng.build_fleet_360_sector_queries(entity_type="USER")["Cloud"]
 
   for q in (user_cloud_q, fleet_cloud_q):
-    stage_body, root = q.split("\n}\n", 1)
-    stage_outcome = stage_body.split("outcome:", 1)[1]
-    root_outcome = root.split("outcome:", 1)[1].split("condition:", 1)[0].split("order:", 1)[0]
-    assert len(OUTCOME_VAR.findall(stage_outcome)) <= 20
-    assert len(OUTCOME_VAR.findall(root_outcome)) <= 20
+    blocks = _outcome_blocks(q)
+    assert len(blocks) >= 2
+    for block in blocks:
+      assert len(OUTCOME_VAR.findall(block)) <= 20
     assert "if(if(" not in q
     for fam in ("resource_read_total", "resource_written_total",
                 "resource_deletion_total", "resource_creation_total"):

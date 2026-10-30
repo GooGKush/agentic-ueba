@@ -5,7 +5,7 @@
 **Agentic UEBA** (`secops-agentic-hunter`) is an autonomous, dual-interface threat hunting, behavioral baselining, and **multi-wave query orchestration service** for **Google Security Operations (Chronicle SIEM & SOAR)**.
 
 It embeds the canonical **`secops-risk-metrics-multistage`** (`v2.2.0+`) and **`secops-statistical-hunter`** (`v2.9.0+`) skills as a unified **Bilateral UEBA Harness**, acting as the stateful connective tissue across time:
-* **Macro + Micro Multi-Horizon Fusion**: Combines 30-day pre-computed `metrics.*` baselines (38 Malachite catalog metrics, 18 mathematical models, 34 pipeline templates including 1-Stage Empirical Quantiles `window.percentile` / Bowley Quartile Skewness / Hubert–Vandervieren Skewness-Adjusted Tukey Fences, and 11 MITRE ATT&CK kill-chain archetypes) with bounded (`<= 14d`) raw-telemetry statistical and structural models (24 canonical raw UDM archetypes across 14 statistical deformations including Non-Parametric Quantiles/Tukey Skew Fences, Per-Flow $P_{50}/P_{90}$ Tail Shape, Telemetry Ingestion-Lag Quantile Auditing, Markov 2-gram process lineage, Shannon character entropy, C2 beaconing jitter, Poisson/Fano burst dispersion, Zipfian binary rarity, EWMA burst velocity, geodesic impossible travel, and producer-consumer byte inversion).
+* **Macro + Micro Multi-Horizon Fusion**: Combines 30-day pre-computed `metrics.*` baselines (38 Malachite catalog metrics, 18 mathematical models, 34 pipeline templates including 1-Stage Empirical Quantiles `window.percentile` / Bowley Quartile Skewness / Hubert–Vandervieren Skewness-Adjusted Tukey Fences, and 11 MITRE ATT&CK kill-chain archetypes) with bounded (`<= 14d`) raw-telemetry statistical and structural models (27 active canonical raw UDM archetypes across 14 statistical deformations including Non-Parametric Quantiles/Tukey Skew Fences, Per-Flow $P_{50}/P_{90}$ Tail Shape, Telemetry Ingestion-Lag Quantile Auditing, Markov 2-gram process lineage, Shannon character entropy, C2 beaconing jitter, Poisson/Fano burst dispersion, Zipfian binary rarity, EWMA burst velocity, and producer-consumer byte inversion; geodesic impossible travel is retired).
 * **Multi-Wave Search Stage Expansion (`Stage A -> UDM -> Stage B -> Capstone`)**: Overcomes Chronicle YARA-L 2.0's single-query compiler ceiling (`<= 2` raw UDM event stages and `<= 20` outcome variables per stage) by chaining searches across **in-memory entity seeding**, **SecOps Data Tables (`%ueba_hunt_bridge`)**, and **read-after-write verified UDM loopback barriers (`PLAYBOOK_BEHAVIORAL_HUNT_MATCH`)**—expanding complex threat runbooks into **4 to 6+ effective analytical stages** over time.
 * **Autonomous SOAR Triage & Dual Control Plane**: Continuously sweeps fleetwide `USER` and `ASSET` populations (`BEHAVIORAL_RISK_RADAR_360`), triages open SOAR cases with sanitized 6-pillar HTML/SVG Case Wall cards, and exposes **14 HTTP REST endpoints** alongside **23 Model Context Protocol (`/mcp`) tools**.
 
@@ -16,14 +16,14 @@ It embeds the canonical **`secops-risk-metrics-multistage`** (`v2.2.0+`) and **`
 `agentic-ueba` operates across five integrated workflows backed by shared execution and integrity guardrails:
 
 ### 1. Standing Fleetwide 360° Behavioral Risk Radar & UDM Event Ingestor
-Every **4 hours** (`FLEET_360_INTERVAL_SECONDS=14400`), `WatchdogDaemon` executes a deterministic **Mode A** (today's UTC bucket vs. 30-day baseline) fleetwide sweep across the tenant's entire `USER` and `ASSET` populations via `RiskMetricsEngine.run_fleet_360_sweep()`:
+Every **4 hours** (`FLEET_360_INTERVAL_SECONDS=14400`), `WatchdogDaemon` executes a deterministic **Mode A** (the last complete UTC day D, `[D, D+1)`, vs. its 30-day baseline) fleetwide sweep across the tenant's entire `USER` and `ASSET` populations via `RiskMetricsEngine.run_fleet_360_sweep()`:
 * **`O(1)` Fleetwide Query Complexity**: Evaluates all entities in 6 decoupled multi-stage YARA-L 2.0 sector queries per entity type:
   * **`USER` Sectors (6)**: `Auth`, `Cloud` (4-family CRUD across read/write/create/delete), `Workspace`, `Egress`, `DNS`, and `Web`.
   * **`ASSET` Sectors (6)**: `Auth`, `Egress`, `DNS`, `Web`, `Flows`, and `Alerts`.
-* **Euclidean Threat Distance & Calibrated Risk Index (CRI)**: Computes multi-sector Euclidean distance $D = \sqrt{\sum \max(0, Z_i)^2}$ and Sigmoid-normalized $\text{CRI} \in [0, 100]$.
-* **Intra-Day Escalation Deduplication (`WatchdogState.should_emit_fleet_360`)**: Tracks emitted `(bucket_date, entity_type, entity_id)` tuples in `data/watchdog_state.json`. An outlier entity ($\ge 1$ sector with $Z \ge 3.0\sigma$) is emitted at most once per UTC day unless:
-  1. A **new behavioral sector** breaches $\ge 3.0\sigma$ later in the day, or
-  2. Its composite Euclidean distance $D$ **escalates by $\ge +2.0\sigma$**.
+* **Euclidean Threat Distance & Calibrated Risk Index (CRI)**: Computes multi-sector Euclidean distance $D = \sqrt{\sum \max(0, Z_i)^2}$ and the harness $\text{CRI} \in [0, 100]$ (see *Harness Truth & Calibrated Risk Index* below).
+* **Intra-Day Escalation Deduplication (`WatchdogState.should_emit_fleet_360`)**: Tracks emitted `(bucket_date, entity_type, entity_id)` tuples in `data/watchdog_state.json`. An outlier entity ($\ge 1$ sector with $Z \ge$ `FLEET_360_SPIKE_THRESHOLD_Z`, by default the harness BALANCED anomaly threshold of $3.0\sigma$) is emitted at most once per UTC day unless:
+  1. A **new behavioral sector** breaches the spike threshold later in the day, or
+  2. Its composite Euclidean distance $D$ **reaches a higher harness CRI band**.
 * **Native Chronicle UDM Ingestion (`BEHAVIORAL_RISK_RADAR_360`)**: Emits one structured UDM event per outlier entity (`RiskMetricsEngine.build_360_outlier_udm_event()`) into Chronicle via `IngestionService.ImportEvents`:
   * **Unbundled Roll-Up Labels (`target.resource.attribute.labels`)**: `Hunt Campaign ID`, `Evaluated Day`, `Composite CRI`, `Composite D`, `Peak Vector`, `Peak CRI`, `Peak Z`, and `Breached Vectors`.
   * **Composite Roll-Up (`security_result[0]`)**: `rule_type = "COMPOSITE_360"`, `risk_score = <Composite CRI>`, `severity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW"`.
@@ -56,7 +56,7 @@ Every **60 seconds** (`WATCHDOG_INTERVAL_SECONDS=60`), `WatchdogDaemon` polls op
   * **`FederatedBridge` Two-Phase Macro $\rightarrow$ Micro Sieve**: Automatically chains 30-day `metrics.*` / 360° macro anomalies (`CRI >= 46`) into bounded (`<= 14d`) `StatsHunterEngine` micro-telemetry drill-downs (Markov 2-gram process transitions for `http2shell`/web-to-shell, C2 jitter + rare process surges for Shadow AI/beaconing, Fano burst clustering for auth/cloud surges) and fuses joint L2 scores.
   * **Tier 2B (Secondary Epistemic Pivot, up to `MAX_SECONDARY_HUNTS = 2`)**: Pivots automatically based on Tier 1 warrants and Tier 2A outcomes (`ACUTE_OUTLIER`, `CLEAN_OR_SUBTHRESHOLD`, `SPARSE_BASELINE`, `FLEET_WAVE`):
     * *Confirmed Outliers (`ACUTE_OUTLIER`)* $\rightarrow$ Pivots to kill-chain progression across **11 MITRE ATT&CK `KillChainArchetype` pipelines**, Workspace 3-Stage Part-of-the-Whole Triad decomposition, Cloud Repository Scope & caller IP attribution, Failure Ratio / Alert Surges, **SecOps Data Table Bridging (`%ueba_hunt_bridge.<column>`)**, or Rare Destination Entity Context Graph enrichment.
-    * *Refuted / Masked Hypotheses (`CLEAN_OR_SUBTHRESHOLD` / `SPARSE_BASELINE`)* $\rightarrow$ Pivots across mathematical assumptions: 4-Stage Non-Parametric `MAD` for heavy-tailed variance masking, `TWO_PART_HURDLE` for dormant baseline awakenings, Cloud `fail`-mode access-denied recon, `MACD_MOMENTUM_VELOCITY`, `CIRCADIAN_VON_MISES`, or Cross-Entity `USER` $\leftrightarrow$ `ASSET`/`IP` bridges.
+    * *Refuted / Masked Hypotheses (`CLEAN_OR_SUBTHRESHOLD` / `SPARSE_BASELINE`)* $\rightarrow$ Pivots across mathematical assumptions: 4-Stage Non-Parametric `MAD` for heavy-tailed variance masking, `TWO_PART_HURDLE` for dormant baseline awakenings, Cloud `fail`-mode access-denied recon, `MACD_MOMENTUM_VELOCITY`, `HOUR_OF_DAY_PROFILE` (replaces the retired `CIRCADIAN_VON_MISES`), or Cross-Entity `USER` $\leftrightarrow$ `ASSET`/`IP` bridges.
 * **Case Wall Injection (`CaseWallCardFormatter`)**: Renders a sanitized, SOAR-compatible HTML + inline 6-spoke SVG forensic triage card (enforcing zero-BigQuery-backend terminology sanitization) and posts it to the Chronicle SOAR Case Wall via `create_case_comment`.
 
 ---
@@ -74,7 +74,11 @@ Exposes `/mcp` (Streamable HTTP / SSE) with **22 MCP tools** spanning autonomous
 ---
 
 ### 🛡️ Cross-Cutting Safety & Execution Guardrails
-* **Telemetry Physics & Window Guardrail**: Strictly enforces the boundary between **Macro Baselines** (`35d` window over pre-computed `metrics.*` daily rollups in `RiskMetricsEngine`) and **Micro / Raw Telemetry** (hard-clamped to `<= 14d` via `StatsHunterEngine.enforce_telemetry_physics_window()` and `1d` / `7d` via `PlaybookRunner.resolve_effective_lookback_days()` so raw high-volume `NETWORK_CONNECTION`, `NETWORK_DNS`, `NETWORK_HTTP`, `USER_LOGIN`, or `PROCESS_LAUNCH` scans never hit Chronicle's 1M-row scan cap). Automatically shifts Entity Context Graph (`DERIVED_CONTEXT` / `GLOBAL_CONTEXT`) query windows back `48h` (`D-2`) when required.
+* **Telemetry Physics & Window Guardrail**: Strictly enforces the boundary between **Macro Baselines** (`35d` window over pre-computed `metrics.*` daily rollups in `RiskMetricsEngine`) and **Micro / Raw Telemetry** (hard-clamped to `<= 14d` via `StatsHunterEngine.enforce_telemetry_physics_window()` and `1d` / `7d` via `PlaybookRunner.resolve_effective_lookback_days()` so raw high-volume `NETWORK_CONNECTION`, `NETWORK_DNS`, `NETWORK_HTTP`, `USER_LOGIN`, or `PROCESS_LAUNCH` scans never hit Chronicle's 1M-row scan cap). Entity Context Graph (`DERIVED_CONTEXT` / `GLOBAL_CONTEXT`) joins run Mode A from `D-2 00:00:00Z` to `D+1 00:00:00Z` with every raw-event stage pinned to the scored day D (`timestamp.get_date(metadata.event_timestamp.seconds) = "<D>"`; `harness_truth.ecg_window` / `event_day_pin`).
+* **Harness Truth & Calibrated Risk Index (`src/harness_truth.py`)**: `src/harness_truth.py` is the single runtime source of harness truth. It loads the CRI formula and bands, sensitivity tiers, loopback / write-back thresholds, Mode B/C caps and the retired-model registries from the skills (`ueba_constants.py`, `preflight_validator.py`, `ueba_hybrid_engine.py`, `multistage_query_builder.py`) and defines the band verdict / action mapping and the Mode A, Entity Graph and raw-baseline windows; no harness constant is copied elsewhere.
+  * $\text{CRI}(Z) = \text{round}\left(\frac{100}{1 + \exp(-0.6 \cdot (Z - 3.0))}\right)$ for $Z > 0$, `0` for $Z \le 0$ (zero floor), and `N/A` when the score is missing or invalid (never a nominal `0`).
+  * Bands: `0–25` Nominal, `26–45` Low Drift, `46–69` Medium Outlier, `70–89` High Threat, `90–100` Critical Outlier.
+  * Verdict / action: Critical → `CRITICAL_OUTLIER` + the domain containment action (e.g. `ISOLATE_HOST`, `LOCK_ACCOUNT`, `QUARANTINE`); High / Medium → `HIGH_OUTLIER` / `MEDIUM_OUTLIER` + `INVESTIGATE`; Low / Nominal / N/A → `LOW_OUTLIER` / `NOMINAL_BASELINE` / `NOT_EVALUATED` + `MONITOR`. Actions are recommendations only: `agentic-ueba` never executes containment.
 * **Two-Layer `QueryIntegrityGate`**:
   1. **Pre-Dispatch Gate (`verify_pre_dispatch`)**: Blocks empty queries, unresolved `{{placeholder}}` slots, Malachite YARA-L AST syntax errors, bare `%data_table` references missing `.column_name` accessors, unscoped non-fleet single-entity queries (`UNSCOPED_ENTITY_QUERY`), and preflight-to-execution query drift.
   2. **Post-Execution Gate (`verify_backend_response`)**: Inspects Chronicle OneMCP payloads for backend compiler/gRPC/`INVALID_ARGUMENT` errors and raises `ChronicleBackendQueryError` so failed queries never masquerade as `0.00σ` clean hunts.
@@ -116,7 +120,7 @@ flowchart TD
 
     subgraph Harness ["3. Bilateral UEBA Harness & Integrity Gates"]
         H1["RiskMetricsEngine (secops-risk-metrics-multistage: 30d metrics.*, 38 Metrics)"]
-        H2["StatsHunterEngine (secops-statistical-hunter: <=14d Raw UDM, 23 Archetypes)"]
+        H2["StatsHunterEngine (secops-statistical-hunter: <=14d Raw UDM, 27 Active Archetypes)"]
         H3["DynamicProtocolAdapter + Vertex AI Gemini ReAct (3 Hybrid Tools)"]
         QG["QueryIntegrityGate (AST, Slot, Entity, %DataTable & Backend Error QA)"]
         GOV["Concurrency Governor (Semaphore=6 udm_search + secops-ueba-io ThreadPool)"]
@@ -218,7 +222,7 @@ sequenceDiagram
 | **Option 3 (Wave 2): `Stage A -> UDM -> Stage B`** | `Stage A` emits `PLAYBOOK_BEHAVIORAL_HUNT_MATCH` $\rightarrow$ Barrier #1 $\rightarrow$ `Stage B` joins `Stage A` UDM + fresh raw UDM | **`2–22.5m`** *(async sleep)* | **4+ stages** across `A` + `B` | Breaking the 2-raw-stage ceiling for high-cardinality cohorts ($> 25$ entities) or multi-pivot chains (`2A -> 2B`, `4A -> 4B`, `6A -> 6B`). |
 | **Option 3 (Wave 3): Unified 3-Stage Capstone** | Barrier #2 verifies `N1 + N2` $\rightarrow$ fuses Wave 1 + Wave 2 UDM (`sum(Z^2) >= 25.0`, `>= 2` scenarios) + raw forensic stage | **`0s–22.5m`** *(0s if `N2 = 0`)* | **6+ cumulative stages** (`A -> B -> Capstone`) | Cross-scenario L2 risk convergence plus raw command-line / DLP / network decoration. |
 | **JIT Tiered & Data Table Progression** | `Tier 1 (360°)` $\rightarrow$ `Tier 2A` $\rightarrow$ `FederatedBridge` $\rightarrow$ `Tier 2B` + `%ueba_hunt_bridge.<col>` | **`~10–45s`** *(live case)* / persistent table | Up to 4 sequential live queries + persistent table | Interactive SOAR case triage, hypothesis refutation pivots, and cross-hunt Data Table materialization. |
-| **Longitudinal Fleet & Scheduled Cycles** | Standing `4h` `BEHAVIORAL_RISK_RADAR_360` sweeps + staggered periodic runbooks | **Every `4h`** *(configurable)* | Continuous multi-day time series | Tracking slow multi-day drift, intra-day Euclidean $D$ escalations (`+2.0σ`), and historical SIEM rules. |
+| **Longitudinal Fleet & Scheduled Cycles** | Standing `4h` `BEHAVIORAL_RISK_RADAR_360` sweeps + staggered periodic runbooks | **Every `4h`** *(configurable)* | Continuous multi-day time series | Tracking slow multi-day drift, intra-day Euclidean $D$ escalations (higher harness CRI band), and historical SIEM rules. |
 
 ---
 
@@ -250,14 +254,14 @@ curl -X POST "https://<YOUR_SERVICE_URL>/api/v1/hunt/jit" \
   "case_wall_updated": true,
   "triage": {
     "calibrated_risk_index": 95.0,
-    "verdict": "CRITICAL",
+    "verdict": "CRITICAL_OUTLIER",
     "is_outlier": true,
     "primary_vector": "tier2b:PART_OF_THE_WHOLE_TRIAD_MULTILEVEL",
     "common_vector": "WORKSPACE",
     "second_order_ran": true,
     "tags": ["RISK:CRITICAL", "VECTOR:WORKSPACE", "SECOND_ORDER_HUNT"],
     "top_z_score": 7.85,
-    "recommended_action": "QUARANTINE_AND_ESCALATE",
+    "recommended_action": "QUARANTINE",
     "entities_to_quarantine": ["alex.lund"],
     "mitre_tactics": ["TA0009", "TA0010"]
   },
@@ -352,7 +356,7 @@ Connect any MCP client (Streamable HTTP) to `https://<YOUR_SERVICE_URL>/mcp`:
 | | `dispatch_hybrid_handoff` | Dispatches a federated `secops-threat-hunt-handoff-v1` payload to `secops-statistical-hunter`. |
 | **Specialized Hunters (13)** | `hunt_cloud_crud` | 30-day baseline Cloud CRUD write surge with companion dimensions. |
 | | `hunt_hybrid_enrichment` | Dual-Plane 2-stage macro-baseline + micro-telemetry signature fusion. |
-| | `hunt_circadian_von_mises` | Off-hours temporal anomaly detection using a 24-hour circular von Mises clock. |
+| | `hunt_circadian_von_mises` | **Retired** (`CIRCADIAN_VON_MISES`): returns the skill's retirement message (CRI `N/A`, `NOT_EVALUATED`) without running a hunt; off-hours hunts use `secops-statistical-hunter` `HOUR_OF_DAY_PROFILE`. |
 | | `hunt_macd_momentum` | Instantaneous momentum velocity divergence (`7d` vs. `30d` anchor). |
 | | `hunt_c2_jitter` | Robotic C2 beaconing detection via inter-arrival Coefficient of Variation ($\text{CV} \le 0.20$). |
 | | `hunt_poisson_burst` | Credential spray burst clustering via Poisson Fano Factor dispersion ($F > 4.0$). |
@@ -360,7 +364,7 @@ Connect any MCP client (Streamable HTTP) to `https://<YOUR_SERVICE_URL>/mcp`:
 | | `hunt_markov_transition` | Rare Living-off-the-Land parent $\rightarrow$ child process transitions via Markov 2-gram surprisal. |
 | | `hunt_zipfian_rarity` | Rare administrative binary execution in the enterprise Zipfian power-law tail. |
 | | `hunt_ewma_burst` | Acute intraday kinetic rate surges via EWMA velocity divergence. |
-| | `hunt_impossible_travel` | Supersonic geodesic travel velocity (`math.geo_distance >= 900 km/h`) across consecutive logins. |
+| | `hunt_impossible_travel` | **Retired** (`IMPOSSIBLE_TRAVEL_GEO_VELOCITY`): returns the skill's retirement message (CRI `N/A`, `NOT_EVALUATED`) without running a hunt; use `HOUR_OF_DAY_PROFILE` or `DERIVED_CONTEXT_PREVALENCE`. |
 | | `hunt_producer_consumer_inversion` | Endpoints shifting from net data consumers to net data producers ($\rho \ge 0.80$ + $Z$-score spike). |
 | | `hunt_quantile_tukey_fences` | 1-Stage Empirical Quantiles (`window.percentile`), Bowley Quartile Skewness, Moors Tail-Heaviness, and Hubert–Vandervieren Skewness-Adjusted Tukey Fences (`QUANTILE_IQR_SKEW` / `IQR_TUKEY_SKEW_FENCES`). |
 
@@ -462,8 +466,8 @@ gcloud run deploy secops-agentic-hunter \
 | `WATCHDOG_WORKER_CONCURRENCY` | `3` | Number of parallel async case-investigation workers. |
 | `FLEET_360_ENABLED` | `false` | Enables the background 4-hour Mode A fleetwide 360° radar sweep when `WatchdogDaemon` runs. |
 | `FLEET_360_INTERVAL_SECONDS` | `14400` | Interval (seconds) between fleetwide 360° sweeps (`14400` = 4 hours). |
-| `FLEET_360_SPIKE_THRESHOLD_Z` | `3.0` | Minimum single-sector $Z$-score required to classify an entity as a 360° outlier. |
-| `FLEET_360_SPOKE_INCLUSION_Z` | `2.0` | Minimum $Z$-score floor for populating secondary sectors on the entity's 360° profile. |
+| `FLEET_360_SPIKE_THRESHOLD_Z` | `3.0` (harness BALANCED `anomaly_threshold`) | Minimum single-sector $Z$-score required to classify an entity as a 360° outlier. |
+| `FLEET_360_SPOKE_INCLUSION_Z` | `2.0` (harness HIGH_RECALL `anomaly_threshold`) | Minimum $Z$-score floor for populating secondary sectors on the entity's 360° profile. |
 | `FLEET_360_MIN_OBSERVED` | `5` | Minimum observed event count per sector to suppress low-volume noise. |
 | `FLEET_360_MAX_OUTLIERS_PER_SECTOR` | `250` | Macro-rollout circuit breaker cap per sector (skips noisy fleet waves). |
 | `FLEET_360_INGEST_EVENTS` | `true` | When `true`, ingests `BEHAVIORAL_RISK_RADAR_360` UDM events via `events:import`. |
@@ -489,12 +493,13 @@ agentic_ueba/
 │   ├── __init__.py
 │   ├── _bootstrap.py                   # Runtime path & virtualenv bootstrapper
 │   ├── config.py                       # Multi-tenant configuration & ADC Bearer token generator
+│   ├── harness_truth.py                # Single runtime source of harness truth (CRI, bands, verdicts/actions, thresholds, retired models, windows)
 │   ├── models.py                       # Pydantic schemas (JITHuntRequest, JITHuntResponse, CleanHandOffPayload)
 │   ├── server.py                       # Dual FastMCP (22 tools on /mcp) + Starlette REST Gateway (14 routes)
 │   ├── autonomous_hunter.py            # 3-Stage investigation orchestrator, Bilateral mode, & Gemini ReAct loop
 │   ├── strategy_decider.py             # 360° warrant analyzer, confidence scorer, & Tier 2A -> Tier 2B pivot router
 │   ├── risk_metrics_engine.py          # 30d UEBA engine (38 metrics, 11 KillChains, %DataTable bridge, Fleet 360°)
-│   ├── stats_hunter_engine.py          # Bounded <=14d raw UDM engine (23 archetypes: C2 CV, Fano, Shannon, Markov, Zipf, EWMA, Geo, PCR)
+│   ├── stats_hunter_engine.py          # Bounded <=14d raw UDM engine (27 active archetypes: C2 CV, Fano, Shannon, Markov, Zipf, EWMA, PCR)
 │   ├── playbook_runner.py              # 3-Wave Markdown playbook engine (Stage A -> UDM -> Stage B -> Capstone & ETag cache)
 │   ├── pipeline_runner.py              # Template renderer, Malachite AST bridge, global udm_search governor, & IO thread pool
 │   ├── query_integrity_gate.py         # Pre-dispatch AST/entity/slot/Data-Table validator & post-execution backend error gate

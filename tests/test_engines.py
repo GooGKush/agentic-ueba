@@ -17,8 +17,8 @@ def test_cri_sigmoid_math():
   runner = PipelineRunner()
   # At Z = 3.0 sigma, CRI must equal 50
   assert runner.calculate_cri(3.0) == 50
-  # At Z = 0.0 sigma, CRI must be nominal (~14)
-  assert runner.calculate_cri(0.0) == 14
+  # At Z <= 0.0 sigma, CRI is 0 (harness zero floor, ueba_constants.calculate_cri / D5)
+  assert runner.calculate_cri(0.0) == 0
   # At Z = 4.5 sigma, CRI must be high outlier (>= 71)
   assert runner.calculate_cri(4.5) >= 71
   # At extreme Z, must reach high saturation
@@ -50,7 +50,10 @@ def test_stats_hunter_c2_jitter_template_rendering():
   tpl = runner.find_template("secops-statistical-hunter", "c2_beaconing_jitter_2stage.yl2")
   rendered = runner.render_template(tpl, {
       "event_type": "NETWORK_CONNECTION",
+      "entity_field": "principal.ip",
+      "event_filter": "",
       "min_conns": "30",
+      "max_conns": "500",
       "min_active_hours": "3",
       "prevalence": "5",
       "tier": "STANDARD",
@@ -60,8 +63,13 @@ def test_stats_hunter_c2_jitter_template_rendering():
   
   assert 'metadata.event_type = "NETWORK_CONNECTION"' in rendered
   assert "not net.ip_in_range_cidr" in rendered
+  # WS5/WS6-04: loopback, multicast, broadcast and link-local destinations are excluded too.
+  for cidr in ("127.0.0.0/8", "224.0.0.0/4", "169.254.0.0/16", "fe80::/10"):
+    assert cidr in rendered
   assert "{{min_conns}}" not in rendered
+  assert "{{max_conns}}" not in rendered
   assert "cv <= 0.20" in rendered.lower() or "cv" in rendered.lower()
+  assert runner.validate_ast(rendered, skill="secops-statistical-hunter") == []
 
 
 def test_hybrid_template_rendering():
@@ -93,41 +101,59 @@ def test_hybrid_template_rendering():
 
 
 def test_circadian_von_mises_template_rendering():
+  """CIRCADIAN_VON_MISES is retired (skill v2.3.0 D1 / PF-10): the template is gone and the engine refuses.
+
+  The refusal carries the skill's own retirement message, which hands off to secops-statistical-hunter
+  HOUR_OF_DAY_PROFILE (daily metrics.* baselines carry no per-hour circadian state).
+  """
+  import asyncio
+  from src import harness_truth
+
   runner = PipelineRunner()
-  tpl = runner.find_template("secops-risk-metrics-multistage", "circadian_von_mises_2stage.yl2")
-  rendered = runner.render_template(tpl, {
-      "event_type": "USER_LOGIN",
-      "entity_field": "target.user.userid",
-      "value_filter": "",
-      "observed_aggregation": "count(metadata.id)",
-      "target_metric_name": "auth_attempts_total",
-      "metric_type_val": "event_count_sum",
-      "dimension_key": "target.user.userid",
-      "extra_dimensions": "",
-  })
-  assert "CIRCADIAN VON MISES" in rendered
-  assert "metrics.auth_attempts_total" in rendered
-  assert "$circadian_threat_score" in rendered
-  assert "{{target_metric_name}}" not in rendered
+  message = harness_truth.retirement_message("circadian_von_mises_2stage.yl2")
+  assert message and "HOUR_OF_DAY_PROFILE" in message
+  # PipelineRunner.find_template refuses a retired template with the skill's own message (pointing to
+  # HOUR_OF_DAY_PROFILE) before looking for the file, so the refusal is a ValueError, not FileNotFoundError.
+  with pytest.raises(ValueError, match="retired") as find_exc:
+    runner.find_template("secops-risk-metrics-multistage", "circadian_von_mises_2stage.yl2")
+  assert str(find_exc.value) == message
+
+  engine = RiskMetricsEngine()
+  with pytest.raises(ValueError) as exc:
+    asyncio.run(engine.run_circadian_von_mises(None, "frank.kolzig"))
+  assert str(exc.value) == message
+  with pytest.raises(ValueError, match="HOUR_OF_DAY_PROFILE"):
+    asyncio.run(engine.run_dynamic_metric_pipeline(None, "frank.kolzig", model_name="CIRCADIAN_VON_MISES"))
 
 
 def test_macd_momentum_velocity_template_rendering():
+  """MACD_MOMENTUM_VELOCITY is relabelled Above-Historical-Max Z (skill v2.3.0 D1 / WS1-02).
+
+  macd_momentum_velocity_2stage.yl2 keeps its file name; the dual-spine fast/slow Z became a personal Z
+  plus a linear exceedance above the 30-day maximum, gated on the 7-active-day maturity floor.
+  """
+  from src import harness_truth
+
   runner = PipelineRunner()
   tpl = runner.find_template("secops-risk-metrics-multistage", "macd_momentum_velocity_2stage.yl2")
   rendered = runner.render_template(tpl, {
-      "event_type": "NETWORK_CONNECTION",
+      "event_filter": "network.sent_bytes > 0",
       "entity_field": "principal.user.userid",
-      "value_filter": "",
       "observed_aggregation": "sum(network.sent_bytes)",
       "target_metric_name": "network_bytes_outbound",
       "metric_type_val": "value_sum",
       "dimension_key": "principal.user.userid",
       "extra_dimensions": "",
+      "min_baseline_days": harness_truth.min_baseline_days(),
+      "anomaly_threshold": 3.0,
   })
-  assert "MACD DUAL-SPINE MOMENTUM VELOCITY" in rendered
+  assert "ABOVE-HISTORICAL-MAX Z" in rendered
+  assert "MACD DUAL-SPINE" not in rendered
   assert "metrics.network_bytes_outbound" in rendered
-  assert "$macd_momentum_score" in rendered
-  assert "{{target_metric_name}}" not in rendered
+  assert "$macd_momentum_score" in rendered and "$above_max_z" in rendered
+  assert "$fast_z" not in rendered and "$slow_z" not in rendered
+  assert _unfilled(rendered) == []
+  assert _root_gate(rendered) == f"$active_days >= {harness_truth.min_baseline_days()} and $macd_z >= 3.0"
 
 
 def test_markov_2gram_transition_rarity_template_rendering():
@@ -139,12 +165,16 @@ def test_markov_2gram_transition_rarity_template_rendering():
       "bucket_size": "1d",
       "min_parent_count": "5",
       "surprisal_threshold": "3.5",
+      "vocab_smooth": "100.0",
       "tier": "STANDARD",
   })
-  assert "Markov 2-Gram Transition" in rendered
+  # WS5: whole-window Laplace-smoothed surprisal with the {{vocab_smooth}} slot.
+  assert "Laplace-Smoothed Markov 2-Gram" in rendered
   assert "principal.process.file.full_path" in rendered
   assert "$markov_threat_score" in rendered
   assert "{{min_parent_count}}" not in rendered
+  assert "{{vocab_smooth}}" not in rendered
+  assert runner.validate_ast(rendered, skill="secops-statistical-hunter") == []
 
 
 def test_shannon_entropy_character_template_rendering():
@@ -153,15 +183,19 @@ def test_shannon_entropy_character_template_rendering():
   rendered = runner.render_template(tpl, {
       "event_type": "PROCESS_LAUNCH",
       "entity_field": "principal.hostname",
-      "bucket_size": "1d",
+      "token_field": "principal.process.command_line",
+      "event_filter": "",
       "min_length": "20",
-      "entropy_threshold": "6.0",
       "tier": "STANDARD",
   })
-  assert "Shannon Character-Class Entropy" in rendered
+  # WS5/WS6-03: ungated token extractor on the {{token_field}} slot; exact per-character entropy is
+  # computed by scripts/micro_python_helpers.py shannon, not in-query.
+  assert "Length-Normalized Per-Character Shannon Entropy" in rendered
   assert "strings.length" in rendered
-  assert "$shannon_entropy_score" in rendered
-  assert "{{entropy_threshold}}" not in rendered
+  assert "$host_prevalence" in rendered
+  assert "micro_python_helpers.py shannon" in rendered
+  assert "{{token_field}}" not in rendered
+  assert runner.validate_ast(rendered, skill="secops-statistical-hunter") == []
 
 
 def test_zipfian_process_rarity_template_rendering():
@@ -173,13 +207,17 @@ def test_zipfian_process_rarity_template_rendering():
       "bucket_size": "1d",
       "max_adopters": "2",
       "min_count": "1",
+      "min_fleet_hosts": "10",
       "zipf_threshold": "3.5",
       "tier": "STANDARD",
   })
-  assert "Zipfian Inverse Rank" in rendered
+  # WS5: host-prevalence inverse document frequency ln(N_fleet / H) with the {{min_fleet_hosts}} floor.
+  assert "Zipfian long tail" in rendered
   assert "fleet_process_popularity" in rendered
   assert "$zipf_rarity_score" in rendered
   assert "{{max_adopters}}" not in rendered
+  assert "{{min_fleet_hosts}}" not in rendered
+  assert runner.validate_ast(rendered, skill="secops-statistical-hunter") == []
 
 
 def test_ewma_burst_velocity_template_rendering():
@@ -188,19 +226,21 @@ def test_ewma_burst_velocity_template_rendering():
   rendered = runner.render_template(tpl, {
       "event_type": "NETWORK_CONNECTION",
       "entity_field": "principal.ip",
+      "event_filter": "",
       "bucket_size": "1h",
       "min_active_samples": "3",
-      "min_sd": "1.0",
       "min_count": "5",
-      "velocity_threshold": "3.0",
       "tier": "STANDARD",
   })
-  assert "Exponentially Weighted Moving Average (EWMA)" in rendered
-  assert "stage entity_baseline" in rendered
-  assert "stage entity_historical_stats" in rendered
-  assert "$ewma_velocity_score" in rendered
-  assert "$velocity_score" in rendered
-  assert "{{velocity_threshold}}" not in rendered
+  # WS6-02: ungated bucketed series extractor; the recursive EWMA is computed by
+  # scripts/micro_python_helpers.py ewma (in-query approximation lives in BURST_Z_SCREEN).
+  assert "Exponentially Weighted Moving Average Control Chart" in rendered
+  assert "stage entity_hourly" in rendered
+  assert "stage entity_prefilter" in rendered
+  assert "$window_events" in rendered
+  assert "micro_python_helpers.py ewma" in rendered
+  assert "{{min_active_samples}}" not in rendered
+  assert runner.validate_ast(rendered, skill="secops-statistical-hunter") == []
 
 
 def test_strategy_decider_routing_all_new_models():
@@ -216,15 +256,15 @@ def test_strategy_decider_routing_all_new_models():
   assert skill == "secops-statistical-hunter"
   assert model == "POISSON_BURST_CLUSTERING"
 
-  # 3. Shannon Entropy
+  # 3. Shannon Entropy (current stats-hunter archetype name)
   skill, query, model = StrategyDecider.decide("", "Obfuscated Command Line", "High Shannon entropy base64 payload", "HOST")
   assert skill == "secops-statistical-hunter"
-  assert model == "SHANNON_CHARACTER_ENTROPY"
+  assert model == "SHANNON_ENTROPY_CHARACTER"
 
-  # 4. Markov Transition
+  # 4. Markov 2-gram Transition (current stats-hunter archetype name)
   skill, query, model = StrategyDecider.decide("", "Unusual Process Parent Child", "Rare LotL Markov transition", "HOST")
   assert skill == "secops-statistical-hunter"
-  assert model == "MARKOV_TRANSITION_RARITY"
+  assert model == "MARKOV_2GRAM_TRANSITION_RARITY"
 
   # 5. Zipfian Rare Binary
   skill, query, model = StrategyDecider.decide("", "Rare Binary Execution", "Long tail rare admin tool in fleet", "HOST")
@@ -236,15 +276,15 @@ def test_strategy_decider_routing_all_new_models():
   assert skill == "secops-statistical-hunter"
   assert model == "EWMA_BURST_VELOCITY"
 
-  # 7. Circadian von Mises
+  # 7. Off-hours / circadian -> learned 24-bin HOUR_OF_DAY_PROFILE (CIRCADIAN_VON_MISES retired, D1 / PF-10)
   skill, query, model = StrategyDecider.decide("", "Off-Hours Login Surge", "Circadian temporal anomaly after hours", "USER")
-  assert skill == "secops-risk-metrics-multistage"
-  assert model == "CIRCADIAN_VON_MISES"
+  assert skill == "secops-statistical-hunter"
+  assert model == "HOUR_OF_DAY_PROFILE"
 
-  # 8. MACD Momentum
+  # 8. MACD label -> Above-Historical-Max Z (risk-metrics v2.3.0 honest rename)
   skill, query, model = StrategyDecider.decide("", "MACD Momentum Velocity Divergence", "Acceleration surge outbound bytes", "USER")
   assert skill == "secops-risk-metrics-multistage"
-  assert model == "MACD_MOMENTUM_VELOCITY"
+  assert model == "ABOVE_HISTORICAL_MAX_Z"
 
   # 9. Cloud CRUD Surge
   skill, query, model = StrategyDecider.decide("", "Cloud IAM Surge", "Cloud permission and resource_creation changes", "USER")
@@ -454,6 +494,9 @@ def test_case_wall_card_to_soar_html():
 
 @pytest.mark.anyio
 async def test_deterministic_jit_hunt_circadian_fast_path(monkeypatch):
+  # CIRCADIAN_VON_MISES is retired in the remediated harness (metrics.* has only daily baselines);
+  # the skill's retirement message hands off-hours hunts to secops-statistical-hunter's
+  # HOUR_OF_DAY_PROFILE, so the circadian alert now runs that model instead of the retired one.
   from unittest.mock import AsyncMock
   from src.autonomous_hunter import AutonomousHunterEngine
   from src.models import JITHuntRequest
@@ -466,26 +509,29 @@ async def test_deterministic_jit_hunt_circadian_fast_path(monkeypatch):
       lookback_days=14,
   )
 
-  mock_circ = {
+  mock_hod = {
       "entity": "night_owl_user",
-      "model": "CIRCADIAN_VON_MISES",
-      "circadian_threat_score": 4.8,
-      "hourly_z": 3.2,
-      "event_hour": 3,
+      "entity_type": "USER",
+      "model": "HOUR_OF_DAY_PROFILE",
+      "score_metric": "hod_z_score",
+      "primary_score": 4.8,
       "top_z_score": 4.8,
       "calibrated_risk_index": 75,
       "is_outlier": True,
       "stats_rows": 1,
-      "executed_query": "// Circadian Query",
+      "executed_query": "// Hour-of-Day Profile Query",
   }
 
-  async def mock_run_circ(*args, **kwargs):
-    return mock_circ
-
-  monkeypatch.setattr("src.autonomous_hunter.RiskMetricsEngine.run_circadian_von_mises", mock_run_circ)
+  retired_circadian = AsyncMock(return_value={"calibrated_risk_index": 99})
+  run_hod = AsyncMock(return_value=mock_hod)
+  monkeypatch.setattr("src.autonomous_hunter.RiskMetricsEngine.run_circadian_von_mises", retired_circadian)
+  monkeypatch.setattr("src.autonomous_hunter.StatsHunterEngine.run_dynamic_archetype_pipeline", run_hod)
 
   mock_session = AsyncMock()
   mock_session.initialize = AsyncMock()
+  mock_session.__aenter__.return_value = mock_session
+  # Fail fast instead of reaching the live Gemini ReAct loop if the deterministic path is skipped.
+  mock_session.list_tools = AsyncMock(side_effect=AssertionError("circadian alert fell through to the ReAct loop"))
   class MockContext:
     async def __aenter__(self):
       return (AsyncMock(), AsyncMock())
@@ -496,12 +542,22 @@ async def test_deterministic_jit_hunt_circadian_fast_path(monkeypatch):
   monkeypatch.setattr("src.autonomous_hunter.ClientSession", lambda *args, **kwargs: mock_session)
   monkeypatch.setattr("src.config.TenantConfig.get_auth_headers", lambda self: {"Authorization": "Bearer test"})
 
+  # Keep this unit test hermetic: if no deterministic fast path matches the
+  # decided directive, execute_jit_hunt falls through to the live Gemini ReAct
+  # loop. Fail fast instead of calling Vertex AI (or hanging the suite).
+  def _no_live_gemini(*args, **kwargs):
+    raise RuntimeError("unit test must not reach the live Gemini ReAct fallback")
+
+  monkeypatch.setattr(AutonomousHunterEngine, "_get_genai_client", _no_live_gemini)
+
   resp = await engine.execute_jit_hunt(req)
   assert resp.status == "SUCCESS"
+  retired_circadian.assert_not_awaited()
+  assert run_hod.await_args.kwargs["archetype"] == "HOUR_OF_DAY_PROFILE"
   assert resp.triage.calibrated_risk_index == 75
   assert resp.triage.verdict == "HIGH_OUTLIER"
-  assert resp.triage.primary_vector == "circadian_temporal_anomaly"
-  assert resp.clean_hand_off.outlier_topology == "CIRCADIAN_TEMPORAL_DEPARTURE"
+  assert resp.triage.primary_vector == "hour_of_day_login_anomaly"
+  assert resp.clean_hand_off.outlier_topology == "HOUR_OF_DAY_PROFILE_DEPARTURE"
 
 
 @pytest.mark.anyio
@@ -552,9 +608,11 @@ async def test_deterministic_jit_hunt_markov_fast_path(monkeypatch):
   resp = await engine.execute_jit_hunt(req)
   assert resp.status == "SUCCESS"
   assert resp.triage.calibrated_risk_index == 82
-  assert resp.triage.verdict == "CRITICAL_OUTLIER"
+  # Remediated harness bands (26/46/70/90): CRI 82 is High Threat -> analyst investigation;
+  # the domain containment recommendation (ISOLATE_HOST) is reserved for Critical (>= 90).
+  assert resp.triage.verdict == "HIGH_OUTLIER"
   assert resp.triage.primary_vector == "markov_process_transition_rarity"
-  assert resp.triage.recommended_action == "ISOLATE_HOST"
+  assert resp.triage.recommended_action == "INVESTIGATE"
 
 
 @pytest.mark.anyio
@@ -728,7 +786,7 @@ async def test_situational_non_auth_non_network_metric_selection():
   assert t2_web.target_metric in ("http_queries_total", "http_queries_fail")
   assert t2_web.confidence_score >= StrategyDecider.TIER_2A_AUTO_EXECUTE_THRESHOLD
 
-  # 3. DNS Outlier -> selects dns_queries_fail with LONGITUDINAL_CUSUM_DRIFT
+  # 3. DNS Outlier -> selects dns_queries_fail with LONGITUDINAL_CUSUM (current risk-metrics model name)
   t2_dns = await StrategyDecider.decide_tier2_deep_dive(
       target_entity="10.20.30.40",
       entity_type="IP",
@@ -738,7 +796,7 @@ async def test_situational_non_auth_non_network_metric_selection():
       connector_events=[],
   )
   assert t2_dns.selected_skill == "secops-risk-metrics-multistage"
-  assert t2_dns.model_name == "LONGITUDINAL_CUSUM_DRIFT"
+  assert t2_dns.model_name == "LONGITUDINAL_CUSUM"
   assert t2_dns.target_metric == "dns_queries_fail"
 
 
@@ -947,7 +1005,11 @@ async def test_bounded_tier2a_to_tier2b_epistemic_pivot_auto_execution(monkeypat
   assert resp.triage.primary_vector == "tier2b_dual_sector_fusion_3stage"
   assert resp.triage.common_vector == "MULTI_SECTOR"
   assert resp.triage.second_order_ran is True
-  assert "RISK:CRITICAL" in resp.triage.tags
+  # Harness CRI bands (26/46/70/90): CRI 88 is the High band, so the risk tag is RISK:HIGH and the
+  # Tier 2B card shows High Threat; RISK:CRITICAL is reserved for the Critical band (CRI >= 90).
+  assert "RISK:HIGH" in resp.triage.tags
+  assert "RISK:CRITICAL" not in resp.triage.tags
+  assert "HIGH THREAT" in posted_comments[2]
   assert "VECTOR:MULTI_SECTOR" in resp.triage.tags
   assert "SECOND_ORDER_HUNT" in resp.triage.tags
 
@@ -1014,12 +1076,12 @@ def test_case_triage_tagging_taxonomy_and_watchdog_filtering(tmp_path):
   from src.models import TriageSummary, StrategyDirective
   from src.watchdog import WatchdogState
 
-  # 1. Critical finding (CRI >= 80) + Common Vector + Second-Order Hunt
+  # 1. Critical finding (harness Critical band: CRI 90-100) + Common Vector + Second-Order Hunt
   triage_crit = TriageSummary(
       is_outlier=True,
-      calibrated_risk_index=85.0,
+      calibrated_risk_index=92.0,
       verdict="CRITICAL_OUTLIER",
-      top_z_score=4.8,
+      top_z_score=7.1,
       primary_vector="Workspace_behavioral_drift",
       second_order_ran=True,
       recommended_action="REVOKE_SESSION",
@@ -1027,20 +1089,32 @@ def test_case_triage_tagging_taxonomy_and_watchdog_filtering(tmp_path):
   assert triage_crit.common_vector == "WORKSPACE"
   assert triage_crit.tags == ["RISK:CRITICAL", "VECTOR:WORKSPACE", "SECOND_ORDER_HUNT"]
 
-  # 2. High finding (60 <= CRI < 80) + Common Vector without Second-Order Hunt
+  # 2. High finding (harness High band: CRI 70-89) + Common Vector without Second-Order Hunt
   triage_high = TriageSummary(
       is_outlier=True,
-      calibrated_risk_index=68.0,
+      calibrated_risk_index=75.0,
       verdict="HIGH_OUTLIER",
-      top_z_score=3.4,
+      top_z_score=4.8,
       primary_vector="Auth_behavioral_drift",
       second_order_ran=False,
-      recommended_action="INVESTIGATE_EVENTS",
+      recommended_action="INVESTIGATE",
   )
   assert triage_high.common_vector == "AUTH"
   assert triage_high.tags == ["RISK:HIGH", "VECTOR:AUTH"]
 
-  # 3. Nominal / Low finding (CRI < 60) with no Second-Order Hunt -> No tags
+  # 2b. Medium outlier (harness Medium band: CRI 46-69) -> VECTOR tag only, no RISK:* tag
+  triage_med = TriageSummary(
+      is_outlier=True,
+      calibrated_risk_index=68.0,
+      verdict="MEDIUM_OUTLIER",
+      top_z_score=3.4,
+      primary_vector="Auth_behavioral_drift",
+      second_order_ran=False,
+      recommended_action="INVESTIGATE",
+  )
+  assert triage_med.tags == ["VECTOR:AUTH"]
+
+  # 3. Nominal / Low finding (CRI <= 45) with no Second-Order Hunt -> No tags
   triage_low = TriageSummary(
       is_outlier=False,
       calibrated_risk_index=25.0,
@@ -1048,11 +1122,11 @@ def test_case_triage_tagging_taxonomy_and_watchdog_filtering(tmp_path):
       top_z_score=0.8,
       primary_vector="Auth",
       second_order_ran=False,
-      recommended_action="CLOSE_FALSE_POSITIVE",
+      recommended_action="MONITOR",
   )
   assert triage_low.tags == []
 
-  # 4. Nominal finding (CRI < 60) where a Second-Order Hunt ran and refuted the anomaly
+  # 4. Nominal finding (CRI <= 25) where a Second-Order Hunt ran and refuted the anomaly
   triage_refuted = TriageSummary(
       is_outlier=False,
       calibrated_risk_index=20.0,
@@ -1060,7 +1134,7 @@ def test_case_triage_tagging_taxonomy_and_watchdog_filtering(tmp_path):
       top_z_score=0.5,
       primary_vector="Egress",
       second_order_ran=True,
-      recommended_action="CLOSE_FALSE_POSITIVE",
+      recommended_action="MONITOR",
   )
   assert triage_refuted.tags == ["VECTOR:EGRESS", "SECOND_ORDER_HUNT"]
 
@@ -1079,7 +1153,7 @@ def test_case_triage_tagging_taxonomy_and_watchdog_filtering(tmp_path):
       target_entity="insider.user",
       entity_type="USER",
       model_name="MACD_MOMENTUM_VELOCITY",
-      calibrated_risk_index=85.0,
+      calibrated_risk_index=92.0,
       is_outlier=True,
       case_id="20999",
       rows_count=12,
@@ -1098,7 +1172,7 @@ def test_case_triage_tagging_taxonomy_and_watchdog_filtering(tmp_path):
       "case_id": "1001",
       "target_entity": "alice",
       "entity_type": "USER",
-      "calibrated_risk_index": 88.0,
+      "calibrated_risk_index": 92.0,
       "verdict": "CRITICAL_OUTLIER",
       "primary_vector": "Workspace",
       "common_vector": "WORKSPACE",
@@ -1109,7 +1183,7 @@ def test_case_triage_tagging_taxonomy_and_watchdog_filtering(tmp_path):
       "case_id": "1002",
       "target_entity": "bob",
       "entity_type": "USER",
-      "calibrated_risk_index": 64.0,
+      "calibrated_risk_index": 75.0,
       "verdict": "HIGH_OUTLIER",
       "primary_vector": "Auth",
       "common_vector": "AUTH",
@@ -1535,49 +1609,63 @@ def _unfilled(query: str):
 
 
 def test_template_paths_fill_skill_gate_placeholders():
-  """Every template the engine fills by hand must resolve the skill's gate placeholders.
+  """Every template the engine fills by hand must resolve all of its placeholders, gates included.
 
-  Unfilled `{{anomaly_threshold}}` / `{{fusion_threshold_sq}}` would reach Chronicle verbatim and
-  fail compilation (render_template only logs a warning).
+  Unfilled `{{anomaly_threshold}}` / `{{fusion_threshold_sq}}` / `{{min_baseline_days}}` would reach
+  Chronicle verbatim and fail compilation (render_template only logs a warning). Gate values come from
+  the harness sensitivity thresholds and the harness 7-active-day maturity floor.
   """
+  import asyncio
+  from src import harness_truth
+
   engine = RiskMetricsEngine()
-  runner = engine.runner
-  gates = PipelineRunner.GATE_DEFAULTS
+  gates = engine.gate_thresholds()
+  min_days = harness_truth.min_baseline_days()
+  captured = []
+
+  async def fake_exec(session, query, *args, **kwargs):
+    captured.append(query)
+    return {}
+
+  engine.runner.execute_query_via_mcp = fake_exec
+  asyncio.run(engine.run_macd_momentum_velocity(None, "alice"))
+  asyncio.run(engine.run_hybrid_enrichment(None, "alice"))
   cases = {
       "rare_destination_ecg": (engine._render_rare_destination_ecg_query("dns_queries_total"),
                                f"$z_sector >= {gates['anomaly_threshold']}"),
+      "rare_destination_ecg_bytes": (engine._render_rare_destination_ecg_query("network_bytes_outbound"),
+                                     f"$z_sector >= {gates['anomaly_threshold']}"),
       "fusion_rare_destination": (engine._render_fusion_rare_destination_query(),
                                   f"$d_sq >= {gates['fusion_threshold_sq']}"),
+      "macd_momentum_velocity_2stage.yl2": (
+          captured[0], f"$active_days >= {min_days} and $macd_z >= {gates['anomaly_threshold']}"),
   }
-  for tpl, metric, dim, gate_var in (
-      ("circadian_von_mises_2stage.yl2", "auth_attempts_total", "target.user.userid", "$circadian_threat_score"),
-      ("macd_momentum_velocity_2stage.yl2", "network_bytes_outbound", "principal.user.userid", "$fast_z"),
-  ):
-    q = runner.render_template(runner.find_template(engine.SKILL_NAME, tpl), {
-        "event_filter": "metadata.event_type = \"USER_LOGIN\"", "event_type": "USER_LOGIN", "entity_field": dim,
-        "value_filter": "", "observed_aggregation": "count(metadata.id)", "target_metric_name": metric,
-        "metric_type_val": "event_count_sum", "dimension_key": dim, "extra_dimensions": "",
-    })
-    cases[tpl] = (q, f"{gate_var} >= {gates['anomaly_threshold']}")
   for name, (query, expected_gate) in cases.items():
     assert _unfilled(query) == [], name
     assert _root_gate(query) == expected_gate, name
+  hybrid = captured[1]
+  assert _unfilled(hybrid) == []
+  assert f"$macro_z_score >= {gates['anomaly_threshold']}" in hybrid
+  assert f"$active_baseline_days >= {min_days}" in hybrid
 
 
 def test_router_paths_use_engine_outlier_gates():
-  """Router-built queries carry gates no stricter than the engine's own outlier rules."""
+  """Router-built queries carry the engine's harness gates plus the 7-active-day maturity floor (v2.3.0 PF-2)."""
+  from src import harness_truth
+
   engine = RiskMetricsEngine()
+  gates = engine.gate_thresholds()
   router = engine.runner.get_template_router()
   EntityType, _, StatisticalModel, _ = engine.runner.get_validator_enums()
   spec_a, spec_b = engine.resolve_compatible_fusion_specs(["auth_attempts_fail", "network_bytes_outbound"], "USER")
-  fusion = router.build_sector_fusion_query(
-      spec_a, spec_b, fusion_threshold_sq=PipelineRunner.GATE_DEFAULTS["fusion_threshold_sq"])
-  # run_sector_fusion flags composite_d >= 3.0, so the query must keep every D >= 3.0 row.
-  assert _root_gate(fusion) == "$composite_threat_norm_sq >= 9.0"
+  fusion = router.build_sector_fusion_query(spec_a, spec_b, fusion_threshold_sq=gates["fusion_threshold_sq"])
+  # run_sector_fusion scores D on the harness Z-equivalent scale, so the query keeps every row at the gate.
+  assert _root_gate(fusion) == f"$composite_threat_norm_sq >= {gates['fusion_threshold_sq']}"
   zq = router.build_query(target_metric="network_bytes_outbound", entity_type=EntityType.ASSET,
                           statistical_model=StatisticalModel.STANDARD_Z_SCORE,
-                          anomaly_threshold=PipelineRunner.GATE_DEFAULTS["anomaly_threshold"])
-  assert _root_gate(zq) == "$personal_z >= 3.0"
+                          anomaly_threshold=gates["anomaly_threshold"])
+  assert _root_gate(zq) == (
+      f"$active_days >= {harness_truth.min_baseline_days()} and $personal_z >= {gates['anomaly_threshold']}")
   assert _unfilled(fusion) == [] and _unfilled(zq) == []
 
 
@@ -2001,7 +2089,9 @@ async def test_query_integrity_gate_and_data_table_bridge(monkeypatch):
   mock_session = AsyncMock()
   mock_session.call_tool = mock_call_tool
 
-  valid_q = 'stage s1 {\n  metadata.event_type = "USER_LOGIN"\n  $user = "alice.smith"\n  match: $user\n  outcome: $c = count(metadata.id)\n}\n$user = $s1.user\nmatch: $user\noutcome: $z = max($s1.c)'
+  # The match placeholder is bound to a UDM field: the remediated risk-metrics validator rejects match
+  # variables bound only to constant literals (CONSTANT_LITERAL_MATCH_VARIABLE, INVALID_ARGUMENT on Malachite).
+  valid_q = 'stage s1 {\n  metadata.event_type = "USER_LOGIN"\n  principal.user.userid = $user\n  $user = "alice.smith"\n  match: $user\n  outcome: $c = count(metadata.id)\n}\n$user = $s1.user\nmatch: $user\noutcome: $z = max($s1.c)'
   resp = await runner.execute_query_via_mcp(
       mock_session,
       valid_q,
@@ -2011,6 +2101,18 @@ async def test_query_integrity_gate_and_data_table_bridge(monkeypatch):
   )
   assert call_count == 2
   assert resp["stats"][0]["user"] == "alice.smith"
+
+  # 5b. Pre-dispatch gate enforces the harness platform rules itself (compound arithmetic in an if()
+  # else-branch) before any udm_search call is made.
+  compound_q = valid_q.replace("$z = max($s1.c)", "$z = if(max($s1.c) > 0, 1.0, max($s1.c) - 1.0)")
+  with pytest.raises(QueryValidationError, match="COMPOUND_ARITHMETIC_IN_IF_BRANCH"):
+    await runner.execute_query_via_mcp(
+        mock_session,
+        compound_q,
+        "2026-10-01T00:00:00Z",
+        "2026-10-08T00:00:00Z",
+    )
+  assert call_count == 2
 
   # 6. Persistent backend compiler error raises ChronicleBackendQueryError after 2 attempts
   async def mock_always_error(tool_name, args):
@@ -2044,6 +2146,7 @@ async def test_query_integrity_gate_and_data_table_bridge(monkeypatch):
 @pytest.mark.anyio
 async def test_stats_hunter_entity_scoping_and_new_archetypes(monkeypatch):
   from unittest.mock import AsyncMock
+  from datetime import datetime
   from src.config import TenantConfig
   from src.pipeline_runner import PipelineRunner
   from src.stats_hunter_engine import StatsHunterEngine
@@ -2052,27 +2155,64 @@ async def test_stats_hunter_entity_scoping_and_new_archetypes(monkeypatch):
   engine = StatsHunterEngine(tenant)
   captured_queries = []
 
+  def _cell(v):
+    if isinstance(v, int):
+      return {"value": {"int64Val": str(v)}}
+    if isinstance(v, float):
+      return {"value": {"doubleVal": v}}
+    if isinstance(v, list):
+      return {"list": {"values": [{"int64Val": str(x)} if isinstance(x, int) else {"stringVal": x} for x in v]}}
+    return {"value": {"stringVal": str(v)}}
+
+  def _columnar(rows):
+    return {"stats": {"results": [
+        {"column": col, "values": [_cell(r[col]) for r in rows]} for col in rows[0]
+    ]}}
+
+  def _payload_for(query, start_iso):
+    # D6: EWMA, Shannon and C2 jitter are scored by scripts/micro_python_helpers.py over the raw
+    # Chronicle columnar payload; the other templates emit their own score columns.
+    t0 = int(datetime.fromisoformat(start_iso.replace("Z", "+00:00")).timestamp())
+    if "stage pair_persistence" in query:  # c2_beaconing_jitter_2stage.yl2
+      return _columnar([
+          {"src_ip": "10.10.20.55", "dst_ip": "198.51.100.42", "ws": t0 + h * 3600,
+           "event_timestamps": [t0 + h * 3600 + k * 300 + (5 if k % 2 else -5) for k in range(12)],
+           "bucket_conns": 12, "total_conns": 36, "active_hours": 3}
+          for h in range(3)
+      ])
+    if "stage entity_prefilter" in query:  # ewma_burst_velocity_2stage.yl2
+      series = [5, 6, 5, 4, 6, 5, 5, 6, 4, 5, 6, 5] + [5, 6, 20, 30, 40, 45, 50, 55, 60, 60, 60, 60]
+      return _columnar([
+          {"entity": "10.20.30.99", "ws": t0 + i * 3600, "window_events": n} for i, n in enumerate(series)
+      ])
+    if "stage token_stats" in query:  # shannon_entropy_character_2stage.yl2
+      benign = [
+          "C:\\Windows\\System32\\svchost.exe -k netsvcs -p -s Schedule",
+          "C:\\Windows\\System32\\svchost.exe -k LocalServiceNetworkRestricted",
+          "C:\\Windows\\System32\\svchost.exe -k UnistackSvcGroup -s CDPUserSvc",
+          "C:\\Windows\\System32\\svchost.exe -k NetworkService -p -s Dnscache",
+          "C:\\Windows\\System32\\svchost.exe -k LocalSystemNetworkRestricted",
+      ]
+      candidate = "cmd /c q8Zr2LxP9vKt4WmB7nYc3HdF6jGs1QaE5uRo0TiXyZpVb"
+      rows = [{"token": t, "sample_entities": ["h1", "h2", "h3"], "host_prevalence": 3, "token_events": 9}
+              for t in benign]
+      rows.append({"token": candidate, "sample_entities": ["wkstn-entropy-01"], "host_prevalence": 1,
+                   "token_events": 1})
+      return _columnar(rows)
+    return {"stats": [{
+        "dst_ip": "198.51.100.42",
+        "fano_factor": 6.5,
+        "poisson_z_sq": 17.64,
+        "markov_threat_score": 4.8,
+        "zipf_rarity_score": 4.5,
+        "z_score": 4.3,
+        "producer_ratio": 0.92,
+        "entity": "wkstn-pivot-09",
+    }]}
+
   async def fake_exec(session, query, start_iso, end_iso):
     captured_queries.append(query)
-    return {
-        "stats": [
-            {
-                "cv": 0.12,
-                "dst_ip": "198.51.100.42",
-                "fano_factor": 6.5,
-                "poisson_z": 4.2,
-                "markov_threat_score": 4.8,
-                "surprisal_score": 3.9,
-                "shannon_entropy_score": 6.4,
-                "zipf_rarity_score": 4.5,
-                "ewma_velocity_score": 4.1,
-                "velocity_kmh": 1450.0,
-                "user": "traveler.user",
-                "pcr_z_score": 4.3,
-                "entity": "wkstn-pivot-09",
-            }
-        ]
-    }
+    return _payload_for(query, start_iso)
 
   monkeypatch.setattr(engine.runner, "execute_query_via_mcp", fake_exec)
   mock_session = AsyncMock()
@@ -2089,9 +2229,10 @@ async def test_stats_hunter_entity_scoping_and_new_archetypes(monkeypatch):
   scoped_e = PipelineRunner.scope_query_to_entity(e_prefixed, "wkstn-e-01", entity_type="ASSET")
   assert '$host = "wkstn-e-01"' in scoped_e
 
-  # 1. C2 Beaconing Jitter scopes $src_ip
+  # 1. C2 Beaconing Jitter scopes $src_ip (fleet template: bound at root, dst prevalence intact)
   r1 = await engine.run_c2_beaconing_jitter(mock_session, src_ip="10.10.20.55")
   assert '$src_ip = "10.10.20.55"' in r1["executed_query"]
+  assert r1["target_destination"] == "198.51.100.42"
   assert r1["is_outlier"] is True
 
   # 2. Poisson Burst Clustering scopes $entity
@@ -2103,6 +2244,7 @@ async def test_stats_hunter_entity_scoping_and_new_archetypes(monkeypatch):
   r3 = await engine.run_poisson_rare_surge(mock_session, entity="admin.rare")
   assert '"admin.rare"' in r3["executed_query"]
   assert "{{" not in r3["executed_query"]
+  assert r3["poisson_z"] == 4.2
   assert r3["is_outlier"] is True
 
   # 4. Markov Transition Rarity scopes $entity
@@ -2113,6 +2255,7 @@ async def test_stats_hunter_entity_scoping_and_new_archetypes(monkeypatch):
   # 5. Shannon Character Entropy scopes $entity
   r5 = await engine.run_shannon_character_entropy(mock_session, entity="wkstn-entropy-01")
   assert '"wkstn-entropy-01"' in r5["executed_query"]
+  assert r5["sample_token"].startswith("cmd /c q8Zr2LxP9vKt4")
   assert r5["is_outlier"] is True
 
   # 6. Zipfian Process Rarity scopes $entity
@@ -2121,23 +2264,26 @@ async def test_stats_hunter_entity_scoping_and_new_archetypes(monkeypatch):
   assert r6["is_outlier"] is True
 
   # 7. EWMA Burst Velocity scopes $entity
-  r7 = await engine.run_ewma_burst_velocity(mock_session, entity="10.20.30.99")
+  r7 = await engine.run_ewma_burst_velocity(mock_session, entity="10.20.30.99", lookback_days=1)
   assert '"10.20.30.99"' in r7["executed_query"]
   assert r7["is_outlier"] is True
 
-  # 8. Impossible Travel Geo Velocity
-  r8 = await engine.run_impossible_travel_velocity(mock_session, user_id="traveler.user")
-  assert r8["model"] == "IMPOSSIBLE_TRAVEL_GEO_VELOCITY"
-  assert '"traveler.user"' in r8["executed_query"]
-  assert r8["velocity_kmh"] == 1450.0
-  assert r8["is_outlier"] is True
+  # 8. Impossible Travel Geo Velocity is retired (D1): refused with the skill's message, nothing executed
+  n_queries = len(captured_queries)
+  with pytest.raises(ValueError, match="IMPOSSIBLE_TRAVEL_GEO_VELOCITY is retired"):
+    await engine.run_impossible_travel_velocity(mock_session, user_id="traveler.user")
+  assert len(captured_queries) == n_queries
 
-  # 9. Producer-Consumer Ratio Inversion
+  # 9. Producer-Consumer Ratio Inversion (template score column: $z_score)
   r9 = await engine.run_producer_consumer_inversion(mock_session, hostname="wkstn-pivot-09")
   assert r9["model"] == "PRODUCER_CONSUMER_RATIO_INVERSION"
   assert '"wkstn-pivot-09"' in r9["executed_query"]
   assert r9["pcr_z_score"] == 4.3
   assert r9["is_outlier"] is True
+
+  # Every executed stats-hunter query passes the skills' validators
+  for q in captured_queries:
+    assert engine.runner.validate_ast(q, skill="secops-statistical-hunter") == []
 
 
 @pytest.mark.anyio
@@ -2243,14 +2389,22 @@ async def test_360_behavioral_radar_synchronous_day_bucket_alignment(monkeypatch
 
 
 def test_cloud_sector_zero_dispersion_and_machine_account_filter():
-  """Cloud CRUD queries must guard against zero-stddev saturation and filter AD machine accounts ($)."""
+  """Cloud CRUD queries must guard against zero-stddev saturation and filter AD machine accounts ($).
+
+  The v2.1.1 `if($std_X > 0, $std_X, 1000000.0)` divisor is gone: v2.3.0 (D8 / WS1-04) uses the count floor
+  max(sd, sqrt(max(avg, 1))) plus the active-day maturity gate, as templates/radar_360/user_2_cloud_risk.yl2 does.
+  """
+  from src import harness_truth
+
   eng = RiskMetricsEngine()
   q_cloud = eng.build_fleet_360_sector_queries(entity_type="USER")["Cloud"]
   assert 'not re.regex(principal.user.userid, "\\\\$$")' in q_cloud
-  assert "if($std_r > 0, $std_r, 1000000.0)" in q_cloud
-  assert "if($std_w > 0, $std_w, 1000000.0)" in q_cloud
-  assert "if($std_c > 0, $std_c, 1000000.0)" in q_cloud
-  assert "if($std_d > 0, $std_d, 1000000.0)" in q_cloud
+  min_days = harness_truth.min_baseline_days()
+  for p, fam in (("r", "read"), ("w", "write"), ("c", "create"), ("d", "delete")):
+    assert f"${p}_flr = math.sqrt(if(${p}_avg > 1.0, ${p}_avg, 1.0))" in q_cloud
+    assert f"${p}_sd = if(${p}_std > ${p}_flr, ${p}_std, ${p}_flr)" in q_cloud
+    assert f"$z_{fam} = if(${p}_days >= {min_days}, $z{p}_u, 0.0)" in q_cloud
+  assert "1000000.0" not in q_cloud
 
 
 @pytest.mark.anyio
@@ -2365,11 +2519,16 @@ async def test_workspace_triad_and_outcome_variable_alignment(monkeypatch):
   assert ws_res["composite_z_score"] == 4.0  # sqrt(16.0)
   assert ws_res["top_z_score"] == 4.0
   assert ws_res["is_outlier"] is True
+  # z1..z3 follow the requested triad order (auth attempts, downloads, changes); z1 is not an email score.
+  assert ws_res["auth_z"] == 2.0
   assert ws_res["download_z"] == 3.0
   assert ws_res["change_z"] == 1.73
-  assert ws_res["email_z"] == 2.0
   assert ws_res["observed_value"] == 116.0
-  assert "workspace_emails_sent_total" in ws_res["fusion_metrics"]
+  assert ws_res["fusion_metrics"] == [
+      "workspace_auth_attempts_total",
+      "workspace_total_download_actions",
+      "workspace_total_change_actions",
+  ]
 
   # 3. run_hybrid_enrichment parses macro_z_score & signature_diversity
   async def fake_hybrid_execute(session, query, start_iso, end_iso):
@@ -2381,7 +2540,7 @@ async def test_workspace_triad_and_outcome_variable_alignment(monkeypatch):
   assert hyb_res["distinct_micro_signatures"] == 2
   assert hyb_res["is_outlier"] is True
 
-  # 4. run_cloud_repository_scope parses obs & dest_z
+  # 4. run_cloud_repository_scope parses obs & dest_z (the dual-branch template has no fold-change column)
   async def fake_repo_execute(session, query, start_iso, end_iso):
     return {"stats": [{"entity": "sa@proj.iam.gserviceaccount.com", "obs": 44, "dest_z": 3.8, "origin_z": 2.9}]}
 
@@ -2389,7 +2548,9 @@ async def test_workspace_triad_and_outcome_variable_alignment(monkeypatch):
   repo_res = await eng.run_cloud_repository_scope(AsyncMock(), "sa@proj.iam.gserviceaccount.com", lookback_days=7)
   assert repo_res["observed_events"] == 44.0
   assert repo_res["composite_risk"] == 3.8
-  assert repo_res["fold_change"] == 3.8
+  assert repo_res["dest_z"] == 3.8
+  assert repo_res["origin_z"] == 2.9
+  assert "fold_change" not in repo_res
   assert repo_res["top_z_score"] == 3.8
   assert repo_res["is_outlier"] is True
 
@@ -2409,7 +2570,11 @@ async def test_workspace_triad_and_outcome_variable_alignment(monkeypatch):
   assert cusum_res["observed_value"] == 25.0
   assert cusum_res["is_outlier"] is True
 
-  # 6. StatsHunterEngine outcome alignment (poisson_z_sq, distance_km, z_score & producer_ratio)
+  # 6. StatsHunterEngine outcome alignment (poisson_z_sq, z_score & producer_ratio); IMPOSSIBLE_TRAVEL_GEO_VELOCITY
+  #    is retired (secops-statistical-hunter D1), so its entry point refuses with the skill's own message before
+  #    any query is dispatched instead of scoring distance_km.
+  from src import harness_truth
+
   stats_eng = StatsHunterEngine(TenantConfig(project_id="test-proj", customer_id="test-cust"))
 
   async def fake_poisson_rare(session, query, start_iso, end_iso):
@@ -2420,14 +2585,14 @@ async def test_workspace_triad_and_outcome_variable_alignment(monkeypatch):
   assert pr_res["poisson_z"] == 4.0  # sqrt(16.0)
   assert pr_res["is_outlier"] is True
 
-  async def fake_travel(session, query, start_iso, end_iso):
-    return {"stats": [{"entity": "traveler", "distance_km": 4250.5, "distinct_cities": 3, "distinct_countries": 2}]}
+  async def no_travel_dispatch(session, query, start_iso, end_iso):
+    raise AssertionError("retired IMPOSSIBLE_TRAVEL_GEO_VELOCITY must not dispatch a query")
 
-  monkeypatch.setattr(stats_eng.runner, "execute_query_via_mcp", fake_travel)
-  tr_res = await stats_eng.run_impossible_travel_velocity(AsyncMock(), "traveler", lookback_days=7)
-  assert tr_res["distance_km"] == 4250.5
-  assert tr_res["max_distance_km"] == 4250.5
-  assert tr_res["is_outlier"] is True
+  monkeypatch.setattr(stats_eng.runner, "execute_query_via_mcp", no_travel_dispatch)
+  with pytest.raises(ValueError, match="retired") as travel_exc:
+    await stats_eng.run_impossible_travel_velocity(AsyncMock(), "traveler", lookback_days=7)
+  assert str(travel_exc.value) == harness_truth.retirement_message("IMPOSSIBLE_TRAVEL_GEO_VELOCITY")
+  assert "HOUR_OF_DAY_PROFILE" in str(travel_exc.value)
 
   async def fake_pc(session, query, start_iso, end_iso):
     return {"stats": [{"entity": "10.0.0.5", "z_score": 4.5, "producer_ratio": 0.92, "sent_bytes": 9200000}]}
@@ -2465,18 +2630,28 @@ async def _async_v212_v282_skill_alignment_and_score_extraction(monkeypatch):
   with pytest.raises(QueryValidationError):
     QueryIntegrityGate.verify_pre_dispatch("stage s1 { principal.hostname in %bad_table match: $h outcome: $c = count(metadata.id) }")
 
-  # 2. Verify Stage 2 math model score extraction for v2.1.2 outcome names
+  # 2. Verify Stage 2 math model score extraction for the remediated (v2.3.0) outcome names: the score is
+  #    the variable each template's root significance gate tests (falling back to its order: variable),
+  #    and retired models are refused with the skill's own message instead of being rendered.
+  from src import harness_truth
+
+  for retired in ("HOURLY_TEMPORAL_ZSCORE", "FLEET_PREVALENCE_SHIELD", "PIECEWISE_CRI"):
+    with pytest.raises(ValueError) as exc:
+      await rm_engine.run_dynamic_metric_pipeline(
+          session=None, entity="alex.lund", entity_type="USER", target_metric="auth_attempts_total",
+          model_name=retired)
+    assert str(exc.value) == harness_truth.retirement_message(retired)
+
   model_mock_rows = [
-      ("HOURLY_TEMPORAL_ZSCORE", {"hourly_z": 6.25, "hourly_observed": 120, "expected_hourly_mean": 5.0}, 6.25),
-      ("FLEET_PREVALENCE_SHIELD", {"shielded_z": 4.10, "personal_z": 9.80, "observed_val": 50, "hist_avg": 5.0}, 4.10),
-      ("ADAPTIVE_CONTEXT_THRESHOLD", {"sensitivity_excess": 3.75, "personal_z": 7.20, "observed_val": 40, "hist_avg": 4.0}, 3.75),
-      ("TWO_PART_HURDLE", {"hurdle_threat_score": 12.40, "dormant_score": 12.40, "intensity_z": 2.1, "observed_val": 10}, 12.40),
-      ("ASYMMETRIC_DIRECTIONAL_Z", {"upper_tail_z": 5.15, "observed_val": 80, "hist_avg": 10.0}, 5.15),
-      ("VARIANCE", {"fano_factor": 8.50, "observed_val": 60, "hist_avg": 7.0}, 8.50),
-      ("POISSON", {"poisson_z": 4.85, "observed_val": 25, "hist_avg": 2.0}, 4.85),
-      ("PIECEWISE_CRI", {"cri_score": 88.0, "clamped_z": 5.50, "raw_z": 5.50, "observed_val": 90}, 5.50),
-      ("LONGITUDINAL_CUSUM", {"cusum_drift": 7.40, "drift_days": 4, "max_daily_z": 3.80, "daily_mean": 12.0}, 7.40),
-      ("DIVERSITY_DEFICIT_ENTROPY", {"diversity_ratio": 4.20, "observed_val": 50, "hist_avg": 10.0}, 4.20),
+      ("ADAPTIVE_CONTEXT_THRESHOLD", {"adaptive_z": 3.75, "sensitivity_excess": 0.75, "personal_z": 7.20, "observed": 40, "hist_avg": 4.0, "active_days": 20}, 3.75),
+      ("TWO_PART_HURDLE", {"hurdle_threat_score": 12.40, "dormant_score": 12.40, "intensity_z": 2.1, "observed": 10}, 12.40),
+      ("ASYMMETRIC_DIRECTIONAL_Z", {"personal_z": 5.15, "observed": 80, "hist_avg": 10.0, "active_days": 20}, 5.15),
+      ("VARIANCE", {"fano_factor": 8.50, "observed": 60, "lambda": 7.0}, 8.50),
+      ("POISSON", {"poisson_z": 4.85, "k": 25, "hist_avg": 2.0}, 4.85),
+      ("LONGITUDINAL_CUSUM", {"cusum_drift_score": 7.40, "drift_days": 4, "max_daily_z": 3.80, "hist_avg": 12.0, "active_days": 20}, 7.40),
+      ("DIVERSITY_DEFICIT_ENTROPY", {"macro_z": 4.20, "diversity_ratio": 0.02, "concentration_ratio": 0.9, "active_baseline_days": 20}, 4.20),
+      ("MAD", {"modified_z": 4.90, "personal_z": 2.0, "median_val": 3.0, "raw_active_days": 25}, 4.90),
+      ("MACD_MOMENTUM_VELOCITY", {"macd_z": 4.40, "macd_momentum_score": 4.40, "above_max_z": 1.2, "active_days": 20}, 4.40),
   ]
 
   for model_name, fake_row, expected_score in model_mock_rows:
@@ -2499,8 +2674,7 @@ async def _async_v212_v282_skill_alignment_and_score_extraction(monkeypatch):
         model_name=model_name,
     )
     assert res["top_z_score"] == pytest.approx(expected_score, 0.01)
-    if model_name == "PIECEWISE_CRI":
-      assert res["calibrated_risk_index"] == 88
+    assert res["calibrated_risk_index"] == harness_truth.calculate_cri(res["z_equivalent"])
     if model_name == "LONGITUDINAL_CUSUM":
       assert res["drift_days"] == 4
       assert res["max_daily_z"] == pytest.approx(3.80, 0.01)
@@ -2541,21 +2715,114 @@ async def _async_v212_v282_skill_alignment_and_score_extraction(monkeypatch):
   h_res = await rm_engine.run_hybrid_enrichment(session=None, username="frank.kolzig")
   assert h_res["macro_z_score"] == 5.2
 
-  # 5. Verify StatsHunterEngine.run_dynamic_archetype_pipeline across v2.8.2 templates
-  async def _fake_sh_exec(session, query, start_iso, end_iso):
-    QueryIntegrityGate.verify_pre_dispatch(query, raise_on_error=True)
-    return {"z_score": 4.2, "ewma_velocity_score": 4.2, "velocity_score": 4.2}
+  # 5. Verify StatsHunterEngine.run_dynamic_archetype_pipeline across the current templates. The mocks return the
+  #    real udm_search `stats` shape (columnar stats.results[].values[].value.<type>Val) and the real
+  #    PipelineRunner.parse_stats_response decodes it: template archetypes are scored on their root `order:`
+  #    column, and EWMA_BURST_VELOCITY is scored by the skill's micro_python_helpers.run_ewma_helper over the raw
+  #    payload, whose D6 G2 guardrail rejects anything that is not a udm_search `stats` block.
+  from datetime import datetime, timezone
 
-  monkeypatch.setattr(sh_engine.runner, "execute_query_via_mcp", _fake_sh_exec)
-  monkeypatch.setattr(sh_engine.runner, "parse_stats_response", lambda resp: [resp])
-  for arch in ("ZSCORE_PROCESS_SURGE", "EWMA_BURST_VELOCITY", "PRIVILEGED_LATERAL_EXPANSION", "DERIVED_CONTEXT_PREVALENCE"):
+  c = harness_truth.constants()
+
+  def _udm_cell(value):
+    if isinstance(value, bool):
+      return {"value": {"boolVal": value}}
+    if isinstance(value, int):
+      return {"value": {"int64Val": str(value)}}
+    if isinstance(value, float):
+      return {"value": {"doubleVal": value}}
+    return {"value": {"stringVal": str(value)}}
+
+  def _udm_stats(columns):
+    return {"stats": {"results": [
+        {"column": name, "values": [_udm_cell(v) for v in values]} for name, values in columns.items()]}}
+
+  def _epoch(iso):
+    return int(datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp())
+
+  template_payloads = {
+      "ZSCORE_PROCESS_SURGE": ("z_score", _udm_stats({
+          "entity": ["wks-eng-01"], "window_start": [1793059200], "observation_count": [42],
+          "baseline_mean": [6.0], "baseline_dispersion": [8.6], "z_score": [4.2]})),
+      "PRIVILEGED_LATERAL_EXPANSION": ("z_score", _udm_stats({
+          "entity": ["wks-eng-01"], "ws": [1793059200], "observation_count": [9], "new_targets": [2],
+          "z_score": [4.2]})),
+      "DERIVED_CONTEXT_PREVALENCE": ("threat_score", _udm_stats({
+          "user": ["alice"], "host": ["wks-eng-01"], "ws": [1793059200], "z_score": [2.1],
+          "threat_score": [4.2], "in_scoring_window": [1]})),
+  }
+  for arch, (score_col, payload) in template_payloads.items():
+    async def _fake_sh_exec(session, query, start_iso, end_iso, _payload=payload):
+      QueryIntegrityGate.verify_pre_dispatch(query, raise_on_error=True)
+      return _payload
+
+    monkeypatch.setattr(sh_engine.runner, "execute_query_via_mcp", _fake_sh_exec)
     sh_res = await sh_engine.run_dynamic_archetype_pipeline(
         session=None,
         entity="wks-eng-01",
         archetype=arch,
         entity_type="ASSET",
     )
-    assert sh_res["top_z_score"] == 4.2
+    assert sh_res["score_metric"] == score_col, arch
+    assert sh_res["top_z_score"] == 4.2, arch
+    assert sh_res["calibrated_risk_index"] == c.cri_from_model_score(score_col, 4.2), arch
+    assert sh_res["stats_rows"] == 1, arch
+
+  # EWMA: the ungated hourly (entity, ws, window_events) series of ewma_burst_velocity_2stage.yl2 over the
+  # dispatched window. Baseline half: 4 events / hour (zero sample SD, so sigma_0 is the Poisson floor
+  # sqrt(4) = 2); scored half: 7 events / hour, a sustained shift EWMA accumulates (lambda = 0.25).
+  ewma_calls = []
+
+  async def _fake_ewma_exec(session, query, start_iso, end_iso):
+    QueryIntegrityGate.verify_pre_dispatch(query, raise_on_error=True)
+    start, end = _epoch(start_iso), _epoch(end_iso)
+    hours = (end - start) // 3600
+    series = [4 if h < hours // 2 else 7 for h in range(hours)]
+    payload = _udm_stats({
+        "entity": ["wks-eng-01"] * hours,
+        "ws": [start + h * 3600 for h in range(hours)],
+        "window_events": series,
+        "total_events": [sum(series)] * hours,
+    })
+    ewma_calls.append((query, start_iso, end_iso, payload))
+    return payload
+
+  monkeypatch.setattr(sh_engine.runner, "execute_query_via_mcp", _fake_ewma_exec)
+  ewma_res = await sh_engine.run_dynamic_archetype_pipeline(
+      session=None,
+      entity="wks-eng-01",
+      archetype="EWMA_BURST_VELOCITY",
+      entity_type="ASSET",
+  )
+  query, start_iso, end_iso, payload = ewma_calls[0]
+  control_l = ewma_res["control_limit_l"]
+  # Closed form at the last of the k scored buckets: (S_k - mu_0) / sigma_EWMA with S_k - mu_0 = 3 * (1 - 0.75^k)
+  # and sigma_EWMA = sigma_0 * sqrt(lambda / (2 - lambda)).
+  hours = (_epoch(end_iso) - _epoch(start_iso)) // 3600
+  k = hours - hours // 2
+  expected_ewma_z = 3.0 * (1.0 - 0.75 ** k) / (2.0 * math.sqrt(0.25 / 1.75))
+  expected_z_eq = c.score_to_z_equivalent("ewma_z", expected_ewma_z, threshold_override=control_l)
+  assert ewma_res["score_metric"] == "ewma_z"
+  assert ewma_res["ewma_velocity_score"] == round(expected_ewma_z, 2)
+  assert ewma_res["top_z_score"] == round(expected_z_eq, 2)
+  assert ewma_res["calibrated_risk_index"] == c.cri_from_model_score(
+      "ewma_z", expected_ewma_z, threshold_override=control_l)
+  assert ewma_res["is_outlier"] is True
+  # Same numbers as the skill's own helper over the same raw payload, query and window.
+  oracle = sh_engine.runner.get_micro_python_helpers().run_ewma_helper(
+      payload, query_text=query, start_time=start_iso, end_time=end_iso, control_l=control_l, bucket_seconds=3600)
+  top = max(oracle["entity_results"], key=lambda r: r["ewma_z"])
+  assert ewma_res["top_z_score"] == round(top["z_equiv"], 2)
+  assert ewma_res["calibrated_risk_index"] == top["cri"]
+
+  # The D6 G2 guardrail still fails closed on a payload without a udm_search `stats` block.
+  async def _fake_flat_exec(session, query, start_iso, end_iso):
+    return {"z_score": 4.2, "ewma_velocity_score": 4.2, "velocity_score": 4.2}
+
+  monkeypatch.setattr(sh_engine.runner, "execute_query_via_mcp", _fake_flat_exec)
+  with pytest.raises(ValueError, match="G2_MISSING_STATS_BLOCK"):
+    await sh_engine.run_dynamic_archetype_pipeline(
+        session=None, entity="wks-eng-01", archetype="EWMA_BURST_VELOCITY", entity_type="ASSET")
 
 
 def test_bilateral_ueba_harness_and_telemetry_physics_guardrail():
@@ -2588,8 +2855,8 @@ def test_bilateral_ueba_harness_and_telemetry_physics_guardrail():
   assert directive.model_name == "DUAL_SECTOR_FUSION_3STAGE"
   assert directive.fusion_metrics == ["http_queries_fail", "file_executions_total"]
   cand_models = {c.model_name for c in directive.candidate_hypotheses}
-  assert "MARKOV_TRANSITION_RARITY" in cand_models
-  assert "SHANNON_CHARACTER_ENTROPY" in cand_models
+  assert "MARKOV_2GRAM_TRANSITION_RARITY" in cand_models
+  assert "SHANNON_ENTROPY_CHARACTER" in cand_models
   assert "C2_BEACONING_JITTER" in cand_models
 
   # 3. Producer-Consumer Byte Ratio Inversion routing
@@ -2616,6 +2883,7 @@ def test_bilateral_ueba_harness_and_telemetry_physics_guardrail():
 @pytest.mark.anyio
 async def test_quantile_iqr_skew_and_tukey_skew_fences_pipelines(monkeypatch):
   """Verify v2.2.0 QUANTILE_IQR_SKEW (risk-metrics) and v2.9.0 IQR_TUKEY_SKEW_FENCES (stats-hunter) pipelines."""
+  from src import harness_truth
   from src.query_integrity_gate import QueryIntegrityGate
 
   rm_engine = RiskMetricsEngine()
@@ -2626,7 +2894,8 @@ async def test_quantile_iqr_skew_and_tukey_skew_fences_pipelines(monkeypatch):
     assert "window.percentile(" in query
     assert "stage quantile_envelope" in query
     assert "$bowley_skew" in query
-    assert "$tukey_fence_ratio" in query
+    # v2.3.0 (WS1-03): scored as robust-scale excess above the Bowley-adjusted Tukey fence.
+    assert "$tukey_excess_z" in query
     return {
         "observed": 50000000.0,
         "q25_val": 1000000.0,
@@ -2635,8 +2904,10 @@ async def test_quantile_iqr_skew_and_tukey_skew_fences_pipelines(monkeypatch):
         "bowley_skew": 0.40,
         "tail_heaviness": 3.1,
         "adj_upper_fence": 12000000.0,
-        "tukey_fence_ratio": 4.17,
+        "robust_scale": 3700000.0,
+        "tukey_excess_z": 2.5,
         "personal_z": 2.4,
+        "raw_active_days": 21,
     }
 
   monkeypatch.setattr(rm_engine.runner, "execute_query_via_mcp", _fake_rm_quantile)
@@ -2650,8 +2921,12 @@ async def test_quantile_iqr_skew_and_tukey_skew_fences_pipelines(monkeypatch):
       lookback_days=14,
   )
   assert q_res["model"] == "QUANTILE_IQR_SKEW"
-  assert q_res["top_z_score"] == 4.17
-  assert q_res["tukey_fence_ratio"] == 4.17
+  assert q_res["score_key"] == "tukey_excess_z"
+  assert q_res["top_z_score"] == 2.5
+  assert q_res["tukey_excess_z"] == 2.5
+  assert q_res["z_equivalent"] == pytest.approx(
+      harness_truth.constants().score_to_z_equivalent("tukey_excess_z", 2.5))
+  assert q_res["is_true_sigma"] is False
   assert q_res["bowley_skew"] == 0.4
   assert q_res["tail_heaviness"] == 3.1
   assert q_res["is_outlier"] is True
@@ -2662,9 +2937,12 @@ async def test_quantile_iqr_skew_and_tukey_skew_fences_pipelines(monkeypatch):
     assert "stage quantile_fences" in query
     assert "$bowley_skew" in query
     assert "$surge_ratio" in query
+    # v3.0.0 (WS5): recalibrated 1.35 Bowley exponent, ranked by the scale-invariant $fence_z.
+    assert "1.35 * $pos_skew" in query
+    assert "$fence_z" in query
     return {
+        "fence_z": 4.2,
         "surge_ratio": 3.85,
-        "tukey_fence_ratio": 3.85,
         "bowley_skew": 0.52,
         "tail_heaviness": 2.95,
     }
@@ -2679,9 +2957,12 @@ async def test_quantile_iqr_skew_and_tukey_skew_fences_pipelines(monkeypatch):
       event_type="NETWORK_CONNECTION",
       lookback_days=30,
   )
+  from src import harness_truth as ht
   assert sh_res["model"] == "IQR_TUKEY_SKEW_FENCES"
-  assert sh_res["score_metric"] in ("surge_ratio", "tukey_fence_ratio")
-  assert sh_res["top_z_score"] == 3.85
+  assert sh_res["score_metric"] == "fence_z"
+  assert sh_res["primary_score"] == 4.2
+  assert sh_res["top_z_score"] == round(ht.constants().score_to_z_equivalent("fence_z", 4.2), 2)
+  assert sh_res["calibrated_risk_index"] == ht.constants().cri_from_model_score("fence_z", 4.2)
   assert sh_res["is_outlier"] is True
 
 

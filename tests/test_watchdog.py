@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 import pytest
 
+from src import harness_truth as ht
 from src.config import TenantConfig
 from src.models import (
     CleanHandOffPayload,
@@ -634,7 +635,7 @@ def test_watchdog_state_fleet_360_intraday_deduplication(tmp_path):
       composite_cri=61,
   )
 
-  # 2. Next 4-hour sweep on same UTC date with same breached sector and small delta D (+0.3 < 2.0) -> suppress
+  # 2. Next 4-hour sweep on same UTC date with same breached sector and small delta D (+0.3, same harness CRI band) -> suppress
   assert state.should_emit_fleet_360(
       bucket_date="2026-10-08",
       entity_type="USER",
@@ -643,7 +644,7 @@ def test_watchdog_state_fleet_360_intraday_deduplication(tmp_path):
       composite_d=3.8,
   ) is False
 
-  # 3. Same UTC date, but a NEW sector ("Egress") breaches >= 3.0 sigma -> emit
+  # 3. Same UTC date, but a NEW sector ("Egress") breaches the spike gate -> emit
   assert state.should_emit_fleet_360(
       bucket_date="2026-10-08",
       entity_type="USER",
@@ -661,7 +662,7 @@ def test_watchdog_state_fleet_360_intraday_deduplication(tmp_path):
       composite_cri=78,
   )
 
-  # 4. Same UTC date and same sectors, but Composite D escalates by >= +2.0 sigma (4.8 -> 7.0) -> emit
+  # 4. Same UTC date and same sectors, but Composite D (4.8 -> 7.0) reaches a higher harness CRI band (HIGH -> CRITICAL) -> emit
   assert state.should_emit_fleet_360(
       bucket_date="2026-10-08",
       entity_type="USER",
@@ -740,3 +741,65 @@ async def test_watchdog_daemon_run_fleet_360_sweep_once_deduplicates_across_4h_r
   assert res2["total_outliers_emitted"] == 0
   assert res2["total_outliers_suppressed_dedup"] == 1
   assert res2["total_udm_events_generated"] == 0
+
+
+def _band(score):
+  """Harness CRI band of a Z / Z-equivalent score."""
+  return ht.cri_band(ht.calculate_cri(score))[0]
+
+
+def test_fleet_360_reemission_follows_harness_cri_bands(tmp_path):
+  state = WatchdogState(state_file=tmp_path / "band_dedup_state.json")
+  # Premises come from the harness, not from local constants.
+  assert _band(7.0) == _band(9.5) == "CRITICAL"
+  assert _band(3.5) != _band(5.2)
+
+  state.record_fleet_360_emission("2026-10-08", "USER", "carol", ["Egress"], 7.0, ht.calculate_cri(7.0))
+  # +2.5σ inside the same (top) band with no new sector: same SOC tier, suppressed.
+  assert state.should_emit_fleet_360("2026-10-08", "USER", "carol", ["Egress"], 9.5) is False
+  # An explicit caller escalation delta is still honoured.
+  assert state.should_emit_fleet_360("2026-10-08", "USER", "carol", ["Egress"], 9.5, min_delta_d=2.0) is True
+
+  state.record_fleet_360_emission("2026-10-08", "USER", "dave", ["Auth"], 3.5, ht.calculate_cri(3.5))
+  # +1.7σ that crosses into a higher harness band: re-emitted.
+  assert state.should_emit_fleet_360("2026-10-08", "USER", "dave", ["Auth"], 5.2) is True
+
+
+def test_playbook_reemission_follows_harness_cri_bands(tmp_path):
+  state = WatchdogState(state_file=tmp_path / "pb_band_dedup_state.json")
+  state.record_playbook_emission("2026-10-23", "pb", "q1", "10.0.0.5", 7.0, ht.calculate_cri(7.0))
+  assert state.should_emit_playbook_match("2026-10-23", "pb", "q1", "10.0.0.5", 9.5) is False
+  assert state.should_emit_playbook_match("2026-10-23", "pb", "q1", "10.0.0.5", 9.5, min_delta_z=2.0) is True
+  state.record_playbook_emission("2026-10-23", "pb", "q2", "10.0.0.6", 3.5, ht.calculate_cri(3.5))
+  assert state.should_emit_playbook_match("2026-10-23", "pb", "q2", "10.0.0.6", 5.2) is True
+
+
+def test_emission_records_keep_a_missing_cri_as_not_evaluated(tmp_path):
+  state = WatchdogState(state_file=tmp_path / "na_cri_state.json")
+  state.record_fleet_360_emission("2026-10-08", "USER", "erin", ["DNS"], 3.2, None)
+  assert state.fleet_360_emissions["2026-10-08:USER:erin"]["composite_cri"] is None
+  state.record_fleet_360_emission("2026-10-08", "USER", "erin", ["DNS"], 4.0, 64)
+  assert state.fleet_360_emissions["2026-10-08:USER:erin"]["composite_cri"] == 64
+
+  state.record_playbook_emission("2026-10-23", "pb", "q", "host-9", 3.1, None)
+  assert state.playbook_emissions["2026-10-23:pb:q:host-9"]["cri_score"] is None
+  # Persisted and reloadable.
+  reloaded = WatchdogState(state_file=tmp_path / "na_cri_state.json")
+  assert reloaded.playbook_emissions["2026-10-23:pb:q:host-9"]["cri_score"] is None
+
+
+def test_activity_report_derives_missing_verdicts_from_harness_bands(tmp_path):
+  from datetime import datetime, timedelta, timezone
+
+  state = WatchdogState(state_file=tmp_path / "legacy_verdict_state.json")
+  ts = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+  state.record_case("legacy-1", {"case_id": "legacy-1", "cri": 75.0, "timestamp": ts})
+  state.record_case("legacy-2", {"case_id": "legacy-2", "timestamp": ts})
+  state.record_case("modern-1", {"case_id": "modern-1", "cri": 95.0, "verdict": "CRITICAL_OUTLIER", "timestamp": ts})
+
+  report = state.get_activity_report(timeframe="1h")
+  assert report["summary_by_verdict"] == {
+      ht.verdict_for(75.0): 1,
+      ht.verdict_for(None): 1,
+      "CRITICAL_OUTLIER": 1,
+  }
